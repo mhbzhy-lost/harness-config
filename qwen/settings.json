@@ -1,0 +1,95 @@
+{
+  "ui": {
+    "showToolCallDetails": false
+  },
+  "model": {
+    "name": "qwen4-max-preview",
+    "baseUrl": "",
+    "reasoningEffort": "high"
+  },
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "glm-5.3",
+        "name": "[ModelStudio Token Plan] glm-5.3",
+        "capabilities": {
+          "reasoning": {
+            "thinking": true,
+            "toggleOnly": true,
+            "canDisable": false,
+            "disableField": "enable_thinking"
+          }
+        },
+        "baseUrl": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        "envKey": "BAILIAN_TOKEN_PLAN_API_KEY",
+        "generationConfig": {
+          "extra_body": {
+            "enable_thinking": true
+          },
+          "thinkingMandatory": true,
+          "contextWindowSize": 1000000
+        }
+      },
+      {
+        "id": "qwen4-max",
+        "name": "[ModelStudio Token Plan] qwen4-max",
+        "capabilities": {
+          "reasoning": {
+            "thinking": true,
+            "efforts": [
+              "low",
+              "high",
+              "xhigh"
+            ],
+            "defaultEffort": "high",
+            "disableField": "reasoning_effort"
+          }
+        },
+        "baseUrl": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        "envKey": "BAILIAN_TOKEN_PLAN_API_KEY",
+        "generationConfig": {
+          "contextWindowSize": 1000000,
+          "modalities": {
+            "image": true,
+            "video": true
+          }
+        }
+      },
+      {
+        "id": "deepseek-v4.1-flash-1017",
+        "name": "[ModelStudio Token Plan] deepseek-v4.1-flash-1017",
+        "capabilities": {
+          "reasoning": {
+            "thinking": true,
+            "efforts": [
+              "low",
+              "high",
+              "max"
+            ],
+            "defaultEffort": "high",
+            "disableField": "enable_thinking"
+          }
+        },
+        "baseUrl": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        "envKey": "BAILIAN_TOKEN_PLAN_API_KEY",
+        "generationConfig": {
+          "contextWindowSize": 1000000,
+          "modalities": {
+            "image": true
+          }
+        }
+      },
+      {
+        "id": "qwen4-max-preview",
+        "name": "[ModelStudio Token Plan] qwen4-max-preview",
+        "baseUrl": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        "envKey": "BAILIAN_TOKEN_PLAN_API_KEY"
+      }
+    ]
+  },
+  "security": {
+    "auth": {
+      "selectedType": "openai"
+    }
+  }
+}
