@@ -9,9 +9,9 @@ description: Use when the user asks to download models, LoRAs, upscalers or VAEs
 
 ## Token
 
-- 位置：WSL 侧 `~/.config/civitai.env`，格式 `CIVITAI_TOKEN=<token>`，权限 600。
-- 缺失时向用户索取，经 `home_exec` 写入并 `chmod 600`；**不要回显、打印或把 token 拼进会被记录的 URL**。
-- 用法：远程命令里 `source ~/.config/civitai.env` 后 `curl -H "Authorization: Bearer $CIVITAI_TOKEN" ...`。
+- 位置：WSL 侧 `~/.config/civitai/token`——**纯 token 文本**（无 `KEY=` 前缀），目录 700、文件 600。
+- 用法：远程命令里 `TOKEN=$(cat ~/.config/civitai/token)` 后 `curl -H "Authorization: Bearer $TOKEN" ...`；**不要回显、打印 token，也不要拼进 `?token=` URL（会进日志）**。
+- 缺失时（新机器）向用户索取，经 `home_exec` 写入：`mkdir -p ~/.config/civitai && chmod 700 ~/.config/civitai`，写文件后 `chmod 600`；写入命令本身不要带 echo/cat 回显。
 
 ## 目标目录（共享模型根）
 
