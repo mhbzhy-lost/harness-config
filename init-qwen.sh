@@ -5,6 +5,7 @@
 #   2. plugins/* 软链接进 ~/.qwen/extensions/
 #   3. qwen/shell.zsh 注册 source 进 ~/.zshrc（标记块，幂等；qwen 主题随系统明暗）
 #   4. qwen/QWEN.md 软链接为 ~/.qwen/QWEN.md（全局指令，跨机同步）
+#   5. qwen/agents/*.md 软链接进 ~/.qwen/agents/（subagent 定义，含 review-agent 重模型覆盖）
 # 模型/提供商/认证/密钥均为 per-machine 配置，不在同步范围。
 set -euo pipefail
 
@@ -17,6 +18,8 @@ SHELL_RC="${QWEN_SHELL_RC:-$HOME/.zshrc}"
 SHELL_SNIPPET="$SCRIPT_DIR/qwen/shell.zsh"
 GLOBAL_MD_SRC="$SCRIPT_DIR/qwen/QWEN.md"
 GLOBAL_MD_TARGET="${QWEN_GLOBAL_MD:-$HOME/.qwen/QWEN.md}"
+AGENTS_SRC="$SCRIPT_DIR/qwen/agents"
+AGENTS_DIR="${QWEN_AGENTS_DIR:-$HOME/.qwen/agents}"
 DRY_RUN=0
 
 usage() {
@@ -31,11 +34,13 @@ usage() {
   QWEN_EXTENSIONS_DIR   覆盖插件链接目录（默认 ~/.qwen/extensions）
   QWEN_SHELL_RC         覆盖 shell 注册目标（默认 ~/.zshrc）
   QWEN_GLOBAL_MD        覆盖全局 QWEN.md 链接目标（默认 ~/.qwen/QWEN.md）
+  QWEN_AGENTS_DIR       覆盖 agent 定义链接目录（默认 ~/.qwen/agents）
 
 脚本会向目标设置的 env 注入 HARNESS_CONFIG_ROOT（本仓库绝对路径），
 确保 skills.directories 含本仓 skills/ 目录（保留其他已有条目），
 把 qwen/shell.zsh 的 source 行注册进 ~/.zshrc（标记块，幂等），
-并把 qwen/QWEN.md 软链接为全局 QWEN.md（真实文件则警告跳过，不破坏）。
+把 qwen/QWEN.md 软链接为全局 QWEN.md（真实文件则警告跳过，不破坏），
+把 qwen/agents/*.md 逐文件软链接进 ~/.qwen/agents/（同语义）。
 EOF
 }
 
@@ -227,8 +232,37 @@ else
   echo "全局 QWEN.md：已链接 → $GLOBAL_MD_SRC"
 fi
 
+# --- 5. subagent 定义软链接 ---
+if [[ -d "$AGENTS_SRC" ]]; then
+  [[ "$DRY_RUN" == 1 ]] || mkdir -p "$AGENTS_DIR"
+  for agent_file in "$AGENTS_SRC"/*.md; do
+    [[ -f "$agent_file" ]] || continue
+    name="$(basename "$agent_file")"
+    link="$AGENTS_DIR/$name"
+    if [[ -L "$link" ]]; then
+      if [[ "$(readlink "$link")" == "$agent_file" ]]; then
+        echo "agent ${name}：链接已正确"
+      elif [[ "$DRY_RUN" == 1 ]]; then
+        echo "[dry-run] agent ${name}：重指链接 → $agent_file"
+      else
+        ln -sfn "$agent_file" "$link"
+        echo "agent ${name}：链接已重指 → $agent_file"
+      fi
+    elif [[ -e "$link" ]]; then
+      echo "警告: $link 已存在且不是软链接，跳过（请手动处理）" >&2
+    elif [[ "$DRY_RUN" == 1 ]]; then
+      echo "[dry-run] agent ${name}：新建链接 → $agent_file"
+    else
+      ln -s "$agent_file" "$link"
+      echo "agent ${name}：已链接 → $agent_file"
+    fi
+  done
+else
+  echo "（无 qwen/agents/ 目录，跳过 agent 链接）"
+fi
+
 if [[ "$DRY_RUN" == 1 ]]; then
   echo "预览完成，未做任何写入。"
 else
-  echo "完成。重启 Qwen Code（或 /reload-plugins）使设置/插件变更生效；新开终端使 qwen 主题包装生效；全局 QWEN.md 新会话即加载。"
+  echo "完成。重启 Qwen Code（或 /reload-plugins）使设置/插件变更生效；新开终端使 qwen 主题包装生效；全局 QWEN.md 与 agent 定义新会话即加载。"
 fi
