@@ -3,6 +3,7 @@
 #   1. qwen/settings.json 深度合并进 ~/.qwen/settings.json，并注入 env.HARNESS_CONFIG_ROOT=仓库根
 #   2. plugins/* 软链接进 ~/.qwen/extensions/
 #   3. qwen/shell.zsh 注册 source 进 ~/.zshrc（标记块，幂等；qwen 主题随系统明暗）
+#   4. qwen/QWEN.md 软链接为 ~/.qwen/QWEN.md（全局指令，跨机同步）
 # 模型/提供商/认证/密钥均为 per-machine 配置，不在同步范围。
 set -euo pipefail
 
@@ -13,6 +14,8 @@ TARGET="${QWEN_SETTINGS_PATH:-$HOME/.qwen/settings.json}"
 EXT_DIR="${QWEN_EXTENSIONS_DIR:-$HOME/.qwen/extensions}"
 SHELL_RC="${QWEN_SHELL_RC:-$HOME/.zshrc}"
 SHELL_SNIPPET="$SCRIPT_DIR/qwen/shell.zsh"
+GLOBAL_MD_SRC="$SCRIPT_DIR/qwen/QWEN.md"
+GLOBAL_MD_TARGET="${QWEN_GLOBAL_MD:-$HOME/.qwen/QWEN.md}"
 DRY_RUN=0
 
 usage() {
@@ -26,9 +29,11 @@ usage() {
   QWEN_SETTINGS_PATH    覆盖目标配置路径（默认 ~/.qwen/settings.json）
   QWEN_EXTENSIONS_DIR   覆盖插件链接目录（默认 ~/.qwen/extensions）
   QWEN_SHELL_RC         覆盖 shell 注册目标（默认 ~/.zshrc）
+  QWEN_GLOBAL_MD        覆盖全局 QWEN.md 链接目标（默认 ~/.qwen/QWEN.md）
 
 脚本会向目标设置的 env 注入 HARNESS_CONFIG_ROOT（本仓库绝对路径），
-并把 qwen/shell.zsh 的 source 行注册进 ~/.zshrc（标记块，幂等）。
+把 qwen/shell.zsh 的 source 行注册进 ~/.zshrc（标记块，幂等），
+并把 qwen/QWEN.md 软链接为全局 QWEN.md（真实文件则警告跳过，不破坏）。
 EOF
 }
 
@@ -46,6 +51,7 @@ done
 command -v python3 >/dev/null 2>&1 || die "需要 python3"
 [[ -f "$TEMPLATE" ]] || die "找不到模板: $TEMPLATE"
 [[ -f "$SHELL_SNIPPET" ]] || die "找不到 shell 片段: $SHELL_SNIPPET"
+[[ -f "$GLOBAL_MD_SRC" ]] || die "找不到全局指令文件: $GLOBAL_MD_SRC"
 
 # --- 1. 合并设置 + 注入 HARNESS_CONFIG_ROOT ---
 QWEN_SYNC_DRY_RUN="$DRY_RUN" python3 - "$TEMPLATE" "$TARGET" "$SCRIPT_DIR" <<'PY'
@@ -186,8 +192,28 @@ if backup_path:
     print(f"已备份: {backup_path}")
 PY
 
+# --- 4. 全局 QWEN.md 软链接 ---
+if [[ -L "$GLOBAL_MD_TARGET" ]]; then
+  if [[ "$(readlink "$GLOBAL_MD_TARGET")" == "$GLOBAL_MD_SRC" ]]; then
+    echo "全局 QWEN.md：链接已正确"
+  elif [[ "$DRY_RUN" == 1 ]]; then
+    echo "[dry-run] 全局 QWEN.md：重指链接 → $GLOBAL_MD_SRC"
+  else
+    ln -sfn "$GLOBAL_MD_SRC" "$GLOBAL_MD_TARGET"
+    echo "全局 QWEN.md：链接已重指 → $GLOBAL_MD_SRC"
+  fi
+elif [[ -e "$GLOBAL_MD_TARGET" ]]; then
+  echo "警告: $GLOBAL_MD_TARGET 已存在且不是软链接，跳过（请手动处理）" >&2
+elif [[ "$DRY_RUN" == 1 ]]; then
+  echo "[dry-run] 全局 QWEN.md：新建链接 → $GLOBAL_MD_SRC"
+else
+  mkdir -p "$(dirname "$GLOBAL_MD_TARGET")"
+  ln -s "$GLOBAL_MD_SRC" "$GLOBAL_MD_TARGET"
+  echo "全局 QWEN.md：已链接 → $GLOBAL_MD_SRC"
+fi
+
 if [[ "$DRY_RUN" == 1 ]]; then
   echo "预览完成，未做任何写入。"
 else
-  echo "完成。重启 Qwen Code（或 /reload-plugins）使设置/插件变更生效；新开终端使 qwen 主题包装生效。"
+  echo "完成。重启 Qwen Code（或 /reload-plugins）使设置/插件变更生效；新开终端使 qwen 主题包装生效；全局 QWEN.md 新会话即加载。"
 fi
