@@ -2,5 +2,8 @@
   "ui": {
     "showToolCallDetails": false,
     "theme": "${QWEN_THEME}"
+  },
+  "experimental": {
+    "mods": true
   }
 }

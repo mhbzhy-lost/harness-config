@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # init-qwen.sh — 将仓库中的 Qwen Code 配置与插件同步到本机：
 #   1. qwen/settings.json 深度合并进 ~/.qwen/settings.json，注入 env.HARNESS_CONFIG_ROOT=仓库根，
-#      确保 skills.directories 含 <仓库根>/skills，注入 codex-proxy 生命周期 hooks（均为 per-machine 绝对路径）
+#      确保 skills.directories 含 <仓库根>/skills，注入 codex-proxy 生命周期 hooks，
+#      清理 comfyui-draw 旧版 classic hooks（已迁 Mods）（均为 per-machine 绝对路径）
 #   2. plugins/* 软链接进 ~/.qwen/extensions/
 #   3. qwen/shell.zsh 注册 source 进 ~/.zshrc（标记块，幂等；qwen 主题随系统明暗）
 #   4. qwen/QWEN.md 软链接为 ~/.qwen/QWEN.md（全局指令，跨机同步）
@@ -41,6 +42,7 @@ usage() {
 脚本会向目标设置的 env 注入 HARNESS_CONFIG_ROOT（本仓库绝对路径），
 确保 skills.directories 含本仓 skills/ 目录（保留其他已有条目），
 注入 codex-proxy 生命周期 hooks（按 name 幂等管理，保留其他 hooks），
+清理 comfyui-draw 旧版 classic hooks（/draw 已迁 Mods，由扩展自带 hooks/register.js 实现），
 把 qwen/shell.zsh 的 source 行注册进 ~/.zshrc（标记块，幂等），
 把 qwen/QWEN.md 软链接为全局 QWEN.md（真实文件则警告跳过，不破坏），
 把 qwen/agents/*.md 逐文件软链接进 ~/.qwen/agents/（同语义），
@@ -138,6 +140,16 @@ set_named_hook("SessionStart", "codex-proxy-start", hook_cmd + " register")
 set_named_hook("SessionEnd", "codex-proxy-end", hook_cmd + " unregister",
                "logout|prompt_input_exit|bypass_permissions_disabled|other")
 
+# comfyui-draw /draw 已迁 Mods（扩展自带 hooks/register.js，需 experimental.mods）：
+# 这里只清理旧版按名注入的 classic hooks（comfyui-draw-*），不再注入新条目
+for event in ("UserPromptExpansion", "PreToolUse"):
+    groups = hooks.setdefault(event, [])
+    if isinstance(groups, list):
+        for g in groups:
+            if isinstance(g, dict) and isinstance(g.get("hooks"), list):
+                g["hooks"] = [h for h in g["hooks"] if not (isinstance(h, dict) and isinstance(h.get("name"), str) and h["name"].startswith("comfyui-draw-"))]
+        groups[:] = [g for g in groups if isinstance(g, dict) and g.get("hooks")]
+
 changed = sorted(k for k in merged if existing.get(k) != merged[k])
 
 if dry_run:
@@ -146,6 +158,7 @@ if dry_run:
     print(f"[dry-run] 将注入 env.HARNESS_CONFIG_ROOT = {repo_root}")
     print(f"[dry-run] 将确保 skills.directories 含 {skills_dir}")
     print(f"[dry-run] 将注入 codex-proxy 生命周期 hooks（SessionStart/SessionEnd）")
+    print(f"[dry-run] 将清理 comfyui-draw 旧版 classic hooks（已迁 Mods）")
     sys.exit(0)
 
 if merged == existing:
