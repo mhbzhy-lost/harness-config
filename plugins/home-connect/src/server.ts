@@ -12,14 +12,11 @@
 
 import { spawn } from "node:child_process";
 import { rmSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 
 const PLUGIN_ROOT = resolve(import.meta.dirname, "..");
-/** 配置/身份根：不随插件代码分发。 */
-const RUNTIME_ROOT = resolve(
-	process.env.HOME_CONNECT_ROOT ?? resolve(homedir(), ".pi", "agent", "home-connect"),
-);
+/** 配置/身份根：默认插件目录（凭据置于仓内对应位置并 gitignore）；可用 HOME_CONNECT_ROOT 覆盖。 */
+const RUNTIME_ROOT = resolve(process.env.HOME_CONNECT_ROOT ?? PLUGIN_ROOT);
 const CONNECT = resolve(PLUGIN_ROOT, "scripts", "connect.sh");
 
 /** 单流输出上限：超出后截断并标注，避免把上下文塞满。 */

@@ -3,3 +3,9 @@
 node_modules/
 *.bak.*
 .DS_Store
+
+# home-connect 运行时凭据（config 下保留 *.example 模板）
+plugins/home-connect/.ssh/
+plugins/home-connect/.remote-files/
+plugins/home-connect/config/*
+!plugins/home-connect/config/*.example
