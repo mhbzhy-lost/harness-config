@@ -12,7 +12,7 @@ Qwen Code 个人配置与插件的多机同步仓库。
 | `qwen/settings.json` | 设置模板（仅跨机通用偏好：TUI 精简 + 主题插值） |
 | `qwen/shell.zsh` | qwen shell 包装：主题随系统明暗（macOS light→Xcode / dark→Qwen Dark） |
 | `qwen/QWEN.md` | 全局指令文件，软链接为 `~/.qwen/QWEN.md`（对所有项目生效） |
-| `qwen/agents/` | subagent 定义（Qwen 专属语法：review-agent 重模型覆盖），逐文件软链接进 `~/.qwen/agents/` |
+| `qwen/agents/` | subagent 定义（Qwen 专属语法：review-agent 重模型覆盖；antigravity 外部执行器委托 `agy acp`），逐文件软链接进 `~/.qwen/agents/` |
 | `qwen/extensions/` | 原生 Qwen extension（codex-proxy：/codex-login、/codex-status + 生命周期脚本），软链接进 `~/.qwen/extensions/` |
 | `skills/` | 独立 skill（superpowers 改写版：writing-skills / writing-plans），经 `skills.directories` 注入加载 |
 | `plugins/` | Agent Plugins v1 插件：deepseek-search / home-connect / playwright |
@@ -72,7 +72,7 @@ cp plugins/deepseek-search/.env.example plugins/deepseek-search/.env   # 填写�
 - pi 侧由 `init-pi.sh` 管理（`PI_PLUGINS_DIR` 可覆盖目标）；指向本仓 `plugins/` 的遗留整目录软链接会自动升级为逐插件链接，指向别处的整目录链接则拒绝处理。
 - 凭据（`.env`）与 `node_modules/` 不入库；缺依赖或缺凭据时脚本会给出提示。
 - 全局 QWEN.md 链接同语义（`QWEN_GLOBAL_MD` 可覆盖目标）：本机已有真实 `~/.qwen/QWEN.md` 时警告跳过，需手动备份后重跑。
-- agent 定义同语义逐文件链接（`QWEN_AGENTS_DIR` 可覆盖目录）：只管理仓内有的文件，本机自建的其他 agent 不受影响。注意 `qwen/agents/review-agent.md` 的 `model` 钉死了具体模型 ID，会随仓同步——其他机器需有该模型，否则自行调整。
+- agent 定义同语义逐文件链接（`QWEN_AGENTS_DIR` 可覆盖目录）：只管理仓内有的文件，本机自建的其他 agent 不受影响。注意 `qwen/agents/review-agent.md` 的 `model` 钉死了具体模型 ID，会随仓同步——其他机器需有该模型，否则自行调整。`qwen/agents/antigravity.md` 是外部执行器（`executor: acp → agy acp`），需要本机安装 Antigravity CLI 并完成 `agy` 登录后才能派发，缺 CLI 时报 `spawn agy ENOENT`、不会回退到 Qwen 模型。
 
 ## 常用命令
 
