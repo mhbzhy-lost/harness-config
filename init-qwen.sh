@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # init-qwen.sh — 将仓库中的 Qwen Code 配置与插件同步到本机：
-#   1. qwen/settings.json 深度合并进 ~/.qwen/settings.json（仅跨机通用偏好）
-#   2. 向设置 env 注入 HARNESS_CONFIG_ROOT=仓库根（本机绝对路径，供插件按相对路径定位仓内资源）
-#   3. plugins/* 软链接进 ~/.qwen/extensions/
+#   1. qwen/settings.json 深度合并进 ~/.qwen/settings.json，并注入 env.HARNESS_CONFIG_ROOT=仓库根
+#   2. plugins/* 软链接进 ~/.qwen/extensions/
+#   3. qwen/shell.zsh 注册 source 进 ~/.zshrc（标记块，幂等；qwen 主题随系统明暗）
 # 模型/提供商/认证/密钥均为 per-machine 配置，不在同步范围。
 set -euo pipefail
 
@@ -11,6 +11,8 @@ TEMPLATE="$SCRIPT_DIR/qwen/settings.json"
 PLUGINS_SRC="$SCRIPT_DIR/plugins"
 TARGET="${QWEN_SETTINGS_PATH:-$HOME/.qwen/settings.json}"
 EXT_DIR="${QWEN_EXTENSIONS_DIR:-$HOME/.qwen/extensions}"
+SHELL_RC="${QWEN_SHELL_RC:-$HOME/.zshrc}"
+SHELL_SNIPPET="$SCRIPT_DIR/qwen/shell.zsh"
 DRY_RUN=0
 
 usage() {
@@ -23,8 +25,10 @@ usage() {
 环境变量:
   QWEN_SETTINGS_PATH    覆盖目标配置路径（默认 ~/.qwen/settings.json）
   QWEN_EXTENSIONS_DIR   覆盖插件链接目录（默认 ~/.qwen/extensions）
+  QWEN_SHELL_RC         覆盖 shell 注册目标（默认 ~/.zshrc）
 
-脚本会向目标设置的 env 注入 HARNESS_CONFIG_ROOT（本仓库绝对路径）。
+脚本会向目标设置的 env 注入 HARNESS_CONFIG_ROOT（本仓库绝对路径），
+并把 qwen/shell.zsh 的 source 行注册进 ~/.zshrc（标记块，幂等）。
 EOF
 }
 
@@ -41,6 +45,7 @@ done
 
 command -v python3 >/dev/null 2>&1 || die "需要 python3"
 [[ -f "$TEMPLATE" ]] || die "找不到模板: $TEMPLATE"
+[[ -f "$SHELL_SNIPPET" ]] || die "找不到 shell 片段: $SHELL_SNIPPET"
 
 # --- 1. 合并设置 + 注入 HARNESS_CONFIG_ROOT ---
 QWEN_SYNC_DRY_RUN="$DRY_RUN" python3 - "$TEMPLATE" "$TARGET" "$SCRIPT_DIR" <<'PY'
@@ -123,8 +128,66 @@ PY
 source "$SCRIPT_DIR/lib-plugins.sh"
 link_plugins "$PLUGINS_SRC" "$EXT_DIR" "$DRY_RUN"
 
+# --- 3. 注册 qwen shell 片段进 ~/.zshrc ---
+QWEN_SYNC_DRY_RUN="$DRY_RUN" python3 - "$SHELL_RC" "$SHELL_SNIPPET" <<'PY'
+import os, re, sys, tempfile
+from datetime import datetime
+
+rc_path, snippet_path = sys.argv[1:3]
+dry_run = os.environ.get("QWEN_SYNC_DRY_RUN") == "1"
+
+start_marker = "# >>> harness-config qwen >>>"
+end_marker = "# <<< harness-config qwen <<<"
+line = f"[[ -f '{snippet_path}' ]] && source '{snippet_path}'"
+block = f"{start_marker}\n{line}\n{end_marker}"
+
+existing = ""
+if os.path.exists(rc_path):
+    with open(rc_path, encoding="utf-8") as f:
+        existing = f.read()
+
+pattern = re.compile(re.escape(start_marker) + r".*?" + re.escape(end_marker), re.DOTALL)
+if pattern.search(existing):
+    updated = pattern.sub(lambda m: block, existing, count=1)
+else:
+    sep = "" if (not existing or existing.endswith("\n")) else "\n"
+    updated = existing + sep + "\n" + block + "\n"
+
+if updated == existing:
+    print(f"shell 注册已是最新，无需写入: {rc_path}")
+    sys.exit(0)
+
+if dry_run:
+    print(f"[dry-run] shell 注册目标: {rc_path}")
+    print(f"[dry-run] 将写入/更新标记块，source: {snippet_path}")
+    sys.exit(0)
+
+backup_path = None
+if os.path.exists(rc_path):
+    backup_path = f"{rc_path}.bak.{datetime.now():%Y%m%d-%H%M%S}"
+    with open(rc_path, "rb") as src, open(backup_path, "wb") as dst:
+        dst.write(src.read())
+
+rc_dir = os.path.dirname(rc_path) or "."
+os.makedirs(rc_dir, exist_ok=True)
+fd, tmp_path = tempfile.mkstemp(dir=rc_dir, prefix=".zshrc-", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(updated)
+    if os.path.exists(rc_path):
+        os.chmod(tmp_path, os.stat(rc_path).st_mode & 0o777)
+    os.replace(tmp_path, rc_path)
+except BaseException:
+    os.unlink(tmp_path)
+    raise
+
+print(f"shell 注册已写入: {rc_path}")
+if backup_path:
+    print(f"已备份: {backup_path}")
+PY
+
 if [[ "$DRY_RUN" == 1 ]]; then
   echo "预览完成，未做任何写入。"
 else
-  echo "完成。重启 Qwen Code（或 /reload-plugins）使变更生效。"
+  echo "完成。重启 Qwen Code（或 /reload-plugins）使设置/插件变更生效；新开终端使 qwen 主题包装生效。"
 fi

@@ -1,5 +1,6 @@
 {
   "ui": {
-    "showToolCallDetails": false
+    "showToolCallDetails": false,
+    "theme": "${QWEN_THEME}"
   }
 }
