@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # init-qwen.sh — 将仓库中的 Qwen Code 配置与插件同步到本机：
 #   1. qwen/settings.json 深度合并进 ~/.qwen/settings.json，注入 env.HARNESS_CONFIG_ROOT=仓库根，
-#      并确保 skills.directories 含 <仓库根>/skills（均为 per-machine 绝对路径）
+#      确保 skills.directories 含 <仓库根>/skills，注入 codex-proxy 生命周期 hooks（均为 per-machine 绝对路径）
 #   2. plugins/* 软链接进 ~/.qwen/extensions/
 #   3. qwen/shell.zsh 注册 source 进 ~/.zshrc（标记块，幂等；qwen 主题随系统明暗）
 #   4. qwen/QWEN.md 软链接为 ~/.qwen/QWEN.md（全局指令，跨机同步）
 #   5. qwen/agents/*.md 软链接进 ~/.qwen/agents/（subagent 定义，含 review-agent 重模型覆盖）
+#   6. qwen/extensions/* 软链接进 ~/.qwen/extensions/（原生 extension：codex-proxy 命令等）
 # 模型/提供商/认证/密钥均为 per-machine 配置，不在同步范围。
 set -euo pipefail
 
@@ -20,6 +21,7 @@ GLOBAL_MD_SRC="$SCRIPT_DIR/qwen/QWEN.md"
 GLOBAL_MD_TARGET="${QWEN_GLOBAL_MD:-$HOME/.qwen/QWEN.md}"
 AGENTS_SRC="$SCRIPT_DIR/qwen/agents"
 AGENTS_DIR="${QWEN_AGENTS_DIR:-$HOME/.qwen/agents}"
+NATIVE_EXT_SRC="$SCRIPT_DIR/qwen/extensions"
 DRY_RUN=0
 
 usage() {
@@ -38,9 +40,11 @@ usage() {
 
 脚本会向目标设置的 env 注入 HARNESS_CONFIG_ROOT（本仓库绝对路径），
 确保 skills.directories 含本仓 skills/ 目录（保留其他已有条目），
+注入 codex-proxy 生命周期 hooks（按 name 幂等管理，保留其他 hooks），
 把 qwen/shell.zsh 的 source 行注册进 ~/.zshrc（标记块，幂等），
 把 qwen/QWEN.md 软链接为全局 QWEN.md（真实文件则警告跳过，不破坏），
-把 qwen/agents/*.md 逐文件软链接进 ~/.qwen/agents/（同语义）。
+把 qwen/agents/*.md 逐文件软链接进 ~/.qwen/agents/（同语义），
+并把 qwen/extensions/* 软链接进 ~/.qwen/extensions/（同语义）。
 EOF
 }
 
@@ -110,6 +114,30 @@ if not isinstance(dirs, list):
 if skills_dir not in dirs:
     dirs.append(skills_dir)
 
+# codex-proxy 生命周期 hooks：按 name 管理自有条目，保留其他 hooks
+hooks = merged.setdefault("hooks", {})
+if not isinstance(hooks, dict):
+    sys.exit("错误: 现有配置的 hooks 字段不是对象，无法注入 codex-proxy hooks")
+hook_script = os.path.join(repo_root, "qwen", "extensions", "codex-proxy", "scripts", "hook.sh")
+
+def set_named_hook(event, name, command, matcher=None):
+    groups = hooks.setdefault(event, [])
+    if not isinstance(groups, list):
+        sys.exit(f"错误: 现有配置的 hooks.{event} 不是数组")
+    for g in groups:
+        if isinstance(g, dict) and isinstance(g.get("hooks"), list):
+            g["hooks"] = [h for h in g["hooks"] if not (isinstance(h, dict) and h.get("name") == name)]
+    groups[:] = [g for g in groups if isinstance(g, dict) and g.get("hooks")]
+    entry = {"hooks": [{"type": "command", "name": name, "command": command}]}
+    if matcher:
+        entry["matcher"] = matcher
+    groups.append(entry)
+
+hook_cmd = f'bash "{hook_script}"'
+set_named_hook("SessionStart", "codex-proxy-start", hook_cmd + " register")
+set_named_hook("SessionEnd", "codex-proxy-end", hook_cmd + " unregister",
+               "logout|prompt_input_exit|bypass_permissions_disabled|other")
+
 changed = sorted(k for k in merged if existing.get(k) != merged[k])
 
 if dry_run:
@@ -117,6 +145,7 @@ if dry_run:
     print(f"[dry-run] 将变更的顶层键: {', '.join(changed) or '（无变更）'}")
     print(f"[dry-run] 将注入 env.HARNESS_CONFIG_ROOT = {repo_root}")
     print(f"[dry-run] 将确保 skills.directories 含 {skills_dir}")
+    print(f"[dry-run] 将注入 codex-proxy 生命周期 hooks（SessionStart/SessionEnd）")
     sys.exit(0)
 
 if merged == existing:
@@ -259,6 +288,40 @@ if [[ -d "$AGENTS_SRC" ]]; then
   done
 else
   echo "（无 qwen/agents/ 目录，跳过 agent 链接）"
+fi
+
+# --- 6. 原生 extension 软链接 ---
+if [[ -d "$NATIVE_EXT_SRC" ]]; then
+  [[ "$DRY_RUN" == 1 ]] || mkdir -p "$EXT_DIR"
+  for ext_path in "$NATIVE_EXT_SRC"/*/; do
+    ext_path="${ext_path%/}"
+    [[ -d "$ext_path" ]] || continue
+    name="$(basename "$ext_path")"
+    if [[ ! -f "$ext_path/qwen-extension.json" ]]; then
+      echo "跳过 ${name}：缺少 qwen-extension.json"
+      continue
+    fi
+    link="$EXT_DIR/$name"
+    if [[ -L "$link" ]]; then
+      if [[ "$(readlink "$link")" == "$ext_path" ]]; then
+        echo "extension ${name}：链接已正确"
+      elif [[ "$DRY_RUN" == 1 ]]; then
+        echo "[dry-run] extension ${name}：重指链接 → $ext_path"
+      else
+        ln -sfn "$ext_path" "$link"
+        echo "extension ${name}：链接已重指 → $ext_path"
+      fi
+    elif [[ -e "$link" ]]; then
+      echo "警告: $link 已存在且不是软链接，跳过（请手动处理）" >&2
+    elif [[ "$DRY_RUN" == 1 ]]; then
+      echo "[dry-run] extension ${name}：新建链接 → $ext_path"
+    else
+      ln -s "$ext_path" "$link"
+      echo "extension ${name}：已链接 → $ext_path"
+    fi
+  done
+else
+  echo "（无 qwen/extensions/ 目录，跳过原生 extension 链接）"
 fi
 
 if [[ "$DRY_RUN" == 1 ]]; then

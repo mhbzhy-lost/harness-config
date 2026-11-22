@@ -13,12 +13,13 @@ Qwen Code 个人配置与插件的多机同步仓库。
 | `qwen/shell.zsh` | qwen shell 包装：主题随系统明暗（macOS light→Xcode / dark→Qwen Dark） |
 | `qwen/QWEN.md` | 全局指令文件，软链接为 `~/.qwen/QWEN.md`（对所有项目生效） |
 | `qwen/agents/` | subagent 定义（Qwen 专属语法：review-agent 重模型覆盖），逐文件软链接进 `~/.qwen/agents/` |
+| `qwen/extensions/` | 原生 Qwen extension（codex-proxy：/codex-login、/codex-status + 生命周期脚本），软链接进 `~/.qwen/extensions/` |
 | `skills/` | 独立 skill（superpowers 改写版：writing-skills / writing-plans），经 `skills.directories` 注入加载 |
 | `plugins/` | Agent Plugins v1 插件：deepseek-search / home-connect / playwright |
 
 ## 同步范围
 
-- **同步**：模板中定义的设置键；`plugins/*` → `~/.qwen/extensions/<name>` 软链接；`qwen/shell.zsh` 的 source 注册进 `~/.zshrc`；`qwen/QWEN.md` → `~/.qwen/QWEN.md` 软链接（全局指令）；`skills/` 经注入的 `skills.directories` 加载（user 级 skill）；`qwen/agents/*.md` → `~/.qwen/agents/<name>.md` 逐文件软链接（subagent 定义）。
+- **同步**：模板中定义的设置键；`plugins/*` → `~/.qwen/extensions/<name>` 软链接；`qwen/shell.zsh` 的 source 注册进 `~/.zshrc`；`qwen/QWEN.md` → `~/.qwen/QWEN.md` 软链接（全局指令）；`skills/` 经注入的 `skills.directories` 加载（user 级 skill）；`qwen/agents/*.md` → `~/.qwen/agents/<name>.md` 逐文件软链接（subagent 定义）；`qwen/extensions/*` → `~/.qwen/extensions/<name>` 软链接 + codex-proxy 生命周期 hooks 注入 settings。
 - **不同步（per-machine）**：`model`、`modelProviders`、`security.auth`、`env` 中的密钥、`providerMetadata`、`$version`、`ui.autoModeAcknowledged` 等机器本地状态。模型/提供商/认证在各机器自行配置。
 
 `init-qwen.sh` 还会向本机设置注入 `env.HARNESS_CONFIG_ROOT`（本仓库绝对路径）——per-machine 值，不入模板。Qwen 将设置 `env` 注入进程环境，插件可据此按相对路径定位仓内资源（如 home-connect 凭据在 `$HARNESS_CONFIG_ROOT/plugins/home-connect`）；无锚点时插件回退自定位。仓库移动后重跑脚本更新。
@@ -33,6 +34,17 @@ Qwen Code 个人配置与插件的多机同步仓库。
 - 主题只在**启动时**确定：系统明暗切换后需重启 qwen 才跟随（引擎无实时监听）。
 - 未注册包装的机器上 `QWEN_THEME` 未定义，插值保留字面量→主题查找失败→回退默认深色。
 - **勿用 `/theme` 对话框选主题**：会把固定值写回 `ui.theme`，覆盖插值；误操作后改回 `"${QWEN_THEME}"`。
+
+## Codex 订阅桥接（codex-proxy）
+
+CLIProxyAPI（`brew install cliproxyapi`）把 ChatGPT 订阅配额暴露为本地 OpenAI 端点（仅绑 `127.0.0.1:8317`），生命周期由 Qwen hooks 自动管理，无需单独守护。
+
+- **架构**：`qwen/extensions/codex-proxy/` 提供 `/codex-login`、`/codex-status` 命令与 `scripts/manager.py`。标准 extension 不加载 hooks（实测），故 SessionStart/SessionEnd hooks 由 `init-qwen.sh` 注入用户 settings（按 name 幂等管理自有条目，保留其他 hooks；命令路径为 per-machine 绝对路径）。
+- **多进程安全**：hook 命令是 qwen 进程直接子进程（`$PPID` 即 qwen PID，实测）。PID 注册表 + `fcntl.flock`；SessionStart 注册，SessionEnd（非 clear 原因）注销；watchdog 每 5s 清理死亡 PID，最后一个会话消失即停 proxy。`kill -9` 崩溃由 watchdog 兜底（已测）。
+- **上游代理**：OpenAI 流量必须走代理——config `requests.proxy-url` 默认 `http://127.0.0.1:7897`（`CODEX_UPSTREAM_PROXY` 可覆盖），登录用 `-login-proxy` 同值。只作用于 cliproxyapi 进程，Qwen 自身流量不受影响。
+- **一次性接入**：`brew install cliproxyapi` → 确保 7897 代理客户端在跑 → `/codex-login`（浏览器 ChatGPT OAuth，命令引导后续模型条目写入）。模型条目属 per-machine 配置，不入模板。
+- **状态目录** `~/.qwen/codex-proxy/`：config.yaml、auth/（OAuth 凭据，per-machine 秘密，不在仓内）、proxy.log、注册表。未安装/未登录时 hooks 静默 no-op，不阻塞任何会话。
+- **风险**：个人自用属 OpenAI 当前默许的灰区；共享/转售触发风控（详见调研记忆）。
 
 ## 新机器用法
 

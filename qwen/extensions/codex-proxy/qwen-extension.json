@@ -1,0 +1,5 @@
+{
+  "name": "codex-proxy",
+  "version": "1.0.0",
+  "description": "CLIProxyAPI 生命周期随 Qwen Code 会话起停（hooks 由 init-qwen.sh 注入 settings），提供 /codex-login 与 /codex-status"
+}
