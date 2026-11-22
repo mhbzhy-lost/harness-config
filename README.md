@@ -6,7 +6,9 @@ Qwen Code 个人配置与插件的多机同步仓库。
 
 | 路径 | 说明 |
 |---|---|
-| `init-qwen.sh` | 同步脚本：合并设置 + 链接插件 |
+| `init-qwen.sh` | 同步脚本：合并设置 + 注入 HARNESS_CONFIG_ROOT + 链接插件到 Qwen |
+| `init-pi.sh` | 链接插件到 pi 的加载目录（默认 `~/.agents/plugins`） |
+| `lib-plugins.sh` | 两个 init 脚本共享的插件链接逻辑 |
 | `qwen/settings.json` | 设置模板（仅跨机通用偏好，当前只有 TUI 精简） |
 | `plugins/` | Agent Plugins v1 插件：deepseek-search / home-connect / playwright |
 
@@ -22,6 +24,7 @@ Qwen Code 个人配置与插件的多机同步仓库。
 ```bash
 git clone <repo-url> harness-config && cd harness-config
 ./init-qwen.sh
+./init-pi.sh      # 若使用 pi：链接插件到 ~/.agents/plugins
 # 按需补齐本机内容：
 (cd plugins/playwright && npm install)
 cp plugins/deepseek-search/.env.example plugins/deepseek-search/.env   # 填写密钥
@@ -39,6 +42,7 @@ cp plugins/deepseek-search/.env.example plugins/deepseek-search/.env   # 填写�
 ## 插件链接语义
 
 - 已是正确链接 → 跳过；指向别处的链接 → 重指；真实目录/文件 → 警告并跳过（不破坏）。
+- pi 侧由 `init-pi.sh` 管理（`PI_PLUGINS_DIR` 可覆盖目标）；指向本仓 `plugins/` 的遗留整目录软链接会自动升级为逐插件链接，指向别处的整目录链接则拒绝处理。
 - 凭据（`.env`）与 `node_modules/` 不入库；缺依赖或缺凭据时脚本会给出提示。
 
 ## 常用命令
