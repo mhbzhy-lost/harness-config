@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # init-qwen.sh — 将仓库中的 Qwen Code 配置与插件同步到本机：
 #   1. qwen/settings.json 深度合并进 ~/.qwen/settings.json（仅跨机通用偏好）
-#   2. plugins/* 软链接进 ~/.qwen/extensions/
+#   2. 向设置 env 注入 HARNESS_CONFIG_ROOT=仓库根（本机绝对路径，供插件按相对路径定位仓内资源）
+#   3. plugins/* 软链接进 ~/.qwen/extensions/
 # 模型/提供商/认证/密钥均为 per-machine 配置，不在同步范围。
 set -euo pipefail
 
@@ -22,6 +23,8 @@ usage() {
 环境变量:
   QWEN_SETTINGS_PATH    覆盖目标配置路径（默认 ~/.qwen/settings.json）
   QWEN_EXTENSIONS_DIR   覆盖插件链接目录（默认 ~/.qwen/extensions）
+
+脚本会向目标设置的 env 注入 HARNESS_CONFIG_ROOT（本仓库绝对路径）。
 EOF
 }
 
@@ -39,12 +42,12 @@ done
 command -v python3 >/dev/null 2>&1 || die "需要 python3"
 [[ -f "$TEMPLATE" ]] || die "找不到模板: $TEMPLATE"
 
-# --- 1. 合并设置 ---
-QWEN_SYNC_DRY_RUN="$DRY_RUN" python3 - "$TEMPLATE" "$TARGET" <<'PY'
+# --- 1. 合并设置 + 注入 HARNESS_CONFIG_ROOT ---
+QWEN_SYNC_DRY_RUN="$DRY_RUN" python3 - "$TEMPLATE" "$TARGET" "$SCRIPT_DIR" <<'PY'
 import copy, json, os, sys, tempfile
 from datetime import datetime
 
-template_path, target_path = sys.argv[1:3]
+template_path, target_path, repo_root = sys.argv[1:4]
 dry_run = os.environ.get("QWEN_SYNC_DRY_RUN") == "1"
 
 with open(template_path, encoding="utf-8") as f:
@@ -73,11 +76,16 @@ def merge(base, override):
 
 # 深拷贝，避免合并结果与 existing 共享子对象导致变更检测失效
 merged = merge(copy.deepcopy(existing), template)
+env = merged.setdefault("env", {})
+if not isinstance(env, dict):
+    sys.exit("错误: 现有配置的 env 字段不是对象，无法注入 HARNESS_CONFIG_ROOT")
+env["HARNESS_CONFIG_ROOT"] = repo_root
 changed = sorted(k for k in merged if existing.get(k) != merged[k])
 
 if dry_run:
     print(f"[dry-run] 设置目标: {target_path}")
     print(f"[dry-run] 将变更的顶层键: {', '.join(changed) or '（无变更）'}")
+    print(f"[dry-run] 将注入 env.HARNESS_CONFIG_ROOT = {repo_root}")
     sys.exit(0)
 
 if merged == existing:

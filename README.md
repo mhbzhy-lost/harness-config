@@ -15,6 +15,8 @@ Qwen Code 个人配置与插件的多机同步仓库。
 - **同步**：模板中定义的设置键；`plugins/*` → `~/.qwen/extensions/<name>` 软链接。
 - **不同步（per-machine）**：`model`、`modelProviders`、`security.auth`、`env` 中的密钥、`providerMetadata`、`$version`、`ui.autoModeAcknowledged` 等机器本地状态。模型/提供商/认证在各机器自行配置。
 
+`init-qwen.sh` 还会向本机设置注入 `env.HARNESS_CONFIG_ROOT`（本仓库绝对路径）——per-machine 值，不入模板。Qwen 将设置 `env` 注入进程环境，插件可据此按相对路径定位仓内资源（如 home-connect 凭据在 `$HARNESS_CONFIG_ROOT/plugins/home-connect`）；无锚点时插件回退自定位。仓库移动后重跑脚本更新。
+
 ## 新机器用法
 
 ```bash

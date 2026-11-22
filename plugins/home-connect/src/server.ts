@@ -15,8 +15,13 @@ import { rmSync } from "node:fs";
 import { resolve } from "node:path";
 
 const PLUGIN_ROOT = resolve(import.meta.dirname, "..");
-/** 配置/身份根：默认插件目录（凭据置于仓内对应位置并 gitignore）；可用 HOME_CONNECT_ROOT 覆盖。 */
-const RUNTIME_ROOT = resolve(process.env.HOME_CONNECT_ROOT ?? PLUGIN_ROOT);
+/** 配置/身份根：优先仓库锚点 HARNESS_CONFIG_ROOT（init-qwen.sh 写入设置 env）下的仓内位置；
+ *  无锚点时回退插件自定位，保证脱离 Qwen 直接运行也可用。 */
+const RUNTIME_ROOT = resolve(
+	process.env.HARNESS_CONFIG_ROOT
+		? resolve(process.env.HARNESS_CONFIG_ROOT, "plugins", "home-connect")
+		: PLUGIN_ROOT,
+);
 const CONNECT = resolve(PLUGIN_ROOT, "scripts", "connect.sh");
 
 /** 单流输出上限：超出后截断并标注，避免把上下文塞满。 */
