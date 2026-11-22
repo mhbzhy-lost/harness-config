@@ -31,7 +31,7 @@ git clone <repo-url> harness-config && cd harness-config
 ## 同步语义
 
 - **深度合并**：模板定义的键覆盖本机值；数组（如 `modelProviders.openai`）整体替换；本机其余已有键保留。
-- **不同步机器本地状态**：`ui.autoModeAcknowledged`、`ui.feedbackLastShownTimestamp`、`providerMetadata`、`$version` 由各机器自行维护。
+- **不同步机器本地状态**：`model`（当前模型选择）、`ui.autoModeAcknowledged`、`ui.feedbackLastShownTimestamp`、`providerMetadata`、`$version` 由各机器自行维护。
 - 写入前自动备份为 `<目标>.bak.<时间戳>`；原子写入；目标与备份权限均为 600。
 - 内容已一致时不写入（幂等，可重复运行）。
 

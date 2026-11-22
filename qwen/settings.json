@@ -2,11 +2,6 @@
   "ui": {
     "showToolCallDetails": false
   },
-  "model": {
-    "name": "qwen4-max-preview",
-    "baseUrl": "",
-    "reasoningEffort": "high"
-  },
   "modelProviders": {
     "openai": [
       {
