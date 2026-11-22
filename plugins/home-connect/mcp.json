@@ -5,6 +5,11 @@
       "type": "stdio",
       "command": "node",
       "args": ["./src/server.ts"]
+    },
+    "comfyui": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["./src/server-comfyui.ts"]
     }
   }
 }
