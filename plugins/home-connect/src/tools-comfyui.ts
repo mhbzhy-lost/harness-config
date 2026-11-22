@@ -317,8 +317,8 @@ export const COMFYUI_TOOLS: ToolDefinition[] = [
 		inputSchema: {
 			type: "object",
 			properties: {
-				prompt: { type: "string", description: "正向提示词；补丁图中所有正向条件节点。" },
-				negativePrompt: { type: "string", description: "负向提示词（零化负向的管线如 Krea2 不支持，会报错）。" },
+				prompt: { type: "string", description: "正向提示词（场景与主体内容）；拼接在 workflow 内置基础质量提示词之后，只写场景不要堆质量词。" },
+				negativePrompt: { type: "string", description: "负向提示词；拼接到 workflow 内置基础负向后（零化负向的管线如 Krea2 不支持，会报错）。" },
 				model: { type: "string", description: `模型名（comfyui_list 中 bound=true 的可用）；默认 ${DEFAULT_MODEL}。` },
 				width: { type: "number", description: "基础分辨率宽（不改动 pose scene_json）。" },
 				height: { type: "number", description: "基础分辨率高。" },
@@ -341,6 +341,7 @@ export const COMFYUI_TOOLS: ToolDefinition[] = [
 export const COMFYUI_INSTRUCTIONS = [
 	"本服务负责 WSL ComfyUI 生图（comfyui_generate）与资源查询（comfyui_list）；连接层与 home-connect 共享。",
 	"控制面只有 prompt/negativePrompt/model/width/height/upscale/lora；模型→workflow 绑定内置，不要试图传 workflow 或采样细节。",
+	"提示词为拼接语义：基础质量词已固化在 workflow 图内；风格、角色触发词与场景由 prompt 提供，不要重复堆质量词。",
 	"选 model/lora 前先 comfyui_list（bound=false 的模型未绑定 workflow，generate 会拒绝）。",
 	"连接异常（WSL 休眠、通道不可达）先用 home 服务的 home_status 诊断，不要在本服务里拼 ssh。",
 	"中继按流量计费：大图/多图优先在家庭 LAN 内生成；超时返回带 promptId，可稍后查 /history 而非盲目重试。",

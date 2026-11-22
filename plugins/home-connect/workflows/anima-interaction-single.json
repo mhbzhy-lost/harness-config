@@ -39,7 +39,7 @@
   "7": {
     "class_type": "CLIPTextEncode",
     "inputs": {
-      "text": "masterpiece, best quality, absurdres, score_7, score_8, score_9, anime, detailed, intricate, film grain, depth of field, 1girl, solo, sitting, aigirls, aigirls（deepseek）, blue hair, gradient hair, very long hair, wavy hair, ahoge, blue eyes, fins, cetacean tail, maid headdress, blue ribbon, sitting",
+      "text": "masterpiece, best quality, absurdres, score_7, score_8, score_9, anime, detailed, intricate, film grain, depth of field",
       "clip": [
         "4",
         1
@@ -160,7 +160,7 @@
   "25": {
     "class_type": "CLIPTextEncode",
     "inputs": {
-      "text": "masterpiece, best quality, absurdres, score_7, score_8, score_9, anime, 1girl, solo, sitting, aigirls, aigirls（deepseek）, blue hair, gradient hair, very long hair, wavy hair, ahoge, blue eyes, fins, cetacean tail, maid headdress, blue ribbon, sitting",
+      "text": "masterpiece, best quality, absurdres, score_7, score_8, score_9, anime, detailed, intricate, film grain, depth of field",
       "clip": [
         "4",
         1

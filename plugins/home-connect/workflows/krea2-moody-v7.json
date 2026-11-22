@@ -31,7 +31,7 @@
   "5": {
     "class_type": "CLIPTextEncode",
     "inputs": {
-      "text": "A high-resolution anime illustration of a young woman standing on a rooftop at dusk, city lights glowing softly below, wind lifting her long silver hair, detailed eyes, cinematic lighting, vibrant colors, delicate linework, masterpiece quality.",
+      "text": "High resolution, cinematic lighting, sharp focus, intricate details, natural skin texture, masterpiece quality.",
       "clip": [
         "2",
         0
