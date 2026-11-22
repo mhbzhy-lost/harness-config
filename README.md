@@ -23,6 +23,8 @@ git clone <repo-url> harness-config && cd harness-config
 # 按需补齐本机内容：
 (cd plugins/playwright && npm install)
 cp plugins/deepseek-search/.env.example plugins/deepseek-search/.env   # 填写密钥
+# home-connect 凭据/身份在 ~/.pi/agent/home-connect（.env、.ssh/、config/*.env），
+# 不随仓库分发，需自行准备；config/ 下有各 .env.example 模板
 # 模型/提供商/认证在本机自行配置
 ```
 
