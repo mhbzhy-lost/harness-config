@@ -1,0 +1,230 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "DeltaMix 3.8B V8.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen_3_06b_base.safetensors",
+      "type": "stable_diffusion",
+      "device": "default"
+    }
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "qwen_image_vae.safetensors"
+    }
+  },
+  "4": {
+    "class_type": "LoraLoader",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "clip": [
+        "2",
+        0
+      ],
+      "lora_name": "aigrilsV1.0.safetensors",
+      "strength_model": 1,
+      "strength_clip": 1
+    }
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "masterpiece, best quality, absurdres, score_7, score_8, score_9, anime, detailed, intricate, film grain, depth of field, 1girl, solo, sitting, aigirls, aigirls（deepseek）, blue hair, gradient hair, very long hair, wavy hair, ahoge, blue eyes, fins, cetacean tail, maid headdress, blue ribbon, sitting",
+      "clip": [
+        "4",
+        1
+      ]
+    }
+  },
+  "8": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "low quality, worst quality, score_1, score_2, score_3, early, old, monochrome, shiny skin, abs, sketch",
+      "clip": [
+        "4",
+        1
+      ]
+    }
+  },
+  "10": {
+    "class_type": "EmptySD3LatentImage",
+    "inputs": {
+      "width": 912,
+      "height": 1216,
+      "batch_size": 1
+    }
+  },
+  "11": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "positive": [
+        "7",
+        0
+      ],
+      "negative": [
+        "8",
+        0
+      ],
+      "latent_image": [
+        "10",
+        0
+      ],
+      "seed": 1,
+      "steps": 30,
+      "cfg": 4.5,
+      "sampler_name": "dpmpp_2m",
+      "scheduler": "sgm_uniform",
+      "denoise": 1
+    }
+  },
+  "12": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "14",
+        0
+      ],
+      "filename_prefix": "interaction/t/initial"
+    }
+  },
+  "14": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "11",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    }
+  },
+  "21": {
+    "class_type": "UpscaleModelLoader",
+    "inputs": {
+      "model_name": "4x-AnimeSharp.safetensors"
+    }
+  },
+  "22": {
+    "class_type": "ImageUpscaleWithModel",
+    "inputs": {
+      "upscale_model": [
+        "21",
+        0
+      ],
+      "image": [
+        "14",
+        0
+      ]
+    }
+  },
+  "23": {
+    "class_type": "ImageScaleBy",
+    "inputs": {
+      "image": [
+        "22",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "scale_by": 0.5
+    }
+  },
+  "24": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": [
+        "23",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    }
+  },
+  "25": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "masterpiece, best quality, absurdres, score_7, score_8, score_9, anime, 1girl, solo, sitting, aigirls, aigirls（deepseek）, blue hair, gradient hair, very long hair, wavy hair, ahoge, blue eyes, fins, cetacean tail, maid headdress, blue ribbon, sitting",
+      "clip": [
+        "4",
+        1
+      ]
+    }
+  },
+  "26": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "low quality, worst quality, score_1, score_2, score_3, early, old, monochrome, shiny skin, abs, sketch",
+      "clip": [
+        "4",
+        1
+      ]
+    }
+  },
+  "27": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "4",
+        0
+      ],
+      "positive": [
+        "25",
+        0
+      ],
+      "negative": [
+        "26",
+        0
+      ],
+      "latent_image": [
+        "24",
+        0
+      ],
+      "seed": 2,
+      "steps": 16,
+      "cfg": 4.5,
+      "sampler_name": "dpmpp_2m",
+      "scheduler": "sgm_uniform",
+      "denoise": 0.25
+    }
+  },
+  "28": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "27",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    }
+  },
+  "38": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "28",
+        0
+      ],
+      "filename_prefix": "interaction/t/final"
+    }
+  }
+}

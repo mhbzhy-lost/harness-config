@@ -1,18 +1,61 @@
 /**
  * comfyui 工具：经 home-connect 连接层（wsl 通道）驱动 ComfyUI HTTP API 生图。
- * 图默认取 WSL 侧 ~/anima-lab/graph-single1.json（API 格式），参数化补丁后提交，
- * 轮询 /history，输出经连接层取回本地。全部远程操作走 execRemote/copyFile。
+ *
+ * 控制面仅暴露：正/负提示词、基础分辨率、模型、超分倍率、LoRA 选择。
+ * 模型 → workflow 的绑定在 MODEL_BINDINGS 内置（调用方不感知 workflow）；
+ * 采样细节（steps/cfg/sampler/scheduler/denoise）一律由绑定的 workflow 决定。
+ * 全部远程操作走 execRemote/copyFile。
  */
 
-import { existsSync, mkdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import { RUNTIME_ROOT, acquireCopy, copyBusy, copyFile, execRemote, releaseCopy } from "./connection.ts";
+import { PLUGIN_ROOT, RUNTIME_ROOT, acquireCopy, copyBusy, copyFile, execRemote, releaseCopy } from "./connection.ts";
 import { patchComfyGraph, type ComfyGraph } from "./graph.ts";
 import { failure, textResult, type ToolDefinition } from "./mcp.ts";
 
-const COMFY_DEFAULT_WORKFLOW = "~/anima-lab/graph-single1.json";
+const COMFY_PORT = 8188;
 const COMFY_START_SCRIPT = "~/.config/comfy-start.sh";
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** 超分链绑定：scale_by = 目标净倍率 / modelFactor；upscale=1 时删除整条 hires 链（含 finalSave）。 */
+interface HiresBinding {
+	scaleNode: string;
+	modelFactor: number;
+	finalSave: string;
+	pruneNodes: string[];
+}
+
+interface ModelBinding {
+	/** local=true 时为相对插件根的仓内路径；否则为 WSL 侧路径（~ 开头）。 */
+	workflow: string;
+	local?: boolean;
+	defaultUpscale?: number;
+	hires?: HiresBinding;
+}
+
+/** 模型 → workflow 绑定。节点 ID 为对应图的内部契约，改图时需同步更新。 */
+const MODEL_BINDINGS: Record<string, ModelBinding> = {
+	"oneObsessionAnima_v40.safetensors": {
+		// 抄自 Mac ~/yugang/src/tools/draw/workflow-interaction-single.json（API 格式）；
+		// 原图 node4 为 AnimaLoRARemapTagLoader（lab 实例未装），仓内副本已适配为 LoraLoader（输出槽同 MODEL/CLIP）。
+		workflow: "workflows/anima-interaction-single.json",
+		local: true,
+		defaultUpscale: 2,
+		hires: {
+			scaleNode: "23",
+			modelFactor: 4,
+			finalSave: "38",
+			pruneNodes: ["21", "22", "23", "24", "25", "26", "27", "28"],
+		},
+	},
+	"Moody-Krea2-Mix-v7-fp8.safetensors": {
+		// 由 anima-prod 的 UI 图 Krea2_Moody_v7.json 转换而来（Krea2 管线，无超分链/LoRA）
+		workflow: "workflows/krea2-moody-v7.json",
+		local: true,
+		defaultUpscale: 1,
+	},
+};
+const DEFAULT_MODEL = "oneObsessionAnima_v40.safetensors";
 
 async function comfyuiGenerate(args: Record<string, unknown>) {
 	try {
@@ -23,22 +66,23 @@ async function comfyuiGenerate(args: Record<string, unknown>) {
 }
 
 async function comfyuiGenerateInner(args: Record<string, unknown>) {
-	const port = typeof args.port === "number" && args.port > 0 ? Math.floor(args.port) : 8188;
-	const base = `http://127.0.0.1:${port}`;
+	const base = `http://127.0.0.1:${COMFY_PORT}`;
 	const timeoutSec = typeof args.timeoutSec === "number" ? Math.min(Math.max(args.timeoutSec, 30), 1800) : 600;
 	const startedAt = Date.now();
 	const deadline = startedAt + timeoutSec * 1000;
-	const autostart = args.autostart !== false;
-	const fetch = args.fetch !== false;
-	const workflowPath = typeof args.workflowPath === "string" && args.workflowPath.trim() ? args.workflowPath.trim() : COMFY_DEFAULT_WORKFLOW;
+
+	const model = typeof args.model === "string" && args.model.trim() ? args.model.trim() : DEFAULT_MODEL;
+	const binding = MODEL_BINDINGS[model];
+	if (!binding) {
+		return failure(`模型 ${model} 未绑定 workflow；已绑定: ${Object.keys(MODEL_BINDINGS).join(", ")}（comfyui_list 可查可用模型与绑定状态）`);
+	}
 
 	const exec = (command: string, t = 60) => execRemote("wsl", command, t);
 
-	// 1) API 存活；未运行时可选自启（经用户的 comfy-start.sh，脱离 SSH 存活）
+	// 1) API 存活；未运行时自启（经用户的 comfy-start.sh，脱离 SSH 存活）
 	const stats = await exec(`curl -s -m 8 ${base}/system_stats`, 45);
 	let autostarted = false;
 	if (stats.result.code !== 0 || !stats.result.stdout.trim()) {
-		if (!autostart) return failure(`ComfyUI 未运行（${base}）；autostart=true 可经 ${COMFY_START_SCRIPT} 自动启动`);
 		const start = await exec(`nohup bash ${COMFY_START_SCRIPT} >/dev/null 2>&1 & echo comfyui-started`, 60);
 		if (start.result.code !== 0) return failure(`ComfyUI 自启失败: ${start.result.stderr.trim()}`);
 		autostarted = true;
@@ -51,15 +95,18 @@ async function comfyuiGenerateInner(args: Record<string, unknown>) {
 		if (!up) return failure("ComfyUI 自启后 180s 内仍未就绪；请在 WSL 上检查 ~/anima-lab/comfy.log");
 	}
 
-	// 2) 加载图（内联 workflow 优先，否则读 WSL 侧文件）
+	// 2) 按绑定加载图（仓内文件或 WSL 侧文件）
 	let graph: ComfyGraph;
-	if (args.workflow !== undefined) {
-		if (typeof args.workflow !== "object" || args.workflow === null || Array.isArray(args.workflow)) return failure("workflow 必须是 API 格式的图对象");
-		graph = args.workflow as ComfyGraph;
+	if (binding.local) {
+		try {
+			graph = JSON.parse(readFileSync(resolve(PLUGIN_ROOT, binding.workflow), "utf8"));
+		} catch (error) {
+			return failure(`读取仓内 workflow 失败 ${binding.workflow}: ${(error as Error).message}`);
+		}
 	} else {
-		const cat = await exec(`cat ${workflowPath}`, 45);
-		if (cat.result.code !== 0) return failure(`读取 workflow 失败 ${workflowPath}: ${cat.result.stderr.trim()}`);
-		try { graph = JSON.parse(cat.result.stdout); } catch { return failure(`${workflowPath} 不是合法 JSON（需要 API 格式图）`); }
+		const cat = await exec(`cat ${binding.workflow}`, 45);
+		if (cat.result.code !== 0) return failure(`读取 workflow 失败 ${binding.workflow}: ${cat.result.stderr.trim()}`);
+		try { graph = JSON.parse(cat.result.stdout); } catch { return failure(`${binding.workflow} 不是合法 JSON（需要 API 格式图）`); }
 	}
 	for (const [id, node] of Object.entries(graph)) {
 		if (!node || typeof node !== "object" || typeof node.class_type !== "string" || !node.inputs || typeof node.inputs !== "object") {
@@ -67,29 +114,39 @@ async function comfyuiGenerateInner(args: Record<string, unknown>) {
 		}
 	}
 
-	// 3) 参数化补丁
+	// 3) 超分倍率：1 = bypass hires 链；>1 = 净倍率（scale_by = 倍率 / 放大模型倍率）
+	const upscale = typeof args.upscale === "number" ? args.upscale : (binding.defaultUpscale ?? 1);
+	if (!(upscale >= 1)) return failure("upscale 必须 >= 1");
+	if (binding.hires) {
+		if (upscale === 1) {
+			// bypass：删除整条 hires 链与 finalSave，只留 initial SaveImage，避免重复输出
+			for (const id of [...binding.hires.pruneNodes, binding.hires.finalSave]) delete graph[id];
+		} else {
+			const scaleNode = graph[binding.hires.scaleNode];
+			if (!scaleNode) return failure(`绑定契约失效：图缺少节点 ${binding.hires.scaleNode}`);
+			scaleNode.inputs.scale_by = upscale / binding.hires.modelFactor;
+		}
+	} else if (upscale !== 1) {
+		return failure(`模型 ${model} 绑定的 workflow 无超分链，upscale 只能为 1`);
+	}
+
+	// 4) 参数化补丁（控制面之外的细节不动）
 	const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-	const filenamePrefix = typeof args.filenamePrefix === "string" && args.filenamePrefix.trim() ? args.filenamePrefix.trim() : `home-connect/${stamp}`;
+	const filenamePrefix = `home-connect/${stamp}`;
 	let patches: string[];
 	try {
 		patches = patchComfyGraph(graph, {
 			prompt: typeof args.prompt === "string" ? args.prompt : undefined,
 			negativePrompt: typeof args.negativePrompt === "string" ? args.negativePrompt : undefined,
-			seed: typeof args.seed === "number" ? args.seed : undefined,
-			steps: typeof args.steps === "number" ? args.steps : undefined,
-			cfg: typeof args.cfg === "number" ? args.cfg : undefined,
-			denoise: typeof args.denoise === "number" ? args.denoise : undefined,
-			sampler: typeof args.sampler === "string" ? args.sampler : undefined,
-			scheduler: typeof args.scheduler === "string" ? args.scheduler : undefined,
 			width: typeof args.width === "number" ? args.width : undefined,
 			height: typeof args.height === "number" ? args.height : undefined,
-			checkpoint: typeof args.checkpoint === "string" ? args.checkpoint : undefined,
+			model,
 			lora: typeof args.lora === "string" ? args.lora : undefined,
 			filenamePrefix,
 		});
 	} catch (error) { return failure((error as Error).message); }
 
-	// 4) 提交（heredoc 落盘 + curl -d @file，JSON 零转义）
+	// 5) 提交（heredoc 落盘 + curl -d @file，JSON 零转义）
 	const payload = JSON.stringify({ prompt: graph, client_id: "comfyui-mcp" });
 	const submitCmd = [
 		"cat > /tmp/comfyui-mcp-$$.json <<'__COMFY_PAYLOAD__'",
@@ -110,7 +167,7 @@ async function comfyuiGenerateInner(args: Record<string, unknown>) {
 	const promptId = submitted.prompt_id;
 	if (!promptId) return failure(`提交响应缺少 prompt_id: ${submit.result.stdout.slice(0, 500)}`);
 
-	// 5) 轮询 /history 至完成
+	// 6) 轮询 /history 至完成
 	let history: { outputs?: Record<string, { images?: Array<{ filename: string; subfolder?: string; type: string }> }>; status?: { status_str?: string; completed?: boolean; messages?: unknown } } | null = null;
 	while (Date.now() < deadline) {
 		await sleep(3000);
@@ -127,7 +184,7 @@ async function comfyuiGenerateInner(args: Record<string, unknown>) {
 		return failure(`生图失败: ${JSON.stringify(status.messages ?? status).slice(0, 2000)}（prompt_id=${promptId}）`);
 	}
 
-	// 6) 收集输出并在 WSL 侧解析绝对路径（运行实例的 cwd / --base-directory 推导 output 根）
+	// 7) 收集输出并在 WSL 侧解析绝对路径（运行实例的 cwd / --base-directory 推导 output 根）
 	const images: Array<{ nodeId: string; filename: string; subfolder: string }> = [];
 	for (const [nodeId, out] of Object.entries(history.outputs ?? {})) {
 		for (const img of out.images ?? []) {
@@ -141,7 +198,7 @@ async function comfyuiGenerateInner(args: Record<string, unknown>) {
 		"python3 -c '",
 		"import json, os, subprocess, sys",
 		"items = json.load(sys.stdin)",
-		`pids = subprocess.run(["pgrep", "-f", "main.py.*--port ${port}"], capture_output=True, text=True).stdout.split()`,
+		`pids = subprocess.run(["pgrep", "-f", "main.py.*--port ${COMFY_PORT}"], capture_output=True, text=True).stdout.split()`,
 		'pids = [p for p in pids if p != str(os.getpid())]',
 		'pid = pids[0] if pids else ""',
 		'cwd = os.readlink("/proc/" + pid + "/cwd") if pid else ""',
@@ -169,38 +226,34 @@ async function comfyuiGenerateInner(args: Record<string, unknown>) {
 	if (resolved.result.code !== 0) return failure(`输出路径解析失败: ${resolved.result.stderr.trim()}`);
 	const paths = resolved.result.stdout.trim().split("\n");
 
-	// 7) 经连接层取回本地（进程内单飞门禁；跨进程见 connection.ts 说明）
-	const localDir = typeof args.localDir === "string" && args.localDir.trim() ? resolve(args.localDir.trim()) : resolve(RUNTIME_ROOT, ".remote-files", "comfyui");
+	// 8) 经连接层取回本地（进程内单飞门禁；跨进程见 connection.ts 说明）
+	const localDir = resolve(RUNTIME_ROOT, ".remote-files", "comfyui");
+	mkdirSync(localDir, { recursive: true });
+	while (copyBusy() && Date.now() < deadline) await sleep(2000);
+	if (!acquireCopy()) return failure("文件传输通道忙，无法取回图片；稍后重试");
 	const outputs: Array<Record<string, unknown>> = [];
-	if (fetch) {
-		mkdirSync(localDir, { recursive: true });
-		while (copyBusy() && Date.now() < deadline) await sleep(2000);
-		if (!acquireCopy()) return failure("文件传输通道忙，无法取回图片；稍后重试或 fetch=false");
-		try {
-			for (let i = 0; i < images.length; i++) {
-				const remotePath = paths[i] ?? "NOT_FOUND";
-				const entry: Record<string, unknown> = { nodeId: images[i].nodeId, filename: images[i].filename, subfolder: images[i].subfolder, remotePath };
-				if (remotePath.startsWith("NOT_FOUND")) { entry.error = "WSL 上未找到输出文件"; outputs.push(entry); continue; }
-				let localPath = resolve(localDir, images[i].filename);
-				if (existsSync(localPath)) localPath = resolve(localDir, `${Date.now()}-${images[i].filename}`);
-				const got = await copyFile("wsl", "get", localPath, remotePath);
-				if (got.result.code === 0 && existsSync(localPath)) {
-					entry.localPath = localPath;
-					entry.bytes = statSync(localPath).size;
-				} else {
-					entry.error = `取回失败: ${got.result.stderr.trim().slice(0, 300)}`;
-				}
-				outputs.push(entry);
-			}
-		} finally { releaseCopy(); }
-	} else {
+	try {
 		for (let i = 0; i < images.length; i++) {
-			outputs.push({ nodeId: images[i].nodeId, filename: images[i].filename, subfolder: images[i].subfolder, remotePath: paths[i] ?? "NOT_FOUND" });
+			const remotePath = paths[i] ?? "NOT_FOUND";
+			const entry: Record<string, unknown> = { nodeId: images[i].nodeId, filename: images[i].filename, subfolder: images[i].subfolder, remotePath };
+			if (remotePath.startsWith("NOT_FOUND")) { entry.error = "WSL 上未找到输出文件"; outputs.push(entry); continue; }
+			let localPath = resolve(localDir, images[i].filename);
+			if (existsSync(localPath)) localPath = resolve(localDir, `${Date.now()}-${images[i].filename}`);
+			const got = await copyFile("wsl", "get", localPath, remotePath);
+			if (got.result.code === 0 && existsSync(localPath)) {
+				entry.localPath = localPath;
+				entry.bytes = statSync(localPath).size;
+			} else {
+				entry.error = `取回失败: ${got.result.stderr.trim().slice(0, 300)}`;
+			}
+			outputs.push(entry);
 		}
-	}
-	const ok = outputs.some((o) => (fetch ? o.localPath : !String(o.remotePath).startsWith("NOT_FOUND")));
+	} finally { releaseCopy(); }
+	const ok = outputs.some((o) => o.localPath);
 	return textResult({
 		promptId,
+		model,
+		upscale,
 		channel: stats.channel,
 		woke: stats.woke,
 		autostarted,
@@ -211,49 +264,92 @@ async function comfyuiGenerateInner(args: Record<string, unknown>) {
 	}, !ok);
 }
 
+/** 查询可用模型/LoRA/放大模型；模型附带 workflow 绑定状态。 */
+async function comfyuiList() {
+	const base = `http://127.0.0.1:${COMFY_PORT}`;
+	const cmd = [
+		"for n in CheckpointLoaderSimple UNETLoader LoraLoader UpscaleModelLoader; do",
+		'  echo "== $n"',
+		`  curl -s -m 15 ${base}/object_info/$n | python3 -c '`,
+		"import json, sys",
+		"try:",
+		"    d = json.load(sys.stdin)",
+		"except Exception:",
+		"    sys.exit(0)",
+		"for v in d.values():",
+		'    req = v.get("input", {}).get("required", {})',
+		'    for key in ("ckpt_name", "unet_name", "lora_name", "model_name"):',
+		"        if key not in req: continue",
+		"        spec = req[key]",
+		"        names = []",
+		"        if isinstance(spec, list) and spec and isinstance(spec[0], list):",
+		"            names = spec[0]",
+		'        elif isinstance(spec, list) and len(spec) > 1 and isinstance(spec[1], dict) and isinstance(spec[1].get("options"), list):',
+		'            names = spec[1]["options"]',
+		"        for name in names:",
+		"            print(name)",
+		"'",
+		"done",
+	].join("\n");
+	const { result } = await execRemote("wsl", cmd, 90);
+	if (result.code !== 0) return failure(`查询失败（ComfyUI 未运行？先 comfyui_generate 自启或 home_status 诊断）: ${result.stderr.trim()}`);
+	const sections: Record<string, string[]> = {};
+	let current = "";
+	for (const line of result.stdout.split("\n")) {
+		if (line.startsWith("== ")) { current = line.slice(3).trim(); sections[current] = []; continue; }
+		const name = line.trim();
+		if (name && current) sections[current].push(name);
+	}
+	const models = [...new Set([...(sections.CheckpointLoaderSimple ?? []), ...(sections.UNETLoader ?? [])])];
+	if (models.length === 0) return failure("ComfyUI 未返回模型清单（服务未就绪或 API 异常）");
+	return textResult({
+		models: models.map((name) => ({ name, bound: name in MODEL_BINDINGS })),
+		loras: sections.LoraLoader ?? [],
+		upscaleModels: sections.UpscaleModelLoader ?? [],
+	});
+}
+
 export const COMFYUI_TOOLS: ToolDefinition[] = [
 	{
 		name: "comfyui_generate",
 		description:
-			"驱动 WSL 上的 ComfyUI 生图并把结果取回本地，复用 home-connect 连接层（LAN 直连/中继自动选路、WSL 自动唤醒）。默认加载 ~/anima-lab/graph-single1.json（单角色 txt2img + hires fix），可用 workflowPath 或内联 workflow（API 格式）换任意图。prompt/negativePrompt 自动补丁正/负向条件节点；seed 默认随机；steps/cfg/sampler/scheduler/denoise/width/height/checkpoint/lora 按需覆盖；SaveImage 前缀默认 home-connect/<时间戳>。ComfyUI 未运行时经 ~/.config/comfy-start.sh 自动启动（autostart=false 关闭）。输出默认下载到插件 .remote-files/comfyui/（fetch=false 仅留远端路径）。中继按流量计费：大图/多图优先在家庭 LAN 内使用。",
+			"驱动 WSL 上的 ComfyUI 生图并把结果取回本地，复用 home-connect 连接层（LAN 直连/中继自动选路、WSL 自动唤醒）。控制面仅：prompt/negativePrompt、model、width/height（基础分辨率）、upscale（超分净倍率，1=关闭超分链）、lora（名称或 none  bypass）。模型→workflow 绑定内置（调用方不感知 workflow）；steps/cfg/sampler 等细节由 workflow 决定，seed 内部随机。ComfyUI 未运行时经 ~/.config/comfy-start.sh 自动启动。输出取回插件 .remote-files/comfyui/，返回 localPath 可直接查看。可用模型/LoRA 用 comfyui_list 查询；中继按流量计费，大图/多图优先 LAN。",
 		inputSchema: {
 			type: "object",
 			properties: {
 				prompt: { type: "string", description: "正向提示词；补丁图中所有正向条件节点。" },
-				negativePrompt: { type: "string", description: "负向提示词。" },
-				workflowPath: { type: "string", description: `WSL 侧 API 格式图路径，默认 ${COMFY_DEFAULT_WORKFLOW}。` },
-				workflow: { type: "object", description: "内联 API 格式图（优先于 workflowPath）。" },
-				checkpoint: { type: "string", description: "覆盖 UNETLoader.unet_name / CheckpointLoaderSimple.ckpt_name。" },
-				lora: { type: "string", description: "覆盖 LoraLoader.lora_name。" },
-				width: { type: "number", description: "覆盖潜空间/采样器宽度（不改动 pose scene_json）。" },
-				height: { type: "number", description: "覆盖潜空间/采样器高度。" },
-				seed: { type: "number", description: "指定可复现；默认每个采样器独立随机。" },
-				steps: { type: "number" },
-				cfg: { type: "number" },
-				denoise: { type: "number" },
-				sampler: { type: "string", description: "如 euler_ancestral、res_multistep。" },
-				scheduler: { type: "string", description: "如 sgm_uniform、karras、simple。" },
-				filenamePrefix: { type: "string", description: "SaveImage 前缀（可含子目录），默认 home-connect/<时间戳>。" },
-				timeoutSec: { type: "number", minimum: 30, maximum: 1800, description: "整体超时秒数，默认 600。" },
-				autostart: { type: "boolean", description: "ComfyUI 未运行时自动启动，默认 true。" },
-				fetch: { type: "boolean", description: "把输出图片取回本地，默认 true。" },
-				localDir: { type: "string", description: "本地保存目录，默认 <运行时根>/.remote-files/comfyui。" },
-				port: { type: "number", description: "ComfyUI 端口，默认 8188。" },
+				negativePrompt: { type: "string", description: "负向提示词（零化负向的管线如 Krea2 不支持，会报错）。" },
+				model: { type: "string", description: `模型名（comfyui_list 中 bound=true 的可用）；默认 ${DEFAULT_MODEL}。` },
+				width: { type: "number", description: "基础分辨率宽（不改动 pose scene_json）。" },
+				height: { type: "number", description: "基础分辨率高。" },
+				upscale: { type: "number", minimum: 1, description: "超分净倍率：1=仅基础分辨率（bypass 超分链），2=2 倍最终输出；默认取绑定值。无超分链的绑定只能为 1。" },
+				lora: { type: "string", description: "LoRA 名（comfyui_list 查询）；none=零强度 bypass；省略=用 workflow 自带 LoRA。" },
+				timeoutSec: { type: "number", minimum: 30, maximum: 1800, description: "整体超时秒数（运维参数），默认 600。" },
 			},
 			additionalProperties: false,
 		},
 	},
+	{
+		name: "comfyui_list",
+		description:
+			"查询 WSL ComfyUI 当前可用的模型（checkpoints/diffusion models，附 workflow 绑定状态 bound）、LoRA 与放大模型清单。选 model/lora 前先查这个，不要猜名字。",
+		inputSchema: { type: "object", properties: {}, additionalProperties: false },
+		annotations: { readOnlyHint: true },
+	},
 ];
 
 export const COMFYUI_INSTRUCTIONS = [
-	"本服务只负责 WSL ComfyUI 生图（comfyui_generate）；连接层与 home-connect 共享。",
+	"本服务负责 WSL ComfyUI 生图（comfyui_generate）与资源查询（comfyui_list）；连接层与 home-connect 共享。",
+	"控制面只有 prompt/negativePrompt/model/width/height/upscale/lora；模型→workflow 绑定内置，不要试图传 workflow 或采样细节。",
+	"选 model/lora 前先 comfyui_list（bound=false 的模型未绑定 workflow，generate 会拒绝）。",
 	"连接异常（WSL 休眠、通道不可达）先用 home 服务的 home_status 诊断，不要在本服务里拼 ssh。",
-	"默认图 ~/anima-lab/graph-single1.json；换图用 workflowPath 或内联 workflow（API 格式）。",
 	"中继按流量计费：大图/多图优先在家庭 LAN 内生成；超时返回带 promptId，可稍后查 /history 而非盲目重试。",
-	"输出默认取回本地 .remote-files/comfyui/，返回 localPath 可直接 read_file 查看。",
+	"输出取回本地 .remote-files/comfyui/，返回 localPath 可直接 read_file 查看。",
+	"从 Civitai 下载模型/LoRA 用 comfyui-download skill（经 home_exec wsl 通用操作），本服务不提供下载工具。",
 ].join("\n");
 
 export async function callComfyuiTool(name: string, args: Record<string, unknown>) {
 	if (name === "comfyui_generate") return comfyuiGenerate(args);
+	if (name === "comfyui_list") return comfyuiList();
 	return failure(`未知工具: ${name}`);
 }
