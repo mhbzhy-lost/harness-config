@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # init-qwen.sh — 将仓库中的 Qwen Code 配置与插件同步到本机：
-#   1. qwen/settings.json 深度合并进 ~/.qwen/settings.json，并注入 env.HARNESS_CONFIG_ROOT=仓库根
+#   1. qwen/settings.json 深度合并进 ~/.qwen/settings.json，注入 env.HARNESS_CONFIG_ROOT=仓库根，
+#      并确保 skills.directories 含 <仓库根>/skills（均为 per-machine 绝对路径）
 #   2. plugins/* 软链接进 ~/.qwen/extensions/
 #   3. qwen/shell.zsh 注册 source 进 ~/.zshrc（标记块，幂等；qwen 主题随系统明暗）
 #   4. qwen/QWEN.md 软链接为 ~/.qwen/QWEN.md（全局指令，跨机同步）
@@ -32,6 +33,7 @@ usage() {
   QWEN_GLOBAL_MD        覆盖全局 QWEN.md 链接目标（默认 ~/.qwen/QWEN.md）
 
 脚本会向目标设置的 env 注入 HARNESS_CONFIG_ROOT（本仓库绝对路径），
+确保 skills.directories 含本仓 skills/ 目录（保留其他已有条目），
 把 qwen/shell.zsh 的 source 行注册进 ~/.zshrc（标记块，幂等），
 并把 qwen/QWEN.md 软链接为全局 QWEN.md（真实文件则警告跳过，不破坏）。
 EOF
@@ -91,12 +93,25 @@ env = merged.setdefault("env", {})
 if not isinstance(env, dict):
     sys.exit("错误: 现有配置的 env 字段不是对象，无法注入 HARNESS_CONFIG_ROOT")
 env["HARNESS_CONFIG_ROOT"] = repo_root
+
+# skills.directories 注入仓库 skills/ 绝对路径（保留用户已有的其他目录）
+skills_dir = os.path.join(repo_root, "skills")
+skills = merged.setdefault("skills", {})
+if not isinstance(skills, dict):
+    sys.exit("错误: 现有配置的 skills 字段不是对象，无法注入 skills.directories")
+dirs = skills.setdefault("directories", [])
+if not isinstance(dirs, list):
+    sys.exit("错误: 现有配置的 skills.directories 不是数组，无法注入")
+if skills_dir not in dirs:
+    dirs.append(skills_dir)
+
 changed = sorted(k for k in merged if existing.get(k) != merged[k])
 
 if dry_run:
     print(f"[dry-run] 设置目标: {target_path}")
     print(f"[dry-run] 将变更的顶层键: {', '.join(changed) or '（无变更）'}")
     print(f"[dry-run] 将注入 env.HARNESS_CONFIG_ROOT = {repo_root}")
+    print(f"[dry-run] 将确保 skills.directories 含 {skills_dir}")
     sys.exit(0)
 
 if merged == existing:

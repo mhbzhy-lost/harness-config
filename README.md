@@ -12,14 +12,17 @@ Qwen Code 个人配置与插件的多机同步仓库。
 | `qwen/settings.json` | 设置模板（仅跨机通用偏好：TUI 精简 + 主题插值） |
 | `qwen/shell.zsh` | qwen shell 包装：主题随系统明暗（macOS light→Xcode / dark→Qwen Dark） |
 | `qwen/QWEN.md` | 全局指令文件，软链接为 `~/.qwen/QWEN.md`（对所有项目生效） |
+| `skills/` | 独立 skill（superpowers 改写版：writing-skills / writing-plans），经 `skills.directories` 注入加载 |
 | `plugins/` | Agent Plugins v1 插件：deepseek-search / home-connect / playwright |
 
 ## 同步范围
 
-- **同步**：模板中定义的设置键；`plugins/*` → `~/.qwen/extensions/<name>` 软链接；`qwen/shell.zsh` 的 source 注册进 `~/.zshrc`；`qwen/QWEN.md` → `~/.qwen/QWEN.md` 软链接（全局指令）。
+- **同步**：模板中定义的设置键；`plugins/*` → `~/.qwen/extensions/<name>` 软链接；`qwen/shell.zsh` 的 source 注册进 `~/.zshrc`；`qwen/QWEN.md` → `~/.qwen/QWEN.md` 软链接（全局指令）；`skills/` 经注入的 `skills.directories` 加载（user 级 skill）。
 - **不同步（per-machine）**：`model`、`modelProviders`、`security.auth`、`env` 中的密钥、`providerMetadata`、`$version`、`ui.autoModeAcknowledged` 等机器本地状态。模型/提供商/认证在各机器自行配置。
 
 `init-qwen.sh` 还会向本机设置注入 `env.HARNESS_CONFIG_ROOT`（本仓库绝对路径）——per-machine 值，不入模板。Qwen 将设置 `env` 注入进程环境，插件可据此按相对路径定位仓内资源（如 home-connect 凭据在 `$HARNESS_CONFIG_ROOT/plugins/home-connect`）；无锚点时插件回退自定位。仓库移动后重跑脚本更新。
+
+同理，脚本确保 `skills.directories` 含 `<仓库根>/skills`（保留用户已有的其他目录条目）。不用软链、不入模板：设置插值先于 settings env 注入，`${HARNESS_CONFIG_ROOT}` 写法首次加载解析不了，故注入字面绝对路径。skill 以 user 级加载、不受文件夹信任门控，**重启 Qwen Code 生效**。仓库移动后重跑会追加新路径，旧路径条目需手动删除。
 
 ## 主题随系统明暗
 
@@ -70,6 +73,7 @@ QWEN_SETTINGS_PATH=/tmp/t.json QWEN_EXTENSIONS_DIR=/tmp/ext QWEN_SHELL_RC=/tmp/z
 - 插件：直接改 `plugins/` 下内容（本机链接即时生效），提交推送；其他机器 `git pull` 即可，新增插件需重跑 `./init-qwen.sh` 建链接。
 - shell 包装：改 `qwen/shell.zsh`（source 即时生效于新终端），提交推送；其他机器 `git pull` 即可。
 - 全局指令：改 `qwen/QWEN.md`（软链接即时生效于新会话），提交推送；其他机器 `git pull` 即可。内容保持短而具体，项目专属内容写各项目的 QWEN.md。
+- skill：改 `skills/<name>/`（重启 Qwen Code 生效），提交推送；其他机器 `git pull` 即可。新增 skill 无需重跑 init（目录已被扫描）。
 
 ## 注意
 
