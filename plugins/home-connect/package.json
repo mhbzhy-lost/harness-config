@@ -1,0 +1,10 @@
+{
+  "name": "home-connect-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent Plugins 包：把 home-connect 的 SSH/中继通道收敛成 MCP 工具",
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

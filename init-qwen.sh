@@ -1,28 +1,27 @@
 #!/usr/bin/env bash
-# init-qwen.sh — 将仓库中的 qwen/settings.json 合并进本机 Qwen Code 配置，
-# 用于多机同步。API 密钥只在本机解析，绝不进入仓库。
+# init-qwen.sh — 将仓库中的 Qwen Code 配置与插件同步到本机：
+#   1. qwen/settings.json 深度合并进 ~/.qwen/settings.json（仅跨机通用偏好）
+#   2. plugins/* 软链接进 ~/.qwen/extensions/
+# 模型/提供商/认证/密钥均为 per-machine 配置，不在同步范围。
 set -euo pipefail
 
-KEY_NAME="BAILIAN_TOKEN_PLAN_API_KEY"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATE="$SCRIPT_DIR/qwen/settings.json"
-SECRETS_FILE="$SCRIPT_DIR/secrets.env"
+PLUGINS_SRC="$SCRIPT_DIR/plugins"
 TARGET="${QWEN_SETTINGS_PATH:-$HOME/.qwen/settings.json}"
+EXT_DIR="${QWEN_EXTENSIONS_DIR:-$HOME/.qwen/extensions}"
 DRY_RUN=0
 
 usage() {
   cat <<EOF
 用法: ./init-qwen.sh [--dry-run]
 
-将仓库 qwen/settings.json 深度合并进本机 Qwen Code 配置（默认 ~/.qwen/settings.json）。
   --dry-run   只预览将发生的变更，不写入
   -h, --help  显示本帮助
 
 环境变量:
-  QWEN_SETTINGS_PATH        覆盖目标配置路径（测试用）
-  ${KEY_NAME}  直接提供 API 密钥
-
-密钥解析顺序: secrets.env > 环境变量 > 本机配置已有值 > 交互输入
+  QWEN_SETTINGS_PATH    覆盖目标配置路径（默认 ~/.qwen/settings.json）
+  QWEN_EXTENSIONS_DIR   覆盖插件链接目录（默认 ~/.qwen/extensions）
 EOF
 }
 
@@ -40,52 +39,13 @@ done
 command -v python3 >/dev/null 2>&1 || die "需要 python3"
 [[ -f "$TEMPLATE" ]] || die "找不到模板: $TEMPLATE"
 
-# --- 解析 API 密钥（通过环境变量传给 python，避免出现在 ps 可见的命令行参数里）---
-api_key=""
-
-if [[ -f "$SECRETS_FILE" ]]; then
-  api_key="$(sed -nE "s/^[[:space:]]*(export[[:space:]]+)?${KEY_NAME}[[:space:]]*=[[:space:]]*//p" "$SECRETS_FILE" | tail -n 1)"
-  api_key="${api_key%\"}"; api_key="${api_key#\"}"
-  api_key="${api_key%\'}"; api_key="${api_key#\'}"
-fi
-
-if [[ -z "$api_key" && -n "${!KEY_NAME:-}" ]]; then
-  api_key="${!KEY_NAME}"
-fi
-
-if [[ -z "$api_key" && -f "$TARGET" ]]; then
-  api_key="$(python3 - "$TARGET" "$KEY_NAME" <<'PY'
-import json, sys
-try:
-    with open(sys.argv[1], encoding="utf-8") as f:
-        data = json.load(f)
-    value = data.get("env", {}).get(sys.argv[2], "")
-    print(value if isinstance(value, str) else "")
-except Exception:
-    pass
-PY
-)"
-fi
-
-# 权限位检查不够：无控制终端时 /dev/tty 存在但打开会失败，需实际试开
-if [[ -z "$api_key" ]] && (exec 3<>/dev/tty) 2>/dev/null; then
-  printf '本机未找到 %s，请输入（输入不回显）: ' "$KEY_NAME" > /dev/tty
-  IFS= read -rs api_key < /dev/tty || true
-  printf '\n' > /dev/tty
-fi
-
-api_key="${api_key#"${api_key%%[![:space:]]*}"}"
-api_key="${api_key%"${api_key##*[![:space:]]}"}"
-
-[[ -n "$api_key" ]] || die "无法获得 ${KEY_NAME}。请写入 secrets.env、导出为环境变量，或在交互终端中运行"
-
-QWEN_SYNC_API_KEY="$api_key" QWEN_SYNC_DRY_RUN="$DRY_RUN" python3 - "$TEMPLATE" "$TARGET" "$KEY_NAME" <<'PY'
+# --- 1. 合并设置 ---
+QWEN_SYNC_DRY_RUN="$DRY_RUN" python3 - "$TEMPLATE" "$TARGET" <<'PY'
 import copy, json, os, sys, tempfile
 from datetime import datetime
 
-template_path, target_path, key_name = sys.argv[1:4]
+template_path, target_path = sys.argv[1:3]
 dry_run = os.environ.get("QWEN_SYNC_DRY_RUN") == "1"
-api_key = os.environ["QWEN_SYNC_API_KEY"]
 
 with open(template_path, encoding="utf-8") as f:
     template = json.load(f)
@@ -111,23 +71,17 @@ def merge(base, override):
             out[k] = v
     return out
 
-# 深拷贝，避免注入密钥时经浅拷贝别名同步改动 existing，导致变更检测失效
+# 深拷贝，避免合并结果与 existing 共享子对象导致变更检测失效
 merged = merge(copy.deepcopy(existing), template)
-env = merged.setdefault("env", {})
-if not isinstance(env, dict):
-    sys.exit("错误: 现有配置的 env 字段不是对象，无法注入密钥")
-env[key_name] = api_key
-
 changed = sorted(k for k in merged if existing.get(k) != merged[k])
 
 if dry_run:
-    print(f"[dry-run] 目标: {target_path}")
+    print(f"[dry-run] 设置目标: {target_path}")
     print(f"[dry-run] 将变更的顶层键: {', '.join(changed) or '（无变更）'}")
-    print(f"[dry-run] 将注入 env.{key_name}（值不显示）")
     sys.exit(0)
 
 if merged == existing:
-    print(f"配置已与模板一致，无需写入: {target_path}")
+    print(f"设置已与模板一致，无需写入: {target_path}")
     sys.exit(0)
 
 target_dir = os.path.dirname(target_path) or "."
@@ -151,9 +105,66 @@ except BaseException:
     os.unlink(tmp_path)
     raise
 
-print(f"已写入: {target_path}（权限 600）")
+print(f"设置已写入: {target_path}（权限 600）")
 if backup_path:
     print(f"已备份: {backup_path}")
 print(f"同步的顶层键: {', '.join(changed) or '（无变更）'}")
-print("请重启 Qwen Code（/exit 后重新进入）使配置生效。")
 PY
+
+# --- 2. 插件软链接 ---
+if [[ ! -d "$PLUGINS_SRC" ]]; then
+  echo "（无 plugins/ 目录，跳过插件链接）"
+  exit 0
+fi
+
+if [[ "$DRY_RUN" != 1 ]]; then
+  mkdir -p "$EXT_DIR"
+fi
+
+for plugin_path in "$PLUGINS_SRC"/*/; do
+  plugin_path="${plugin_path%/}"
+  [[ -d "$plugin_path" ]] || continue
+  name="$(basename "$plugin_path")"
+  if [[ ! -f "$plugin_path/plugin.json" ]]; then
+    echo "跳过 ${name}：缺少 plugin.json"
+    continue
+  fi
+  link="$EXT_DIR/$name"
+  if [[ -L "$link" ]]; then
+    if [[ "$(readlink "$link")" == "$plugin_path" ]]; then
+      echo "插件 ${name}：链接已正确"
+      continue
+    fi
+    if [[ "$DRY_RUN" == 1 ]]; then
+      echo "[dry-run] 插件 ${name}：重指链接 → $plugin_path"
+    else
+      ln -sfn "$plugin_path" "$link"
+      echo "插件 ${name}：链接已重指 → $plugin_path"
+    fi
+  elif [[ -e "$link" ]]; then
+    echo "警告: $link 已存在且不是软链接，跳过（请手动处理）" >&2
+    continue
+  else
+    if [[ "$DRY_RUN" == 1 ]]; then
+      echo "[dry-run] 插件 ${name}：新建链接 → $plugin_path"
+    else
+      ln -s "$plugin_path" "$link"
+      echo "插件 ${name}：已链接 → $plugin_path"
+    fi
+  fi
+  if [[ "$DRY_RUN" != 1 ]]; then
+    if [[ -f "$plugin_path/package.json" && ! -d "$plugin_path/node_modules" ]] \
+      && python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("dependencies") else 1)' "$plugin_path/package.json" 2>/dev/null; then
+      echo "  提示: $name 需要依赖，请运行 (cd \"$plugin_path\" && npm install)"
+    fi
+    if [[ -f "$plugin_path/.env.example" && ! -f "$plugin_path/.env" ]]; then
+      echo "  提示: $name 需要凭据，请复制 .env.example 为 .env 并填写"
+    fi
+  fi
+done
+
+if [[ "$DRY_RUN" == 1 ]]; then
+  echo "预览完成，未做任何写入。"
+else
+  echo "完成。重启 Qwen Code（或 /reload-plugins）使变更生效。"
+fi

@@ -1,0 +1,8 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "home-connect",
+  "version": "0.1.0",
+  "description": "家中 Mac / Windows / WSL 的连接通道化封装：只暴露通道选择、平台命令与文件传输",
+  "license": "MIT",
+  "keywords": ["home", "ssh", "mcp", "tailscale", "wsl"]
+}

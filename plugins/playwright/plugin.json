@@ -1,0 +1,8 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "playwright",
+  "version": "1.0.0",
+  "description": "受限 Playwright 浏览器操作：多实例、profile 凭据共享、手动认证模式，安全命令集封装，经本地系统 Chrome 执行",
+  "license": "MIT",
+  "keywords": ["browser", "playwright", "chrome", "automation", "e2e"]
+}

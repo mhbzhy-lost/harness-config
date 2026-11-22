@@ -1,0 +1,8 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "deepseek-search",
+  "version": "1.0.0",
+  "description": "联网搜索与网页抓取：DeepSeek 优先、Exa fallback，暴露 web_search / web_fetch 两个 MCP 工具",
+  "license": "MIT",
+  "keywords": ["search", "web", "deepseek", "exa", "fetch"]
+}
