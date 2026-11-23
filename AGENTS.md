@@ -21,6 +21,10 @@
 - 更新从 superpowers 改编的 skills 时，核对最新上游发布版，不以本机旧缓存为准。保留版本来源和许可证说明，移除对未随仓库分发的上游 skills 的依赖，保证改编版可以独立使用。
 - `codex-proxy` 保持为本机 Qwen 扩展：会话 hooks 由 `init-qwen.sh` 按名称幂等管理，不影响其他 hooks。代理只监听回环地址；多个 Qwen 会话可共用，最后一个会话退出后才停止。未安装或未登录不应阻塞 Qwen 会话。
 
+## Git 命令
+
+- 本仓 Git 操作优先使用 `git1` 命令；确认 `git1` 不可用后再回退到 `git`。
+
 ## Git 提交身份
 
 - 本仓用 `git config --local` 固定提交身份为 `gh` 当前登录账号；账号未公开邮箱时使用 GitHub 的 `noreply` 地址，不使用全局私人邮箱。新克隆或切换 GitHub 账号后，在提交前核对本仓的 `user.name` 和 `user.email`。
