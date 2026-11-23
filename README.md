@@ -9,10 +9,10 @@ Qwen Code 个人配置与插件的多机同步仓库。
 | `init-qwen.sh` | 同步脚本：合并设置 + 注入 HARNESS_CONFIG_ROOT + 链接插件 + 注册 shell 片段 + 链接全局 QWEN.md + 链接 agent 定义 |
 | `init-pi.sh` | 链接插件到 pi 的加载目录（默认 `~/.agents/plugins`） |
 | `lib-plugins.sh` | 两个 init 脚本共享的插件链接逻辑 |
-| `qwen/settings.json` | 设置模板（仅跨机通用偏好：TUI 精简 + 主题插值） |
+| `qwen/settings.json` | 设置模板（跨机通用偏好：TUI 精简 + 主题插值 + Explore 抽象 `fast` 档位） |
 | `qwen/shell.zsh` | qwen shell 包装：主题随系统明暗（macOS light→Xcode / dark→Qwen Dark） |
-| `qwen/QWEN.md` | 全局指令文件，软链接为 `~/.qwen/QWEN.md`（对所有项目生效） |
-| `qwen/agents/` | subagent 定义（Qwen 专属语法：review-agent 重模型覆盖；antigravity 外部执行器委托 `agy acp`），逐文件软链接进 `~/.qwen/agents/` |
+| `qwen/QWEN.md` | 全局指令与子代理路由表，软链接为 `~/.qwen/QWEN.md`（对所有项目生效） |
+| `qwen/agents/` | subagent 定义（test-runner 验证；review-agent 重模型覆盖；antigravity 外部执行器委托 `agy acp`），逐文件软链接进 `~/.qwen/agents/` |
 | `qwen/extensions/` | 原生 Qwen extension（codex-proxy：/codex-login、/codex-status + 生命周期脚本），软链接进 `~/.qwen/extensions/` |
 | `skills/` | 独立 skill（superpowers 改写版：writing-skills / writing-plans），经 `skills.directories` 注入加载 |
 | `plugins/` | Agent Plugins v1 插件：deepseek-search / home-connect / playwright |
@@ -20,11 +20,19 @@ Qwen Code 个人配置与插件的多机同步仓库。
 ## 同步范围
 
 - **同步**：模板中定义的设置键；`plugins/*` → `~/.qwen/extensions/<name>` 软链接；`qwen/shell.zsh` 的 source 注册进 `~/.zshrc`；`qwen/QWEN.md` → `~/.qwen/QWEN.md` 软链接（全局指令）；`skills/` 经注入的 `skills.directories` 加载（user 级 skill）；`qwen/agents/*.md` → `~/.qwen/agents/<name>.md` 逐文件软链接（subagent 定义）；`qwen/extensions/*` → `~/.qwen/extensions/<name>` 软链接 + codex-proxy 生命周期 hooks 注入 settings。
-- **不同步（per-machine）**：`model`、`modelProviders`、`security.auth`、`env` 中的密钥、`providerMetadata`、`$version`、`ui.autoModeAcknowledged` 等机器本地状态。模型/提供商/认证在各机器自行配置。
+- **不同步（per-machine）**：`model`、`fastModel`、`agents.modelGrades`、`modelProviders`、`security.auth`、`env` 中的密钥、`providerMetadata`、`$version`、`ui.autoModeAcknowledged` 等机器本地状态。具体模型、轻量档位映射、提供商和认证在各机器自行配置；模板只写 `fast` / `inherit` 等抽象角色档位。
 
 `init-qwen.sh` 还会向本机设置注入 `env.HARNESS_CONFIG_ROOT`（本仓库绝对路径）——per-machine 值，不入模板。Qwen 将设置 `env` 注入进程环境，插件可据此按相对路径定位仓内资源（如 home-connect 凭据在 `$HARNESS_CONFIG_ROOT/plugins/home-connect`）；无锚点时插件回退自定位。仓库移动后重跑脚本更新。
 
 同理，脚本确保 `skills.directories` 含 `<仓库根>/skills`（保留用户已有的其他目录条目）。不用软链、不入模板：设置插值先于 settings env 注入，`${HARNESS_CONFIG_ROOT}` 写法首次加载解析不了，故注入字面绝对路径。skill 以 user 级加载、不受文件夹信任门控，**重启 Qwen Code 生效**。仓库移动后重跑会追加新路径，旧路径条目需手动删除。
+
+## 子代理路由与模型档位
+
+- `qwen/QWEN.md` 是跨项目软路由：主模型负责调度、开发、集成和最终回复；广泛探索用 Explore，联网调研和未分类非开发任务用 general-purpose，测试、构建和 lint 用 test-runner，完整审查用 `/review` medium/high。
+- Explore 在模板中使用 `fast`。各机器在本机 settings 配置 `fastModel`，模板不保存该档位对应的具体模型 ID。general-purpose 和 test-runner 不写 `model`，默认继承当前主模型。
+- 原生 `/review` 暂不支持把 `high` 档静态绑定到 review-agent，因此 `review-agent.md` 保留 `qwen4-max-preview` 作为唯一具体模型例外；其他机器须自行提供该模型。第一版不要求新增 `agents.modelGrades.high`。
+- test-runner 不开放 `write_file` / `edit`，shell 仅用于运行检查，禁止用于修改项目文件。后者是提示词约束，不是只读沙箱；测试和构建产生的正常产物允许存在。
+- 路由和模型设置均需新会话加载。配置验收命令：`python3 -m unittest discover -s tests -p 'test_*.py'`；真实路由是否命中仍须观察新会话中的实际 Agent 调用。
 
 ## 主题随系统明暗
 
@@ -78,7 +86,8 @@ cp plugins/deepseek-search/.env.example plugins/deepseek-search/.env   # 填写�
 
 ```bash
 ./init-qwen.sh --dry-run    # 预览变更
-QWEN_SETTINGS_PATH=/tmp/t.json QWEN_EXTENSIONS_DIR=/tmp/ext QWEN_SHELL_RC=/tmp/zshrc QWEN_GLOBAL_MD=/tmp/QWEN.md QWEN_AGENTS_DIR=/tmp/agents ./init-qwen.sh   # 测试
+python3 -m unittest discover -s tests -p 'test_*.py'   # 路由与 init 回归测试
+QWEN_SETTINGS_PATH=/tmp/t.json QWEN_EXTENSIONS_DIR=/tmp/ext QWEN_SHELL_RC=/tmp/zshrc QWEN_GLOBAL_MD=/tmp/QWEN.md QWEN_AGENTS_DIR=/tmp/agents ./init-qwen.sh   # 临时目录同步测试
 ```
 
 ## 更新

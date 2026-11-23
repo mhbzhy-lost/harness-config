@@ -8,9 +8,9 @@
 
 ## Qwen Code 设置的同步范围
 
-- `qwen/settings.json` 只放跨机器通用的偏好。模型选择、模型提供商（包括自定义 provider）、认证方式、API Key 等凭据，以及 `providerMetadata` 等本机状态，均由各机器在本机配置，不写入同步模板，也不由 `init-qwen.sh` 分发。同步时须保留本机已有配置。
+- `qwen/settings.json` 只放跨机器通用的偏好。具体模型选择、`fastModel`、`agents.modelGrades`、模型提供商（包括自定义 provider）、认证方式、API Key 等凭据，以及 `providerMetadata` 等本机状态，均由各机器在本机配置，不写入同步模板，也不由 `init-qwen.sh` 分发。模板可以配置 `fast` / `inherit` 等抽象角色档位，但不写这些档位对应的具体模型 ID。同步时须保留本机已有配置。
 - 仓内资源统一以 `HARNESS_CONFIG_ROOT` 为锚点按相对路径定位，不新增各插件专用的仓库根变量。该绝对路径由 `init-qwen.sh` 注入本机设置，不写入模板。`skills.directories` 同样由脚本注入仓内 `skills/` 的绝对路径，并保留已有目录条目。
-- 仓内同步的 agent 定义若引用具体模型 ID，应注明目标机器需要自行配置对应模型和提供商，不要为满足该依赖扩大设置同步范围。覆盖内置 agent 时，除有意调整的字段外，应保留上游工具和提示词；升级 Qwen Code 后对照内置定义检查。
+- 仓内同步的 agent 定义若引用具体模型 ID，应注明目标机器需要自行配置对应模型和提供商，不要为满足该依赖扩大设置同步范围。当前仅 `review-agent` 为原生 `/review` 保留 `qwen4-max-preview` 例外，其他 agent 不复制这一做法。覆盖内置 agent 时，除有意调整的字段外，应保留上游工具和提示词；升级 Qwen Code 后对照内置定义检查。
 
 ## 插件与初始化
 
