@@ -1,6 +1,10 @@
 {
   "ui": {
     "showToolCallDetails": false,
+    "hideTips": true,
+    "accessibility": {
+      "enableLoadingPhrases": false
+    },
     "theme": "${QWEN_THEME}"
   },
   "agents": {
@@ -10,6 +14,9 @@
     "modelGrades": {
       "high": "qwen4-max-preview"
     }
+  },
+  "tools": {
+    "approvalMode": "yolo"
   },
   "experimental": {
     "mods": true
