@@ -178,20 +178,40 @@ After writing the complete plan, look at the spec with fresh eyes and check the 
 
 If you find issues, fix them inline. No need to re-review — just fix and move on. If you find a spec requirement with no task, add the task.
 
+## Independent Plan Review
+
+After Self-Review and before Execution Handoff, always run one fresh-context,
+read-only independent review of the plan and its spec. Do this without waiting
+for the user to request review and before asking for an execution method.
+Prefer a fresh `review-agent`; if it is unavailable, use a fresh
+`general-purpose` reviewer. This plan review is separate from the final
+implementation review and does not replace it.
+
+Give the reviewer both document paths, the confirmed decisions and constraints,
+and ask for correctness, feasibility, internal consistency, test validity and
+unintended side effects. Findings must cite file:line and a concrete failure
+scenario; the reviewer does not edit files.
+
+Apply Critical and Suggestion findings to the plan or spec before handoff, or
+record why they are intentionally deferred. Record the reviewer and any
+unresolved or deferred findings with the plan. If no independent reviewer is
+available, disclose that blocker instead of presenting the plan as reviewed.
+
 ## Execution Handoff
 
-After saving and self-reviewing the plan, link it for your human partner
-to read. If they have already explicitly supplied an execution method, ask
-them to review the plan and confirm it captures what they want; wait for that
-review before implementation, then use the preserved method. Otherwise, ask
-them to review the plan and choose an execution method before implementation.
+After saving and self-reviewing the plan and completing Independent Plan
+Review, link it for your human partner to read. If they have already explicitly
+supplied an execution method, ask them to review the plan and confirm it
+captures what they want; wait for that review before implementation, then use
+the preserved method. Otherwise, ask them to review the plan and choose an
+execution method before implementation.
 
 **When no execution method has already been supplied:**
 
 **"Plan complete and saved to `docs/plans/<filename>.md`. Please review the plan. Which execution approach would you prefer?**
 
 - **Subagent-driven** - A fresh subagent implements each task and a fresh reviewer checks it before the next one starts, then a whole-branch review at the end. Most thorough; costs a fresh context per task and per review.
-- **Native** - I implement every task myself in this session, the way this harness runs work, then one fresh reviewer on the most capable model checks the whole branch. Cheapest and fastest; no independent review until the end. Runs well with a mid-tier session model, since the plan carries the design.
+- **Native** - I implement every task myself in this session, the way this harness runs work, then one fresh reviewer on the most capable model checks the whole branch. Cheapest and fastest; no independent implementation review until the end. Runs well with a mid-tier session model, since the plan carries the design.
 
 **For this plan I recommend <one of the two>, because <one sentence from the plan: how much the tasks depend on each other's interfaces, how many there are, what a shipped mistake would cost>. Does the plan capture what you want, and which approach should we use?"**
 
