@@ -3,6 +3,14 @@
     "showToolCallDetails": false,
     "theme": "${QWEN_THEME}"
   },
+  "agents": {
+    "builtin": {
+      "exploreModel": "deepseek-v4.1-flash-1017"
+    },
+    "modelGrades": {
+      "high": "qwen4-max-preview"
+    }
+  },
   "experimental": {
     "mods": true
   }
