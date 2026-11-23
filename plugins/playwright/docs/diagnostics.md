@@ -11,6 +11,7 @@
 | 错误 | 处理 |
 |---|---|
 | `chrome-unavailable` | 准备系统 Google Chrome；不自动下载、换 browser 或把升级 SDK 当作修复 |
+| `sdk-missing` | 插件依赖未安装：执行 `bash "$HARNESS_CONFIG_ROOT/plugins/playwright/scripts/setup.sh"` 后重试；不要用升级 SDK 代替安装或改用 npx 缓存 |
 | `instance-in-use` | 选择自己新的 instance；不覆写或接管未知实例 |
 | `profile-in-use` | 等 owner 正常 stop 或请求 owner 确认；不删租约、不因 PID 消失抢占 |
 | `socket-path-too-long` | 报告私有状态根过长；不放宽安全预算或换公共 socket |

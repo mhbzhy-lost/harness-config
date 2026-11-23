@@ -1,9 +1,13 @@
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
-import { RuntimeFault, safeError, safeName, validateCommand, type RuntimeOptions } from './contracts.ts';
+import { RuntimeFault, fault, safeError, safeName, validateCommand, type BrowserAdapter, type RuntimeOptions } from './contracts.ts';
 import { resolveScope, startRuntime, stopRuntime, getRuntimeStatus, listRuntimeInstances, sendRuntimeCommand, serveRuntime } from './lifecycle.ts';
-import { sdkAdapter } from './sdk-adapter.ts';
 import { executeOperation } from './operations.ts';
+
+// 懒加载 SDK：依赖缺失时 daemon 仍能回包 sdk-missing，而不是 import 阶段直接退出。
+async function loadSdkAdapter(): Promise<BrowserAdapter> {
+  try { return (await import('./sdk-adapter.ts')).sdkAdapter; } catch { fault('browser', 'sdk-missing'); }
+}
 
 export async function runCli(argv: string[]): Promise<number> {
   if (argv[0] === '--_daemon') {
@@ -15,7 +19,8 @@ export async function runCli(argv: string[]): Promise<number> {
         if (m.cancel) { controller.abort(); return; }
         if (received) return; received = true;
         try {
-          const ready = await serveRuntime(m.scope, m.options, sdkAdapter, executeOperation, controller.signal);
+          const adapter = await loadSdkAdapter();
+          const ready = await serveRuntime(m.scope, m.options, adapter, executeOperation, controller.signal);
           settled = true; if (process.connected) process.send?.({ ready }); done(0);
         } catch (error) { settled = true; if (process.connected) process.send?.({ error: safeError(error, 'browser') }); done(1); }
       });

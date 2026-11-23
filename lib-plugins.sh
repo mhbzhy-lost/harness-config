@@ -42,7 +42,10 @@ link_plugins() {
       fi
     fi
     if [[ "$dry" != 1 ]]; then
-      if [[ -f "$plugin_path/package.json" && ! -d "$plugin_path/node_modules" ]] \
+      # 自带 scripts/setup.sh 的插件按需懒初始化（由插件 skill 在首次使用时引导），
+      # 不在 init 阶段提示安装，避免每次同步都要求人工前置操作。
+      if [[ ! -f "$plugin_path/scripts/setup.sh" ]] \
+        && [[ -f "$plugin_path/package.json" && ! -d "$plugin_path/node_modules" ]] \
         && python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("dependencies") else 1)' "$plugin_path/package.json" 2>/dev/null; then
         echo "  提示: $name 需要依赖，请运行 (cd \"$plugin_path\" && npm install)"
       fi

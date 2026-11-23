@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createConnection, createServer, type Socket } from 'node:net';
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
+import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import {
@@ -95,8 +96,14 @@ async function wire(ref: RuntimeRef, command: WireRequest['command']): Promise<S
     socket.on('end', () => { if (!settled) end(new RuntimeFault('protocol', 'incomplete-reply')); });
   });
 }
+// playwright SDK 是懒加载依赖：只影响浏览器实例启动，不影响 MCP server 自身。
+// 缺失时 fork 出的 daemon 会在 import 阶段静默退出，故先给出可操作的明确错误。
+function sdkInstalled(): boolean {
+  try { createRequire(import.meta.url).resolve('playwright'); return true; } catch { return false; }
+}
 export async function startRuntime(scope: RuntimeScope, options: RuntimeOptions, launch?: { daemonPath: string }): Promise<ReadyState> {
   validateOptions(options); await validateScope(scope); socketPath({ scope, instance: options.instance });
+  if (!launch && !sdkInstalled()) fault('browser', 'sdk-missing');
   const child = fork(launch?.daemonPath ?? fileURLToPath(new URL('./cli.ts', import.meta.url)), ['--_daemon'], {
     detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'], execArgv: [],
     // 不继承会将页面/协议写入日志的 Playwright debug 开关。

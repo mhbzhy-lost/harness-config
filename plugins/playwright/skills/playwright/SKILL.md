@@ -15,6 +15,17 @@ description: Use when needing real browser UI interaction, web automation, E2E s
 - `browser_command(instance, command)`：安全命令对象，如 `{op:'navigate',url:'https://example.com'}`、`{op:'snapshot'}`、`{op:'click',locator:...}`。
 - `browser_instances()`：列出全部实例；遗留实例排查后 `browser_stop`。
 
+## 依赖（懒加载）
+
+MCP server 自身不依赖 SDK 即可启动；`playwright` SDK 只在首次 `browser_start` 时加载。
+若 `browser_start` 返回 `sdk-missing`（stage=browser），执行一次初始化（幂等，已装则跳过）：
+
+```bash
+bash "$HARNESS_CONFIG_ROOT/plugins/playwright/scripts/setup.sh"
+```
+
+脚本位于插件目录的 `scripts/setup.sh`（`HARNESS_CONFIG_ROOT` 由 init-qwen 注入；pi 运行时直接用插件目录下的脚本）。它按 `package-lock.json` 安装且不下载浏览器（运行时使用系统 Chrome）。装好后直接重试 `browser_start`，无需重启 Qwen 或重连 MCP。
+
 ## 规则
 
 1. 每个任务使用自己拥有的实例名；默认 headless，headed/auth 仅在用户明确要求时使用。

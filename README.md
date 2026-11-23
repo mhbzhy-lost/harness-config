@@ -52,8 +52,8 @@ CLIProxyAPI（`brew install cliproxyapi`）把 ChatGPT 订阅配额暴露为本�
 git clone <repo-url> harness-config && cd harness-config
 ./init-qwen.sh
 ./init-pi.sh      # 若使用 pi：链接插件到 ~/.agents/plugins
-# 按需补齐本机内容：
-(cd plugins/playwright && npm install)
+# 可选：playwright 依赖按需安装（首次 browser_start 返回 sdk-missing 时再执行也可以）
+bash plugins/playwright/scripts/setup.sh
 cp plugins/deepseek-search/.env.example plugins/deepseek-search/.env   # 填写密钥
 # home-connect 凭据在 plugins/home-connect/ 内对应位置（已 gitignore）：
 #   .env（ROOT_PWD=<sudo密码>）、.ssh/（密钥）、config/*.env（从 *.example 复制填写）
@@ -70,7 +70,7 @@ cp plugins/deepseek-search/.env.example plugins/deepseek-search/.env   # 填写�
 
 - 已是正确链接 → 跳过；指向别处的链接 → 重指；真实目录/文件 → 警告并跳过（不破坏）。
 - pi 侧由 `init-pi.sh` 管理（`PI_PLUGINS_DIR` 可覆盖目标）；指向本仓 `plugins/` 的遗留整目录软链接会自动升级为逐插件链接，指向别处的整目录链接则拒绝处理。
-- 凭据（`.env`）与 `node_modules/` 不入库；缺依赖或缺凭据时脚本会给出提示。
+- 凭据（`.env`）与 `node_modules/` 不入库；缺凭据时脚本会给出提示。自带 `scripts/setup.sh` 的插件按懒加载处理，init 阶段不提示安装，由对应 skill 在首次使用时报 `sdk-missing` 并引导执行 setup。
 - 全局 QWEN.md 链接同语义（`QWEN_GLOBAL_MD` 可覆盖目标）：本机已有真实 `~/.qwen/QWEN.md` 时警告跳过，需手动备份后重跑。
 - agent 定义同语义逐文件链接（`QWEN_AGENTS_DIR` 可覆盖目录）：只管理仓内有的文件，本机自建的其他 agent 不受影响。注意 `qwen/agents/review-agent.md` 的 `model` 钉死了具体模型 ID，会随仓同步——其他机器需有该模型，否则自行调整。`qwen/agents/antigravity.md` 是外部执行器（`executor: acp → agy acp`），需要本机安装 Antigravity CLI 并完成 `agy` 登录后才能派发，缺 CLI 时报 `spawn agy ENOENT`、不会回退到 Qwen 模型。
 
@@ -92,7 +92,7 @@ QWEN_SETTINGS_PATH=/tmp/t.json QWEN_EXTENSIONS_DIR=/tmp/ext QWEN_SHELL_RC=/tmp/z
 
 ## 注意
 
-- 需要 bash + python3；插件运行依赖 node（playwright 还需 `npm install`）。
+- 需要 bash + python3；插件运行依赖 node（playwright 依赖按需安装：`plugins/playwright/scripts/setup.sh`）。
 - 本机设置必须是标准 JSON；脚本不处理手写的 `//` 注释。
 - 设置变更重启 Qwen Code 生效；插件变更可用 `/reload-plugins`；shell 包装新开终端生效；全局 QWEN.md 新会话加载（`/memory` 可查看）。
 - 主题包装依赖 zsh（注册进 `~/.zshrc`）；bash-only 机器不生效，主题回退默认。

@@ -6,6 +6,7 @@
  */
 
 import { getRuntimeStatus, listRuntimeInstances, resolveScope, sendRuntimeCommand, startRuntime, stopRuntime } from "./runtime/lifecycle.ts";
+import { fileURLToPath } from "node:url";
 import type { Command, RuntimeOptions } from "./runtime/contracts.ts";
 
 const INSTANCE_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
@@ -114,6 +115,9 @@ async function callTool(name: string, args: Record<string, unknown>) {
   throw new Error(`未知工具: ${name}`);
 }
 
+// 依赖按需安装（懒加载）：提示里用运行时解析的绝对路径，qwen / pi 两种链接方式都可用。
+const SETUP_SCRIPT = fileURLToPath(new URL("../scripts/setup.sh", import.meta.url));
+
 const INSTRUCTIONS = [
   "使用顺序：browser_start → browser_command（navigate/snapshot/click/fill/wait/screenshot/tabs/inspect）→ browser_stop。",
   "每个任务使用自己拥有的实例名；需要共享登录态时在 start 传 profile，跨实例复用持久凭据。",
@@ -121,6 +125,7 @@ const INSTRUCTIONS = [
   "只接受安全命令对象：不支持任意 evaluate、run-file，也不输出 cookie、token、密码或授权材料。",
   "等待页面状态使用 op=wait，不使用同步阻塞等待。",
   "实例闲置 30 分钟自动回收（PI_PLAYWRIGHT_IDLE_TIMEOUT 可调）；遗留实例用 browser_instances 排查后 stop。",
+  `browser_start 返回 sdk-missing 表示安装依赖缺失：执行 bash "${SETUP_SCRIPT}"（幂等，不下载浏览器）后重试，无需重启会话。`,
 ].join("\n");
 
 async function handleRequest(message: { id?: unknown; method?: string; params?: unknown }): Promise<unknown> {
