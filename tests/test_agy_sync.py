@@ -57,6 +57,8 @@ class AgySyncTest(unittest.TestCase):
         self.assertIn("test-runner", text)
         self.assertIn("`flash`", text)
         self.assertIn("`pro`", text)
+        self.assertIn("Git 历史考古", text)
+        self.assertIn("基于最终 Diff 生成 PR/文档初稿", text)
         for forbidden in ("Explore", "general-purpose", "run_in_background", "/review --effort"):
             self.assertNotIn(forbidden, text)
 
@@ -68,7 +70,7 @@ class AgySyncTest(unittest.TestCase):
         _, frontmatter, body = text.split("---", 2)
         self.assertIn("\nname: test-runner\n", frontmatter)
         self.assertIn("\nsubagent: true\n", frontmatter)
-        self.assertIn("\nmodel: inherit\n", frontmatter)
+        self.assertIn("\nmodel: flash\n", frontmatter)
 
         tools = []
         in_tools = False
@@ -88,6 +90,7 @@ class AgySyncTest(unittest.TestCase):
             "Never use shell commands to create, edit, or delete project files",
             body,
         )
+        self.assertIn("parent agent owns root-cause analysis", body)
 
     def test_subagent_model_router_hook_behavior(self) -> None:
         hook_path = ROOT / "agy/hooks/subagent-model-router.py"

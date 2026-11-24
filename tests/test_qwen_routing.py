@@ -34,11 +34,21 @@ class QwenRoutingConfigTest(unittest.TestCase):
         frontmatter, _ = read_agent(ROOT / "qwen/agents/review-agent.md")
         self.assertIn("\nmodel: qwen4-max-preview\n", frontmatter)
 
+    def test_qwen_global_routing_covers_fast_tier_principles(self) -> None:
+        text = (ROOT / "qwen/QWEN.md").read_text(encoding="utf-8")
+        self.assertIn("test-runner", text)
+        self.assertIn("`fast`", text)
+        self.assertIn("Git 历史考古", text)
+        self.assertIn("基于最终 Diff 生成 PR/文档初稿", text)
+        self.assertIn("架构设计、复杂根因定位和深度审查不降档到 `fast`", text)
+        for forbidden in ("invoke_subagent", "flash_lite"):
+            self.assertNotIn(forbidden, text)
+
     def test_test_runner_has_no_file_write_tools(self) -> None:
         frontmatter, body = read_agent(ROOT / "qwen/agents/test-runner.md")
         self.assertIn("\nname: test-runner\n", frontmatter)
         self.assertIn("Use PROACTIVELY", frontmatter)
-        self.assertNotIn("\nmodel:", frontmatter)
+        self.assertIn("\nmodel: fast\n", frontmatter)
 
         tools = []
         in_tools = False
@@ -61,6 +71,7 @@ class QwenRoutingConfigTest(unittest.TestCase):
             "Never use shell commands to create, edit, or delete project files",
             body,
         )
+        self.assertIn("parent agent owns root-cause analysis", body)
 
     def test_init_preserves_machine_models_and_links_test_runner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

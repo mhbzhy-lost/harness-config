@@ -20,12 +20,12 @@ Qwen Code 个人配置与插件的多机同步仓库。
 | `lib-plugins.sh` | 三个 init 脚本共享的插件链接逻辑 |
 | `agy/settings.json` | AGY CLI 设置模板（跨机通用 UI 偏好：全屏 `altScreenMode: always`），深度合并进 `~/.gemini/antigravity-cli/settings.json` |
 | `agy/rules/` | AGY 全局规则（带 `trigger: always_on`），逐文件软链接进 `~/.gemini/config/rules/`（对所有项目生效） |
-| `agy/agents/` | AGY 自定义 subagent 定义（`test-runner` 只读验证，frontmatter 声明 `model: inherit`），逐文件软链接进 `~/.gemini/config/agents/` |
+| `agy/agents/` | AGY 自定义 subagent 定义（`test-runner` 只读验证与失败日志压缩，frontmatter 声明 `model: flash`），逐文件软链接进 `~/.gemini/config/agents/` |
 | `agy/hooks/` | AGY 生命周期 hook（`subagent-model-router.py`：内置 `research` 缺省/`inherit` 时机械兜底 `flash`），按名幂等注入 `~/.gemini/config/hooks.json` |
 | `qwen/settings.json` | 设置模板（跨机通用偏好：TUI 精简 + 主题插值 + Explore 抽象 `fast` 档位） |
 | `qwen/shell.zsh` | qwen shell 包装：主题随系统明暗（macOS light→Xcode / dark→Qwen Dark） |
 | `qwen/QWEN.md` | 全局指令与子代理路由表，软链接为 `~/.qwen/QWEN.md`（对所有项目生效） |
-| `qwen/agents/` | subagent 定义（test-runner 验证；review-agent 重模型覆盖；antigravity 外部执行器委托 `agy acp`），逐文件软链接进 `~/.qwen/agents/` |
+| `qwen/agents/` | subagent 定义（test-runner 只读验证与失败日志压缩，frontmatter 声明 `model: fast`；review-agent 重模型覆盖；antigravity 外部执行器委托 `agy acp`），逐文件软链接进 `~/.qwen/agents/` |
 | `qwen/extensions/` | 原生 Qwen extension（codex-proxy：/codex-login、/codex-status + 生命周期脚本），软链接进 `~/.qwen/extensions/` |
 | `skills/` | 跨项目独立 skill（superpowers 改写版：`writing-skills` / `writing-plans`），分别注入 Qwen `skills.directories`、AGY `skills.json` 与 Pi `skills` 加载 |
 | `.agents/skills/` | 仅在本仓加载的项目级 skill：`pi-manage-provider`（安全管理 `~/.pi/agent/models.json` 与 `/dev/tty` 凭据录入）、`pi-docs`（Pi 官方文档索引，本机 `docs`/`examples`/`schemas`/`README.md` 软链由 `init-pi.sh` 自动生成且 gitignore） |
@@ -42,8 +42,8 @@ Qwen Code 个人配置与插件的多机同步仓库。
 
 ## 子代理路由与模型档位
 
-- `qwen/QWEN.md` 是跨项目软路由：主模型负责调度、开发、集成和最终回复；广泛探索用 Explore，联网调研和未分类非开发任务用 general-purpose，测试、构建和 lint 用 test-runner，完整审查用 `/review` medium/high。
-- Explore 在模板中使用 `fast`。各机器在本机 settings 配置 `fastModel`，模板不保存该档位对应的具体模型 ID。general-purpose 和 test-runner 不写 `model`，默认继承当前主模型。
+- `qwen/QWEN.md` 是跨项目软路由：主模型负责调度、开发、集成和最终回复；广泛探索用 Explore，常规测试/构建/lint 与日志压缩用 test-runner，重噪声外部检索/长文档与大 JSON 抽取、Git 历史考古、基于最终 Diff 生成 PR/文档初稿用 general-purpose（优先轻量档位），未分类非开发任务用 general-purpose（继承主模型），完整审查用 `/review` medium/high。
+- Explore（模板 `agents.builtin.exploreModel`）与 test-runner（frontmatter `model: fast`）均使用抽象档位 `fast`。各机器在本机 settings 配置 `fastModel`，模板不保存该档位对应的具体模型 ID；未配置 `fastModel` 时自动回退继承主模型。general-purpose 默认继承当前主模型，高噪声可核验任务按需传轻量档位（`fast` / `small`）。
 - 原生 `/review` 暂不支持把 `high` 档静态绑定到 review-agent，因此 `review-agent.md` 保留 `qwen4-max-preview` 作为唯一具体模型例外；其他机器须自行提供该模型。第一版不要求新增 `agents.modelGrades.high`。
 - test-runner 不开放 `write_file` / `edit`，shell 仅用于运行检查，禁止用于修改项目文件。后者是提示词约束，不是只读沙箱；测试和构建产生的正常产物允许存在。
 - 路由和模型设置均需新会话加载。配置验收命令：`python3 -m unittest discover -s tests -p 'test_*.py'`；真实路由是否命中仍须观察新会话中的实际 Agent 调用。
