@@ -5,6 +5,7 @@
 #   3. 确保 ~/.gemini/config/skills.json 的 entries 含 <仓库根>/skills（保留已有条目）
 #   4. agy/rules/*.md 逐文件软链接进 ~/.gemini/config/rules/（全局规则）
 #   5. agy/agents/*.md 逐文件软链接进 ~/.gemini/config/agents/（自定义 subagent）
+#   6. 注入内置 subagent 模型档位兜底 hook 到 ~/.gemini/config/hooks.json（按名幂等管理）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,6 +14,7 @@ PLUGINS_SRC="$SCRIPT_DIR/plugins"
 SKILLS_SRC="$SCRIPT_DIR/skills"
 RULES_SRC="$SCRIPT_DIR/agy/rules"
 AGENTS_SRC="$SCRIPT_DIR/agy/agents"
+HOOK_SCRIPT="$SCRIPT_DIR/agy/hooks/subagent-model-router.py"
 
 SETTINGS_TARGET="${AGY_SETTINGS_PATH:-$HOME/.gemini/antigravity-cli/settings.json}"
 CONFIG_DIR="${AGY_CONFIG_DIR:-$HOME/.gemini/config}"
@@ -20,13 +22,14 @@ PLUGINS_DIR="${AGY_PLUGINS_DIR:-$CONFIG_DIR/plugins}"
 SKILLS_JSON="${AGY_SKILLS_JSON:-$CONFIG_DIR/skills.json}"
 RULES_DIR="${AGY_RULES_DIR:-$CONFIG_DIR/rules}"
 AGENTS_DIR="${AGY_AGENTS_DIR:-$CONFIG_DIR/agents}"
+HOOKS_JSON="${AGY_HOOKS_JSON:-$CONFIG_DIR/hooks.json}"
 DRY_RUN=0
 
 usage() {
   cat <<EOF
 用法: ./init-agy.sh [--dry-run]
 
-将仓库中的 AGY 设置模板、插件、独立 skills、全局规则与 subagent 定义同步到本机。
+将仓库中的 AGY 设置模板、插件、独立 skills、全局规则、subagent 定义与生命周期 hooks 同步到本机。
   --dry-run   只预览将发生的变更，不写入
   -h, --help  显示本帮助
 
@@ -37,6 +40,7 @@ usage() {
   AGY_SKILLS_JSON   覆盖 skills.json 路径（默认 \$AGY_CONFIG_DIR/skills.json）
   AGY_RULES_DIR     覆盖全局规则链接目录（默认 \$AGY_CONFIG_DIR/rules）
   AGY_AGENTS_DIR    覆盖 subagent 定义链接目录（默认 \$AGY_CONFIG_DIR/agents）
+  AGY_HOOKS_JSON    覆盖 hooks.json 路径（默认 \$AGY_CONFIG_DIR/hooks.json）
 EOF
 }
 
@@ -53,6 +57,7 @@ done
 
 command -v python3 >/dev/null 2>&1 || die "需要 python3"
 [[ -f "$SETTINGS_TEMPLATE" ]] || die "找不到 AGY 设置模板: $SETTINGS_TEMPLATE"
+[[ -f "$HOOK_SCRIPT" ]] || die "找不到 AGY hook 脚本: $HOOK_SCRIPT"
 
 # --- 1. 深度合并 agy/settings.json ---
 AGY_SYNC_DRY_RUN="$DRY_RUN" python3 - "$SETTINGS_TEMPLATE" "$SETTINGS_TARGET" <<'PY'
@@ -251,8 +256,80 @@ else
   echo "（无 agy/agents/ 目录，跳过 AGY agent 链接）"
 fi
 
+# --- 6. 注入内置 subagent 模型档位兜底 hook 到 ~/.gemini/config/hooks.json ---
+AGY_SYNC_DRY_RUN="$DRY_RUN" python3 - "$HOOKS_JSON" "$HOOK_SCRIPT" <<'PY'
+import copy, json, os, sys, tempfile
+from datetime import datetime
+
+target_path, hook_script = sys.argv[1:3]
+dry_run = os.environ.get("AGY_SYNC_DRY_RUN") == "1"
+hook_name = "harness-config-subagent-model-router"
+
+existing = {}
+if os.path.exists(target_path):
+    with open(target_path, encoding="utf-8") as f:
+        text = f.read()
+    if text.strip():
+        try:
+            existing = json.loads(text)
+        except json.JSONDecodeError as e:
+            sys.exit(f"错误: 现有配置 {target_path} 不是标准 JSON: {e}")
+    if not isinstance(existing, dict):
+        sys.exit(f"错误: {target_path} 顶层不是 JSON 对象")
+
+merged = copy.deepcopy(existing)
+merged[hook_name] = {
+    "PreToolUse": [
+        {
+            "matcher": "invoke_subagent",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f'python3 "{hook_script}"',
+                    "timeout": 5,
+                }
+            ],
+        }
+    ]
+}
+
+if merged == existing and os.path.exists(target_path):
+    print(f"hooks.json 已包含 {hook_name}，无需写入: {target_path}")
+    sys.exit(0)
+
+if dry_run:
+    print(f"[dry-run] hooks.json 目标: {target_path}")
+    print(f"[dry-run] 将注入/更新 hook {hook_name} → {hook_script}")
+    sys.exit(0)
+
+target_dir = os.path.dirname(target_path) or "."
+os.makedirs(target_dir, exist_ok=True)
+
+backup_path = None
+if os.path.exists(target_path):
+    backup_path = f"{target_path}.bak.{datetime.now():%Y%m%d-%H%M%S}"
+    with open(target_path, "rb") as src, open(backup_path, "wb") as dst:
+        dst.write(src.read())
+    os.chmod(backup_path, 0o600)
+
+fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=".hooks-", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(merged, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, target_path)
+except BaseException:
+    os.unlink(tmp_path)
+    raise
+
+print(f"hooks.json 已写入: {target_path}（权限 600）")
+if backup_path:
+    print(f"已备份: {backup_path}")
+PY
+
 if [[ "$DRY_RUN" == 1 ]]; then
   echo "预览完成，未做任何写入。"
 else
-  echo "完成。重启 agy 新开会话使插件、skills、全局规则与 subagent 生效。"
+  echo "完成。重启 agy 新开会话使设置、插件、skills、全局规则、subagent 与 hooks 生效。"
 fi

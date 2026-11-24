@@ -2,7 +2,7 @@
 
 ## 目录与指令归属
 
-- Qwen Code 专属配置放在 `qwen/`，包括设置模板、shell 包装、agent 定义和原生扩展；AGY 专属配置放在 `agy/`（设置模板 `agy/settings.json`、全局规则 `agy/rules/` 与 subagent 定义 `agy/agents/`；设置模板同样只放跨机通用偏好，不写入本机状态或凭据）。跨运行时的插件和独立技能分别放在根目录的 `plugins/` 和 `skills/`。
+- Qwen Code 专属配置放在 `qwen/`，包括设置模板、shell 包装、agent 定义和原生扩展；AGY 专属配置放在 `agy/`（设置模板 `agy/settings.json`、全局规则 `agy/rules/`、subagent 定义 `agy/agents/` 与生命周期 hook `agy/hooks/`；设置模板同样只放跨机通用偏好，不写入本机状态或凭据，自定义 subagent 通过 frontmatter 绑定抽象档位，内置 subagent 档位兜底通过 `hooks.json` 按名幂等注入）。跨运行时的插件和独立技能分别放在根目录的 `plugins/` 和 `skills/`。
 - 本仓规则写在根目录 `AGENTS.md`；跨项目的个人偏好按运行时分别维护在 `qwen/QWEN.md`（由 `init-qwen.sh` 软链接到 `~/.qwen/QWEN.md`）和 `agy/rules/harness-config.md`（由 `init-agy.sh` 逐文件软链接到 `~/.gemini/config/rules/`，不命名为 `AGENTS.md` 以免被目录扫描误加载），不用复制文件或通过 `context.includeDirectories` 扩大加载范围。
 - 支撑跨机器偏好的 shell 逻辑应留在仓内（例如 `qwen/shell.zsh`）；用户的 shell 配置只由初始化脚本幂等注册加载入口，不内联实现。
 

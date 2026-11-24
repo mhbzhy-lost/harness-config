@@ -2,6 +2,7 @@
 name: test-runner
 description: Use PROACTIVELY after code changes and for test, build, lint, or type-check requests. Runs the project's checks, diagnoses failures without editing, and reports exact commands, exit codes, skipped checks, and environment limitations.
 subagent: true
+model: inherit
 tools:
   - read_file
   - run_command

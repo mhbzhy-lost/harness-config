@@ -55,6 +55,8 @@ class AgySyncTest(unittest.TestCase):
         self.assertIn("trigger: always_on", frontmatter)
         self.assertIn("## Git Commit 规范", text)
         self.assertIn("test-runner", text)
+        self.assertIn("`flash`", text)
+        self.assertIn("`pro`", text)
         for forbidden in ("Explore", "general-purpose", "run_in_background", "/review --effort"):
             self.assertNotIn(forbidden, text)
 
@@ -66,7 +68,7 @@ class AgySyncTest(unittest.TestCase):
         _, frontmatter, body = text.split("---", 2)
         self.assertIn("\nname: test-runner\n", frontmatter)
         self.assertIn("\nsubagent: true\n", frontmatter)
-        self.assertNotIn("\nmodel:", frontmatter)
+        self.assertIn("\nmodel: inherit\n", frontmatter)
 
         tools = []
         in_tools = False
@@ -86,6 +88,71 @@ class AgySyncTest(unittest.TestCase):
             "Never use shell commands to create, edit, or delete project files",
             body,
         )
+
+    def test_subagent_model_router_hook_behavior(self) -> None:
+        hook_path = ROOT / "agy/hooks/subagent-model-router.py"
+        self.assertTrue(hook_path.exists())
+
+        def run_hook(stdin_text: str) -> dict:
+            res = subprocess.run(
+                ["python3", str(hook_path)],
+                input=stdin_text,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            return json.loads(res.stdout)
+
+        # 1. 内置 research 缺省 Model → 机械兜底 flash
+        self.assertEqual(
+            run_hook(
+                json.dumps(
+                    {"toolCall": {"name": "invoke_subagent", "args": {"TypeName": "research"}}}
+                )
+            ),
+            {"decision": "allow", "overwrite": {"Model": "flash"}},
+        )
+        # 2. 内置 research 传 inherit → 同样兜底 flash
+        self.assertEqual(
+            run_hook(
+                json.dumps(
+                    {
+                        "toolCall": {
+                            "name": "invoke_subagent",
+                            "args": {"TypeName": "research", "Model": "inherit"},
+                        }
+                    }
+                )
+            ),
+            {"decision": "allow", "overwrite": {"Model": "flash"}},
+        )
+        # 3. 显式指定 pro / flash_lite → 原样放行不覆盖
+        for explicit in ("pro", "flash_lite", "flash"):
+            self.assertEqual(
+                run_hook(
+                    json.dumps(
+                        {
+                            "toolCall": {
+                                "name": "invoke_subagent",
+                                "args": {"TypeName": "research", "Model": explicit},
+                            }
+                        }
+                    )
+                ),
+                {"decision": "allow"},
+            )
+        # 4. 其他 subagent（self / test-runner）→ 原样放行
+        self.assertEqual(
+            run_hook(
+                json.dumps(
+                    {"toolCall": {"name": "invoke_subagent", "args": {"TypeName": "self"}}}
+                )
+            ),
+            {"decision": "allow"},
+        )
+        # 5. 非法输入 → fail-open 放行
+        self.assertEqual(run_hook("not-json"), {"decision": "allow"})
 
     def test_agy_settings_enables_alt_screen(self) -> None:
         settings_path = ROOT / "agy/settings.json"
@@ -135,6 +202,10 @@ class AgySyncTest(unittest.TestCase):
                 "entries": [{"path": "/existing/skills", "exclude": ["demo-.*"]}],
             }
             skills_json.write_text(json.dumps(existing), encoding="utf-8")
+
+            hooks_json = config_dir / "hooks.json"
+            existing_hooks = {"my-custom-hook": {"PostToolUse": []}}
+            hooks_json.write_text(json.dumps(existing_hooks), encoding="utf-8")
 
             env = os.environ.copy()
             env["AGY_CONFIG_DIR"] = str(config_dir)
@@ -193,7 +264,19 @@ class AgySyncTest(unittest.TestCase):
                 agent_link.resolve(), (ROOT / "agy/agents/test-runner.md").resolve()
             )
 
-            # 5. 二次运行完全幂等
+            # 5. hooks.json 保留已有 hook 并注入内置子代理档位兜底 hook
+            merged_hooks = json.loads(hooks_json.read_text(encoding="utf-8"))
+            self.assertEqual(merged_hooks["my-custom-hook"], existing_hooks["my-custom-hook"])
+            router_hook = merged_hooks["harness-config-subagent-model-router"]
+            self.assertEqual(router_hook["PreToolUse"][0]["matcher"], "invoke_subagent")
+            self.assertIn(
+                str(ROOT / "agy/hooks/subagent-model-router.py"),
+                router_hook["PreToolUse"][0]["hooks"][0]["command"],
+            )
+            self.assertEqual(stat.S_IMODE(hooks_json.stat().st_mode), 0o600)
+            self.assertEqual(len(list(config_dir.glob("hooks.json.bak.*"))), 1)
+
+            # 6. 二次运行完全幂等
             second = subprocess.run(
                 ["bash", str(ROOT / "init-agy.sh")],
                 cwd=ROOT,
@@ -217,6 +300,10 @@ class AgySyncTest(unittest.TestCase):
             self.assertEqual(merged_again, merged)
             backups_after_second = list(config_dir.glob("skills.json.bak.*"))
             self.assertEqual(len(backups_after_second), 1)
+            self.assertEqual(
+                json.loads(hooks_json.read_text(encoding="utf-8")), merged_hooks
+            )
+            self.assertEqual(len(list(config_dir.glob("hooks.json.bak.*"))), 1)
 
     def test_init_agy_skips_regular_rule_file_without_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
