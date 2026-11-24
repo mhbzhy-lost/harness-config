@@ -20,6 +20,8 @@ if (process.env.FAKE_MCP_MODE === "sleep") {
 } else {
   appendFileSync(${JSON.stringify(countFile)}, "1\\n", "utf8");
   const round = readFileSync(${JSON.stringify(countFile)}, "utf8").trim().split("\\n").length;
+  process.stdout.write(JSON.stringify({ type: "tool_execution_start", toolCallId: "c1", toolName: "bash", args: { command: "echo step" } }) + "\\n");
+  process.stdout.write(JSON.stringify({ type: "tool_execution_end", toolCallId: "c1", toolName: "bash", isError: false }) + "\\n");
   if (round === 1) {
     writeFileSync(process.env.PI_WORKER_OUTCOME_FILE, JSON.stringify({
       status: "needs_input",
@@ -57,6 +59,7 @@ function startMcpClient(env) {
   });
 
   const pending = new Map();
+  const notifications = [];
   let buf = "";
   let nextId = 1;
 
@@ -74,6 +77,8 @@ function startMcpClient(env) {
         const { resolve: res } = pending.get(msg.id);
         pending.delete(msg.id);
         res(msg);
+      } else if (msg.id === undefined && msg.method) {
+        notifications.push(msg);
       }
     }
   });
@@ -89,7 +94,7 @@ function startMcpClient(env) {
     child.stdin.end();
   });
 
-  return { child, request, close };
+  return { child, request, close, notifications };
 }
 
 test("test_mcp_full_lifecycle_validation_and_graceful_shutdown", async () => {
@@ -393,6 +398,125 @@ test("test_mcp_agy_mode_blocks_start_reply_and_cancels_via_notification", async 
   } finally {
     if (client) await client.close().catch(() => {});
     if (cancelClient) await cancelClient.close().catch(() => {});
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_mcp_progress_notifications_and_agy_app_endpoints", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-mcp-app-"));
+  let agyClient;
+  let stdClient;
+  let nestedAgyClient;
+  try {
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const countFile = join(dir, "rounds.txt");
+    const pidFile = join(dir, "sleep.pid");
+    const fakePi = createFakePiForMcp(dir, countFile, pidFile);
+    const fakeHtmlPath = join(dir, "monitor.html");
+    writeFileSync(fakeHtmlPath, "<!DOCTYPE html><html><body>monitor-ok</body></html>", "utf8");
+
+    // 1. 标准模式（未设 PI_WORKER_AGY）：发 progressToken 时仍支持标准 notifications/progress，但不暴露 MCP App 资源或工具
+    stdClient = startMcpClient({
+      PI_WORKER_BIN: fakePi,
+      PI_WORKER_STATE_DIR: join(dir, "state-std"),
+    });
+    const stdResList = await stdClient.request("resources/list");
+    assert.deepEqual(stdResList.result.resources, []);
+    const stdTools = (await stdClient.request("tools/list")).result.tools.map((t) => t.name);
+    assert.equal(stdTools.includes("pi_worker_monitor"), false);
+    assert.equal(stdTools.includes("pi_worker_app_snapshot"), false);
+
+    const stdStart = await stdClient.request("tools/call", {
+      name: "pi_worker_start",
+      arguments: { cwd: workDir, prompt: "with progress", waitSeconds: 5 },
+      _meta: { progressToken: "pt-std-1" },
+    });
+    assert.equal(stdStart.result.isError, undefined);
+    const progNotes = stdClient.notifications.filter((n) => n.method === "notifications/progress");
+    assert.ok(progNotes.length >= 1, "expected standard notifications/progress when progressToken is provided");
+    assert.equal(progNotes[0].params.progressToken, "pt-std-1");
+    assert.match(progNotes[0].params.message, /bash/);
+    await stdClient.close();
+    stdClient = undefined;
+
+    // 2. AGY 模式：resources/list + resources/read + pi_worker_monitor + app-only 工具
+    agyClient = startMcpClient({
+      PI_WORKER_BIN: fakePi,
+      PI_WORKER_STATE_DIR: join(dir, "state-agy"),
+      PI_WORKER_AGY: "1",
+      PI_WORKER_APP_HTML: fakeHtmlPath,
+    });
+    const agyInit = await agyClient.request("initialize", { protocolVersion: "2025-06-18" });
+    assert.ok(agyInit.result.capabilities.resources);
+    const agyResList = await agyClient.request("resources/list");
+    assert.equal(agyResList.result.resources.length, 1);
+    assert.equal(agyResList.result.resources[0].uri, "ui://pi-worker/monitor.html");
+    assert.equal(agyResList.result.resources[0].mimeType, "text/html;profile=mcp-app");
+
+    const readRes = await agyClient.request("resources/read", { uri: "ui://pi-worker/monitor.html" });
+    assert.equal(readRes.result.contents[0].mimeType, "text/html;profile=mcp-app");
+    assert.match(readRes.result.contents[0].text, /monitor-ok/);
+
+    const agyTools = (await agyClient.request("tools/list")).result.tools;
+    const monitorTool = agyTools.find((t) => t.name === "pi_worker_monitor");
+    assert.ok(monitorTool);
+    assert.equal(monitorTool._meta.ui.resourceUri, "ui://pi-worker/monitor.html");
+    assert.equal(monitorTool._meta["com.google.antigravity/ui"].entrypoints.length, 2);
+
+    const snapshotTool = agyTools.find((t) => t.name === "pi_worker_app_snapshot");
+    const appCancelTool = agyTools.find((t) => t.name === "pi_worker_app_cancel");
+    assert.deepEqual(snapshotTool._meta.ui.visibility, ["app"]);
+    assert.deepEqual(appCancelTool._meta.ui.visibility, ["app"]);
+
+    // start/reply 不附加 inline resourceUri，避免聊天流堆叠重复轮询 iframe
+    const startTool = agyTools.find((t) => t.name === "pi_worker_start");
+    assert.equal(startTool._meta, undefined);
+
+    // 空参启动 pi_worker_monitor({}) 必须安全返回
+    const emptyMon = await agyClient.request("tools/call", { name: "pi_worker_monitor", arguments: {} });
+    assert.equal(emptyMon.result.isError, undefined);
+    assert.deepEqual(emptyMon.result.structuredContent.tasks, []);
+    assert.equal(emptyMon.result.structuredContent.task, null);
+
+    // 启动任务后，pi_worker_monitor 的 LLM content 紧凑（不含 events 数组），structuredContent 含 stream
+    const started = await agyClient.request("tools/call", {
+      name: "pi_worker_start",
+      arguments: { cwd: workDir, prompt: "agy app task" },
+    });
+    const tid = started.result.structuredContent.taskId;
+    const monRes = await agyClient.request("tools/call", { name: "pi_worker_monitor", arguments: { taskId: tid } });
+    assert.equal(monRes.result.isError, undefined);
+    assert.equal(monRes.result.structuredContent.task.taskId, tid);
+    assert.ok(monRes.result.structuredContent.stream.events.length >= 1);
+    assert.equal(monRes.result.content[0].text.includes('"events"'), false);
+
+    // app-only snapshot 增量读取
+    const snap = await agyClient.request("tools/call", {
+      name: "pi_worker_app_snapshot",
+      arguments: { taskId: tid, offset: 0 },
+    });
+    assert.equal(snap.result.isError, undefined);
+    assert.ok(snap.result.structuredContent.stream.events.length >= 1);
+    await agyClient.close();
+    agyClient = undefined;
+
+    // 3. 嵌套环境即使带 PI_WORKER_AGY=1 也必须隐藏并封锁全部资源与工具
+    nestedAgyClient = startMcpClient({
+      PI_WORKER_AGY: "1",
+      PI_WORKER_DEPTH: "1",
+      PI_WORKER_STATE_DIR: join(dir, "state-nest-agy"),
+    });
+    assert.deepEqual((await nestedAgyClient.request("tools/list")).result.tools, []);
+    assert.deepEqual((await nestedAgyClient.request("resources/list")).result.resources, []);
+    const nestedRead = await nestedAgyClient.request("resources/read", { uri: "ui://pi-worker/monitor.html" });
+    assert.ok(nestedRead.error);
+    await nestedAgyClient.close();
+    nestedAgyClient = undefined;
+  } finally {
+    if (stdClient) await stdClient.close().catch(() => {});
+    if (agyClient) await agyClient.close().catch(() => {});
+    if (nestedAgyClient) await nestedAgyClient.close().catch(() => {});
     rmSync(dir, { recursive: true, force: true });
   }
 });

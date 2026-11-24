@@ -24,6 +24,8 @@ import {
 } from "./protocol.ts";
 import { TaskStore, defaultIsPidAlive } from "./store.ts";
 import type { TaskRecord, TaskStatus, TaskSummary } from "./store.ts";
+import { createEventFormatter } from "./stream.ts";
+import type { FormattedStreamEvent } from "./stream.ts";
 
 export const MAX_WAIT_SECONDS = 30;
 export const DEFAULT_EXCLUDE_TOOLS = [
@@ -51,6 +53,7 @@ export interface StartTaskInput {
   waitSeconds?: number;
   waitUntilSettled?: boolean;
   onTaskCreated?: (taskId: string) => void;
+  onProgress?: (event: FormattedStreamEvent) => void;
 }
 
 export interface ReplyTaskInput {
@@ -62,6 +65,7 @@ export interface ReplyTaskInput {
   waitSeconds?: number;
   waitUntilSettled?: boolean;
   onTaskCreated?: (taskId: string) => void;
+  onProgress?: (event: FormattedStreamEvent) => void;
 }
 
 export interface StatusTaskInput {
@@ -302,7 +306,11 @@ export class PiWorkerRunner {
     return childEnv;
   }
 
-  private launchRound(record: TaskRecord, promptText: string): ActiveExecution {
+  private launchRound(
+    record: TaskRecord,
+    promptText: string,
+    onProgress?: (event: FormattedStreamEvent) => void,
+  ): ActiveExecution {
     const piBinary = this.resolveBinary();
     const args = this.buildArgs(record);
     const childEnv = this.buildChildEnv(record);
@@ -359,6 +367,15 @@ export class PiWorkerRunner {
 
     const logStream = createWriteStream(record.logPath, { flags: "a", mode: 0o600 });
     logStream.on("error", () => { /* 日志写入失败不阻塞主流程 */ });
+    const eventsStream = createWriteStream(record.eventsPath, { flags: "a", mode: 0o600 });
+    eventsStream.on("error", () => { /* 进度流写入失败不阻塞主流程 */ });
+    const eventFormatter = createEventFormatter();
+    const recordFormattedEvents = (formatted: FormattedStreamEvent[]): void => {
+      for (const item of formatted) {
+        eventsStream.write(`${JSON.stringify(item)}\n`);
+        try { onProgress?.(item); } catch { /* 进度通知异常不阻塞主流程 */ }
+      }
+    };
 
     let lastAssistantText = "";
     let lastStopReason: string | null = null;
@@ -371,6 +388,7 @@ export class PiWorkerRunner {
     const lineSplitter = createLineSplitter((line) => {
       if (!line.trim()) return;
       logStream.write(`${line}\n`);
+      recordFormattedEvents(eventFormatter.feedRawLine(line));
 
       const assistant = extractAssistantMessage(line);
       if (assistant) {
@@ -431,6 +449,7 @@ export class PiWorkerRunner {
       }
 
       lineSplitter.flush();
+      recordFormattedEvents(eventFormatter.flush());
       await new Promise<void>((done) => {
         logStream.end(() => done());
       });
@@ -480,6 +499,16 @@ export class PiWorkerRunner {
         record.verifiedCommands = [];
         record.error = null;
       }
+
+      recordFormattedEvents([
+        eventFormatter.emitStatus(
+          record.status,
+          record.question ?? record.error ?? record.summary ?? undefined,
+        ),
+      ]);
+      await new Promise<void>((done) => {
+        eventsStream.end(() => done());
+      });
 
       record.gitChanges = await this.collectGitChangesFn(record.cwd);
       tightenSessionPermissions(record.sessionDir, record.taskId);
@@ -591,7 +620,7 @@ export class PiWorkerRunner {
       gitChanges: [],
     };
 
-    const execState = this.launchRound(record, input.prompt);
+    const execState = this.launchRound(record, input.prompt, input.onProgress);
     input.onTaskCreated?.(taskId);
     if (input.waitUntilSettled) {
       const settled = await execState.settled;
@@ -636,7 +665,7 @@ export class PiWorkerRunner {
       error: null,
     };
 
-    const execState = this.launchRound(nextRecord, input.reply);
+    const execState = this.launchRound(nextRecord, input.reply, input.onProgress);
     input.onTaskCreated?.(nextRecord.taskId);
     if (input.waitUntilSettled) {
       const settled = await execState.settled;
