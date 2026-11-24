@@ -1,0 +1,15 @@
+{
+  "hideThinkingBlock": true,
+  "cacheWarming": "streaming",
+  "defaultTools": [
+    "+codemode",
+    "+tool_search",
+    "+grep",
+    "+find",
+    "+ls"
+  ],
+  "packages": [
+    "npm:@arhen/pi-core-ask@1.1.0",
+    "git:github.com/mhbzhy-lost/pi-dcp-migrate@v0.1.5"
+  ]
+}

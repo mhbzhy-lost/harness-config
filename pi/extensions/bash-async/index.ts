@@ -1,0 +1,93 @@
+import { createLocalBashOperations, defineTool, type ExtensionAPI, type ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { createBashAsyncStatusResult } from "./status.ts";
+import { createBashCwdToolDefinition, prepareBashCwdExecution } from "../bash-cwd/index.ts";
+import { createBashAsyncController } from "./controller.ts";
+import { createBashAsyncWake } from "./wake.ts";
+import { BASH_ASYNC_FOOTER_EVENT, type BashAsyncRequest, type ExecutionEvidence } from "./contracts.ts";
+export * from "./contracts.ts";
+export { createBashAsyncController } from "./controller.ts";
+export { createBashAsyncCompleteRenderer, type BashAsyncRendererDeps } from "./renderer.ts";
+export { createBashAsyncStatusResult, type BashAsyncStatusReport } from "./status.ts";
+
+export function createBashAsyncExtension(pi: ExtensionAPI, options: Parameters<typeof createBashCwdToolDefinition>[0]) {
+  const base = createBashCwdToolDefinition(options);
+  const wake = createBashAsyncWake(pi);
+  const controller = createBashAsyncController({
+    send: (message, delivery) => wake.sendMessage(message, delivery),
+    async prepare(request: BashAsyncRequest, ctx: ExtensionToolContext) {
+      const id = ctx.sessionManager.getSessionId(), file = ctx.sessionManager.getSessionFile();
+      const captured = { cwd: ctx.cwd, model: ctx.model ? { ...ctx.model } : undefined, thinkingLevel: ctx.thinkingLevel, sessionManager: { getSessionId: () => id, getSessionFile: () => file } };
+      const evidence: ExecutionEvidence = {};
+      const prepared = await prepareBashCwdExecution(options, ctx, (config) => {
+        const operations = config.operations ?? createLocalBashOperations({ shellPath: config.shellPath });
+        return { ...config, operations: { async exec(...args: any[]) {
+          try { const result = await operations.exec(...args); evidence.exitCode = result.exitCode; return result; }
+          catch (error) { evidence.backendError = error; throw error; }
+        } } };
+      });
+      return { cwd: prepared.cwd, evidence, execute: (toolCallId, params, signal) => prepared.definition.execute(toolCallId, params, signal, undefined, captured) };
+    },
+  });
+  controller.subscribe(() => {
+    pi.events?.emit?.(BASH_ASYNC_FOOTER_EVENT, {
+      tasks: controller.snapshot().active.map((receipt) => ({ id: receipt.jobId, command: receipt.command, state: "running" as const })),
+    });
+  });
+  const { outputSchema: _outputSchema, constrainedSampling: _sampling, renderResult: _resultRenderer, renderCall: _callRenderer, execute: _execute, ...metadata } = base;
+  pi.registerTool({
+    ...metadata,
+    name: "bash_async", label: "bash_async", exposure: "model-only",
+    description: "后台复用原生 Bash 执行命令，立即返回 jobId 接受回执，不等待命令结束。完成后自动向本会话投递原生结果（busy 经 steer 进入会话，Esc 后经 pending custom 扛住清队列）。仅用于测试套件、类型检查、产物构建或网络请求等真实长耗时工作；不要用它轮询、常驻或替代普通等待。收到接受回执后立即继续其他无冲突工作；没有独立工作时结束当前回合，命令完成会自动投递回执唤醒本会话。短查询或立即依赖输出的操作使用 bash。仅 TUI/RPC；不提供隔离、跨会话持久化或崩溃后重放。",
+    promptSnippet: "异步执行长耗时命令并在完成后自动接收回执",
+    promptGuidelines: [
+      "bash_async 启动成功只代表接受任务；以 bash-async-complete 的 outcome/exitCode 判断执行结果。",
+      "bash_async 接受回执后立即继续其他无冲突工作；没有独立工作时结束当前回合，完成时自动投递回执唤醒。正例：启动 e2e 测试后转去处理无关文件或直接结束回合；反例：启动构建后反复轮询任务状态，或另起阻塞命令纯粹干等结果。",
+      "不得用 bash_async 绕过命令门禁、凭据、网络或提交授权；不要用于自建 daemon、轮询或常驻定时器。",
+      "bash_async 不支持 print/json；tree/独立 compaction/reload/switch/退出可能取消任务。clear_queue 是 Host/RPC 侧操作、不是 bash_async 参数，可清除已提交的回执且不自动重发。",
+    ],
+    async execute(toolCallId: any, request: any, signal: any, _onUpdate: any, ctx: any) {
+      const receipt = await controller.launch(toolCallId, request as BashAsyncRequest, ctx, signal);
+      return {
+        content: [
+          { type: "text", text: JSON.stringify(receipt) },
+          { type: "text", text: "以上为启动回执：accepted 仅代表任务已接受，不代表命令成功。现在请立即继续其他无冲突工作；没有独立工作就结束当前回合，命令完成后会自动投递回执唤醒本会话。不要轮询本任务状态，也不要另起阻塞命令纯粹干等结果。" },
+        ],
+        details: receipt,
+      };
+    },
+  });
+  pi.registerTool(defineTool({
+    name: "bash_async_status", label: "bash_async_status",
+    description: "只读查询本会话 bash_async 后台任务的权威状态：活跃任务总数（activeCount）、每个活跃任务的 jobId/command/cwd/接受时间，以及最近 64 条已收束任务归档的 outcome/exitCode/耗时/回执投递状态。可传 jobId 只查单个任务（计数仍为全局）。适用于 compaction 后核对哪些任务仍在运行、决定是否需要取消、确认完成回执是否投递成功。不返回命令输出全文（完整输出在 bash-async-complete 完成回执消息中），不取消、不等待、不修改任务；仅反映当前会话内存快照，不跨会话、不持久化、崩溃后不可恢复。",
+    promptSnippet: "只读查询本会话 bash_async 活跃任务总数与单任务状态",
+    promptGuidelines: [
+      "bash_async_status 仅用于一次性核对（如 compaction 后确认存活任务、决定是否取消）；不得用它轮询等待任务完成，完成结果仍以 bash-async-complete 回执为准。",
+    ],
+    parameters: Type.Object({
+      jobId: Type.Optional(Type.String({ minLength: 1, description: "只查询该 jobId 的任务；省略时返回全部活跃任务与归档摘要。activeCount/completedCount 始终为全局计数。" })),
+    }, { additionalProperties: false }),
+    exposure: "deferred",
+    defaultActive: false,
+    async execute(_toolCallId, input) {
+      return createBashAsyncStatusResult(controller.snapshot(), input.jobId);
+    },
+  }));
+  pi.on("session_start", async (_event, ctx) => { wake.bindSession(ctx); await controller.start(ctx.sessionManager.getSessionId()); });
+  pi.on("session_shutdown", async (event) => { wake.sessionShutdown(event.reason); await controller.shutdown(event.reason); });
+  pi.on("agent_end", (_event, ctx) => { if (ctx.hasUI && ctx.signal?.aborted) wake.userAborted(); });
+  pi.on("agent_start", () => { wake.agentStarted(); });
+  pi.on("session_compact", (event) => { if (event.reason === "manual") wake.releaseHold(); });
+  pi.on("session_before_tree", async () => { await controller.invalidateBranch(); });
+  pi.on("session_before_compact", async (_event, ctx) => {
+    if (!ctx.signal) await controller.invalidateBranch();
+  });
+  pi.registerCommand("bash-async-cancel", {
+    description: "取消本会话指定异步 Bash job，或 all；不撤销已经发生的副作用",
+    async handler(args, ctx) {
+      if (args.trim() === "all") { await controller.cancelAll(); ctx.ui.notify("已请求取消当前会话全部异步 Bash，并等待原生执行收束", "info"); }
+      else { const result = await controller.cancel(args.trim()); ctx.ui.notify(JSON.stringify(result), result.accepted ? "info" : "warning"); }
+    },
+  });
+  return controller;
+}

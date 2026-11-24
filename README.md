@@ -7,7 +7,13 @@ Qwen Code 个人配置与插件的多机同步仓库。
 | 路径 | 说明 |
 |---|---|
 | `init-qwen.sh` | 同步脚本：合并设置 + 注入 HARNESS_CONFIG_ROOT + 链接插件 + 注册 shell 片段 + 链接全局 QWEN.md + 链接 agent 定义 |
-| `init-pi.sh` | 链接插件到 pi 的加载目录（默认 `~/.agents/plugins`） |
+| `init-pi.sh` | 同步到 Pi：合并 `pi/settings.json` 并按序注入 `pi/extensions/*` 与 `skills/` 到 `~/.pi/agent/settings.json` + 链接 `pi/keybindings.json` + 链接 `pi/GLOBAL.md` 到 `~/.pi/agent/AGENTS.md` + 复制 `pi/bin/apply_patch` 到 `~/.pi/agent/bin/` + 链接跨运行时插件到 `~/.agents/plugins` + 注册 `pi/shell.zsh` 到 `~/.zshrc` + 自动软链本机 Pi 包文档到 `.agents/skills/pi-docs/` |
+| `pi/settings.json` | Pi 跨机通用设置模板（`hideThinkingBlock`、`cacheWarming`、`defaultTools` 与锁版社区包 `npm:@arhen/pi-core-ask@1.1.0` / `git:github.com/mhbzhy-lost/pi-dcp-migrate@v0.1.5`），深度合并进 `~/.pi/agent/settings.json`（保留本机模型、本地 packages 与非受管扩展） |
+| `pi/GLOBAL.md` | Pi 全局指令（Commit 规范、Pi bin 工具与 `bash_async` 约定），软链接为 `~/.pi/agent/AGENTS.md`（仓内不命名为 `AGENTS.md` 避免目录扫描误加载） |
+| `pi/keybindings.json` | Pi 快捷键配置（`alt+p` / `shift+alt+p` 切换模型），软链接为 `~/.pi/agent/keybindings.json` |
+| `pi/bin/` | Pi 辅助工具 `apply_patch`（由 `init-pi.sh` 复制到 `~/.pi/agent/bin/apply_patch`，与 Pi 原生管理的 `fd` / `rg` 一同自动进入 Pi bash 子进程 `PATH`） |
+| `pi/extensions/` | Pi 专属扩展（每个扩展 `<name>/<name>.ts`）：`agent-plugins`（Agent Plugins 1.0.0 加载 `~/.agents/plugins/`）、`ask-user-question`、`dcp`、`compact-tools`、`bash-cwd`、`bash-async`、`endpoint-fallback`、`network-recovery`、`openai-proxy`、`security-gates`、`session-owner`、`tool-timing`、`tui-lite` |
+| `pi/shell.zsh` + `pi/launcher.zsh` | Pi shell 包装与 `session-owner` 启动预检器（`pi/scripts/pi-session-owner.ts`），防止多窗口 `pi -c` 写坏同一会话 |
 | `init-agy.sh` | 同步到 Antigravity（AGY）：合并 `agy/settings.json` + 链接插件到 `~/.gemini/config/plugins` + 注册 `skills/` 到 `skills.json` + 链接 `agy/rules/*.md` 到全局 rules + 链接 `agy/agents/*.md` 到全局 agents + 注入 `agy/hooks/` 到 `hooks.json` |
 | `lib-plugins.sh` | 三个 init 脚本共享的插件链接逻辑 |
 | `agy/settings.json` | AGY CLI 设置模板（跨机通用 UI 偏好：全屏 `altScreenMode: always`），深度合并进 `~/.gemini/antigravity-cli/settings.json` |
@@ -19,7 +25,8 @@ Qwen Code 个人配置与插件的多机同步仓库。
 | `qwen/QWEN.md` | 全局指令与子代理路由表，软链接为 `~/.qwen/QWEN.md`（对所有项目生效） |
 | `qwen/agents/` | subagent 定义（test-runner 验证；review-agent 重模型覆盖；antigravity 外部执行器委托 `agy acp`），逐文件软链接进 `~/.qwen/agents/` |
 | `qwen/extensions/` | 原生 Qwen extension（codex-proxy：/codex-login、/codex-status + 生命周期脚本），软链接进 `~/.qwen/extensions/` |
-| `skills/` | 独立 skill（superpowers 改写版：writing-skills / writing-plans），经 `skills.directories` 注入加载 |
+| `skills/` | 跨项目独立 skill（superpowers 改写版：`writing-skills` / `writing-plans`），分别注入 Qwen `skills.directories`、AGY `skills.json` 与 Pi `skills` 加载 |
+| `.agents/skills/` | 仅在本仓加载的项目级 skill：`pi-manage-provider`（安全管理 `~/.pi/agent/models.json` 与 `/dev/tty` 凭据录入）、`pi-docs`（Pi 官方文档索引，本机 `docs`/`examples`/`schemas`/`README.md` 软链由 `init-pi.sh` 自动生成且 gitignore） |
 | `plugins/` | Agent Plugins v1 插件：deepseek-search / home-connect / playwright |
 
 ## 同步范围
@@ -92,9 +99,12 @@ cp plugins/deepseek-search/.env.example plugins/deepseek-search/.env   # 填写�
 
 ```bash
 ./init-qwen.sh --dry-run    # 预览 Qwen 变更
+./init-pi.sh --dry-run      # 预览 Pi 变更
 ./init-agy.sh --dry-run     # 预览 AGY 变更
 python3 -m unittest discover -s tests -p 'test_*.py'   # 路由与 init 回归测试
+node --test tests/test_pi_extensions.mjs               # Pi 扩展与 session-owner 回归测试
 QWEN_SETTINGS_PATH=/tmp/t.json QWEN_EXTENSIONS_DIR=/tmp/ext QWEN_SHELL_RC=/tmp/zshrc QWEN_GLOBAL_MD=/tmp/QWEN.md QWEN_AGENTS_DIR=/tmp/agents ./init-qwen.sh   # 临时目录同步测试
+PI_AGENT_DIR=/tmp/pi-agent PI_PLUGINS_DIR=/tmp/pi-plugins PI_SHELL_RC=/tmp/pi-zshrc ./init-pi.sh   # Pi 临时目录同步测试
 AGY_SETTINGS_PATH=/tmp/agy-settings.json AGY_CONFIG_DIR=/tmp/agy-config ./init-agy.sh   # AGY 临时目录同步测试
 ```
 
