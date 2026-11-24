@@ -1,0 +1,172 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { TaskStore, resolveStateDir } from "../plugins/pi-worker/src/store.ts";
+
+function makeRecord(store, overrides = {}) {
+  const taskId = overrides.taskId ?? "11111111-1111-4111-8111-111111111111";
+  const paths = store.allocateTaskPaths(taskId);
+  const now = new Date().toISOString();
+  return {
+    taskId,
+    cwd: "/repo/a",
+    sessionDir: paths.sessionDir,
+    logPath: paths.logPath,
+    outcomePath: paths.outcomePath,
+    status: "running",
+    pid: 12345,
+    excludeTools: ["ask_question", "ask_user_question", "bash_async", "bash_async_status"],
+    createdAt: now,
+    updatedAt: now,
+    lastActivityAt: now,
+    turnCount: 0,
+    roundCount: 1,
+    lastTool: null,
+    recentEvents: [],
+    summary: null,
+    question: null,
+    options: [],
+    verifiedCommands: [],
+    stopReason: null,
+    exitCode: null,
+    error: null,
+    gitChanges: [],
+    ...overrides,
+  };
+}
+
+test("test_save_and_load_enforces_private_permissions_and_dirs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-store-"));
+  try {
+    assert.equal(resolveStateDir({ PI_WORKER_STATE_DIR: dir }), dir);
+    const store = new TaskStore(dir, { isPidAlive: () => true });
+    const record = makeRecord(store, { status: "done", pid: null, summary: "all green" });
+    store.save(record);
+
+    for (const sub of ["", "tasks", "sessions", "logs", "locks", "outcomes"]) {
+      const target = sub ? join(dir, sub) : dir;
+      assert.equal(statSync(target).mode & 0o777, 0o700, `dir ${target} must be 0700`);
+    }
+
+    const { taskFile, sessionDir, outcomePath } = store.allocateTaskPaths(record.taskId);
+    assert.equal(statSync(taskFile).mode & 0o777, 0o600);
+    assert.equal(sessionDir, join(dir, "sessions"));
+    assert.equal(outcomePath, join(dir, "outcomes", `${record.taskId}.json`));
+    assert.deepEqual(store.load(record.taskId), record);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_load_reconciles_dead_pid_but_skips_in_flight_tasks", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-store-"));
+  try {
+    const store = new TaskStore(dir, { isPidAlive: () => false });
+    const record = makeRecord(store, { status: "running", pid: 999999 });
+    store.save(record);
+
+    // inFlight 保护期不得被覆写为 orphan_process
+    const protectedRec = store.load(record.taskId, { inFlightTaskIds: new Set([record.taskId]) });
+    assert.equal(protectedRec?.status, "running");
+    assert.equal(protectedRec?.pid, 999999);
+
+    // 移出 inFlight 后自动校正为 orphan_process 并回写磁盘
+    const reconciled = store.load(record.taskId);
+    assert.equal(reconciled?.status, "failed");
+    assert.equal(reconciled?.pid, null);
+    assert.equal(reconciled?.error, "orphan_process");
+
+    // 再次读取验证已持久化
+    const persisted = new TaskStore(dir, { isPidAlive: () => true }).load(record.taskId);
+    assert.equal(persisted?.status, "failed");
+    assert.equal(persisted?.error, "orphan_process");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_cwd_lock_prevents_cross_process_conflict_and_reclaims_dead_owner", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-store-"));
+  try {
+    const alivePids = new Set([1001, 2002]);
+    const store = new TaskStore(dir, { isPidAlive: (pid) => alivePids.has(pid) });
+
+    const idA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const idB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    store.save(makeRecord(store, { taskId: idA, cwd: "/repo/shared", status: "running", pid: 1001 }));
+
+    const lockA = store.acquireCwdLock("/repo/shared", { taskId: idA, ownerPid: 1001 });
+    assert.ok("lockPath" in lockA);
+    assert.equal(statSync(lockA.lockPath).mode & 0o777, 0o600);
+
+    // 活进程持锁期间，另一任务无法获锁
+    const conflict = store.acquireCwdLock("/repo/shared", { taskId: idB, ownerPid: 2002 });
+    assert.ok("conflictTaskId" in conflict);
+    assert.equal(conflict.conflictTaskId, idA);
+
+    // 非锁主调用 release 不得误删 A 的锁
+    store.releaseCwdLock("/repo/shared", idB);
+    assert.ok("conflictTaskId" in store.acquireCwdLock("/repo/shared", { taskId: idB, ownerPid: 2002 }));
+
+    // A 进程死亡后，B 自动回收陈旧锁，同时将 A 校正为 orphan_process
+    alivePids.delete(1001);
+    const lockB = store.acquireCwdLock("/repo/shared", { taskId: idB, ownerPid: 2002 });
+    assert.ok("lockPath" in lockB);
+    assert.equal(store.load(idA)?.status, "failed");
+    assert.equal(store.load(idA)?.error, "orphan_process");
+
+    store.releaseCwdLock("/repo/shared", idB);
+    assert.ok("lockPath" in store.acquireCwdLock("/repo/shared", { taskId: idB, ownerPid: 2002 }));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_list_returns_compact_summaries_and_rejects_invalid_task_id", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-store-"));
+  try {
+    const store = new TaskStore(dir, { isPidAlive: () => true });
+    const id1 = "11111111-1111-4111-8111-111111111111";
+    const id2 = "22222222-2222-4222-8222-222222222222";
+    const id3 = "33333333-3333-4333-8333-333333333333";
+
+    store.save(makeRecord(store, {
+      taskId: id1,
+      cwd: "/repo/a",
+      status: "done",
+      pid: null,
+      updatedAt: "2026-11-24T10:00:00.000Z",
+      summary: "big summary",
+      recentEvents: [{ kind: "turn_end", timestamp: "2026-11-24T10:00:00.000Z" }],
+    }));
+    store.save(makeRecord(store, {
+      taskId: id2,
+      cwd: "/repo/b",
+      status: "needs_input",
+      pid: null,
+      question: "A or B?",
+      updatedAt: "2026-11-24T12:00:00.000Z",
+    }));
+    store.save(makeRecord(store, {
+      taskId: id3,
+      cwd: "/repo/a",
+      status: "done",
+      pid: null,
+      updatedAt: "2026-11-24T11:00:00.000Z",
+    }));
+
+    const all = store.list();
+    assert.deepEqual(all.map((t) => t.taskId), [id2, id3, id1]);
+    assert.equal("recentEvents" in all[0], false);
+    assert.equal("summary" in all[0], false);
+
+    assert.deepEqual(store.list({ status: "done", cwd: "/repo/a", limit: 1 }).map((t) => t.taskId), [id3]);
+
+    assert.throws(() => store.allocateTaskPaths("../escape"));
+    assert.throws(() => store.load("bad/id"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
