@@ -8,7 +8,10 @@ Qwen Code 个人配置与插件的多机同步仓库。
 |---|---|
 | `init-qwen.sh` | 同步脚本：合并设置 + 注入 HARNESS_CONFIG_ROOT + 链接插件 + 注册 shell 片段 + 链接全局 QWEN.md + 链接 agent 定义 |
 | `init-pi.sh` | 链接插件到 pi 的加载目录（默认 `~/.agents/plugins`） |
-| `lib-plugins.sh` | 两个 init 脚本共享的插件链接逻辑 |
+| `init-agy.sh` | 同步到 Antigravity（AGY）：链接插件到 `~/.gemini/config/plugins` + 注册 `skills/` 到 `skills.json` + 链接 `agy/rules/*.md` 到全局 rules + 链接 `agy/agents/*.md` 到全局 agents |
+| `lib-plugins.sh` | 三个 init 脚本共享的插件链接逻辑 |
+| `agy/rules/` | AGY 全局规则（带 `trigger: always_on`），逐文件软链接进 `~/.gemini/config/rules/`（对所有项目生效） |
+| `agy/agents/` | AGY 自定义 subagent 定义（`test-runner` 只读验证），逐文件软链接进 `~/.gemini/config/agents/` |
 | `qwen/settings.json` | 设置模板（跨机通用偏好：TUI 精简 + 主题插值 + Explore 抽象 `fast` 档位） |
 | `qwen/shell.zsh` | qwen shell 包装：主题随系统明暗（macOS light→Xcode / dark→Qwen Dark） |
 | `qwen/QWEN.md` | 全局指令与子代理路由表，软链接为 `~/.qwen/QWEN.md`（对所有项目生效） |
@@ -60,6 +63,7 @@ CLIProxyAPI（`brew install cliproxyapi`）把 ChatGPT 订阅配额暴露为本�
 git clone <repo-url> harness-config && cd harness-config
 ./init-qwen.sh
 ./init-pi.sh      # 若使用 pi：链接插件到 ~/.agents/plugins
+./init-agy.sh     # 若使用 agy：链接插件 + 注册 skills.json + 链接 AGY 全局规则
 # 可选：playwright 依赖按需安装（首次 browser_start 返回 sdk-missing 时再执行也可以）
 bash plugins/playwright/scripts/setup.sh
 cp plugins/deepseek-search/.env.example plugins/deepseek-search/.env   # 填写密钥
@@ -85,9 +89,11 @@ cp plugins/deepseek-search/.env.example plugins/deepseek-search/.env   # 填写�
 ## 常用命令
 
 ```bash
-./init-qwen.sh --dry-run    # 预览变更
+./init-qwen.sh --dry-run    # 预览 Qwen 变更
+./init-agy.sh --dry-run     # 预览 AGY 变更
 python3 -m unittest discover -s tests -p 'test_*.py'   # 路由与 init 回归测试
 QWEN_SETTINGS_PATH=/tmp/t.json QWEN_EXTENSIONS_DIR=/tmp/ext QWEN_SHELL_RC=/tmp/zshrc QWEN_GLOBAL_MD=/tmp/QWEN.md QWEN_AGENTS_DIR=/tmp/agents ./init-qwen.sh   # 临时目录同步测试
+AGY_CONFIG_DIR=/tmp/agy-config ./init-agy.sh   # AGY 临时目录同步测试
 ```
 
 ## 更新

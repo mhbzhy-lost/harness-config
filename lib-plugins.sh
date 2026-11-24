@@ -1,4 +1,4 @@
-# lib-plugins.sh — 插件软链接共享逻辑，由 init-qwen.sh / init-pi.sh source。
+# lib-plugins.sh — 插件软链接共享逻辑，由 init-qwen.sh / init-pi.sh / init-agy.sh source。
 # link_plugins <plugins_src_dir> <target_dir> <dry_run:0|1>
 link_plugins() {
   local src="$1" target="$2" dry="$3"

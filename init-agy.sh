@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# init-agy.sh — 将仓库中的跨运行时插件、独立 skills 与 AGY 专属配置同步到本机：
+#   1. plugins/* 逐插件软链接进 ~/.gemini/config/plugins/（复用 lib-plugins.sh）
+#   2. 确保 ~/.gemini/config/skills.json 的 entries 含 <仓库根>/skills（保留已有条目）
+#   3. agy/rules/*.md 逐文件软链接进 ~/.gemini/config/rules/（全局规则）
+#   4. agy/agents/*.md 逐文件软链接进 ~/.gemini/config/agents/（自定义 subagent）
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGINS_SRC="$SCRIPT_DIR/plugins"
+SKILLS_SRC="$SCRIPT_DIR/skills"
+RULES_SRC="$SCRIPT_DIR/agy/rules"
+AGENTS_SRC="$SCRIPT_DIR/agy/agents"
+
+CONFIG_DIR="${AGY_CONFIG_DIR:-$HOME/.gemini/config}"
+PLUGINS_DIR="${AGY_PLUGINS_DIR:-$CONFIG_DIR/plugins}"
+SKILLS_JSON="${AGY_SKILLS_JSON:-$CONFIG_DIR/skills.json}"
+RULES_DIR="${AGY_RULES_DIR:-$CONFIG_DIR/rules}"
+AGENTS_DIR="${AGY_AGENTS_DIR:-$CONFIG_DIR/agents}"
+DRY_RUN=0
+
+usage() {
+  cat <<EOF
+用法: ./init-agy.sh [--dry-run]
+
+将仓库中的插件、独立 skills、AGY 全局规则与 subagent 定义同步到 Antigravity 全局配置目录。
+  --dry-run   只预览将发生的变更，不写入
+  -h, --help  显示本帮助
+
+环境变量:
+  AGY_CONFIG_DIR    覆盖 AGY 全局配置根目录（默认 ~/.gemini/config）
+  AGY_PLUGINS_DIR   覆盖插件链接目录（默认 \$AGY_CONFIG_DIR/plugins）
+  AGY_SKILLS_JSON   覆盖 skills.json 路径（默认 \$AGY_CONFIG_DIR/skills.json）
+  AGY_RULES_DIR     覆盖全局规则链接目录（默认 \$AGY_CONFIG_DIR/rules）
+  AGY_AGENTS_DIR    覆盖 subagent 定义链接目录（默认 \$AGY_CONFIG_DIR/agents）
+EOF
+}
+
+die() { printf '错误: %s\n' "$*" >&2; exit 1; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; die "未知参数: $1" ;;
+  esac
+  shift
+done
+
+command -v python3 >/dev/null 2>&1 || die "需要 python3"
+
+# --- 1. 插件软链接 ---
+source "$SCRIPT_DIR/lib-plugins.sh"
+link_plugins "$PLUGINS_SRC" "$PLUGINS_DIR" "$DRY_RUN"
+
+# --- 2. 注册独立 skills 到 ~/.gemini/config/skills.json ---
+AGY_SYNC_DRY_RUN="$DRY_RUN" python3 - "$SKILLS_JSON" "$SKILLS_SRC" <<'PY'
+import copy, json, os, sys, tempfile
+from datetime import datetime
+
+target_path, skills_dir = sys.argv[1:3]
+dry_run = os.environ.get("AGY_SYNC_DRY_RUN") == "1"
+
+existing = {}
+if os.path.exists(target_path):
+    with open(target_path, encoding="utf-8") as f:
+        text = f.read()
+    if text.strip():
+        try:
+            existing = json.loads(text)
+        except json.JSONDecodeError as e:
+            sys.exit(f"错误: 现有配置 {target_path} 不是标准 JSON: {e}")
+    if not isinstance(existing, dict):
+        sys.exit(f"错误: {target_path} 顶层不是 JSON 对象")
+
+merged = copy.deepcopy(existing)
+entries = merged.setdefault("entries", [])
+if not isinstance(entries, list):
+    sys.exit(f"错误: {target_path} 的 entries 字段不是数组，无法注入")
+
+already = any(isinstance(e, dict) and e.get("path") == skills_dir for e in entries)
+if not already:
+    entries.append({"path": skills_dir})
+
+if merged == existing and os.path.exists(target_path):
+    print(f"skills.json 已包含仓库 skills 目录，无需写入: {target_path}")
+    sys.exit(0)
+
+if dry_run:
+    print(f"[dry-run] skills.json 目标: {target_path}")
+    print(f"[dry-run] 将确保 entries 含 {skills_dir}")
+    sys.exit(0)
+
+target_dir = os.path.dirname(target_path) or "."
+os.makedirs(target_dir, exist_ok=True)
+
+backup_path = None
+if os.path.exists(target_path):
+    backup_path = f"{target_path}.bak.{datetime.now():%Y%m%d-%H%M%S}"
+    with open(target_path, "rb") as src, open(backup_path, "wb") as dst:
+        dst.write(src.read())
+    os.chmod(backup_path, 0o600)
+
+fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=".skills-", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(merged, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, target_path)
+except BaseException:
+    os.unlink(tmp_path)
+    raise
+
+print(f"skills.json 已写入: {target_path}（权限 600）")
+if backup_path:
+    print(f"已备份: {backup_path}")
+PY
+
+# --- 3. AGY 全局规则软链接 ---
+if [[ -d "$RULES_SRC" ]]; then
+  [[ "$DRY_RUN" == 1 ]] || mkdir -p "$RULES_DIR"
+  for rule_file in "$RULES_SRC"/*.md; do
+    [[ -f "$rule_file" ]] || continue
+    name="$(basename "$rule_file")"
+    link="$RULES_DIR/$name"
+    if [[ -L "$link" ]]; then
+      if [[ "$(readlink "$link")" == "$rule_file" ]]; then
+        echo "AGY 规则 ${name}：链接已正确"
+      elif [[ "$DRY_RUN" == 1 ]]; then
+        echo "[dry-run] AGY 规则 ${name}：重指链接 → $rule_file"
+      else
+        ln -sfn "$rule_file" "$link"
+        echo "AGY 规则 ${name}：链接已重指 → $rule_file"
+      fi
+    elif [[ -e "$link" ]]; then
+      echo "警告: $link 已存在且不是软链接，跳过（请手动处理）" >&2
+    elif [[ "$DRY_RUN" == 1 ]]; then
+      echo "[dry-run] AGY 规则 ${name}：新建链接 → $rule_file"
+    else
+      ln -s "$rule_file" "$link"
+      echo "AGY 规则 ${name}：已链接 → $rule_file"
+    fi
+  done
+else
+  echo "（无 agy/rules/ 目录，跳过 AGY 规则链接）"
+fi
+
+# --- 4. AGY subagent 定义软链接 ---
+if [[ -d "$AGENTS_SRC" ]]; then
+  [[ "$DRY_RUN" == 1 ]] || mkdir -p "$AGENTS_DIR"
+  for agent_file in "$AGENTS_SRC"/*.md; do
+    [[ -f "$agent_file" ]] || continue
+    name="$(basename "$agent_file")"
+    link="$AGENTS_DIR/$name"
+    if [[ -L "$link" ]]; then
+      if [[ "$(readlink "$link")" == "$agent_file" ]]; then
+        echo "AGY agent ${name}：链接已正确"
+      elif [[ "$DRY_RUN" == 1 ]]; then
+        echo "[dry-run] AGY agent ${name}：重指链接 → $agent_file"
+      else
+        ln -sfn "$agent_file" "$link"
+        echo "AGY agent ${name}：链接已重指 → $agent_file"
+      fi
+    elif [[ -e "$link" ]]; then
+      echo "警告: $link 已存在且不是软链接，跳过（请手动处理）" >&2
+    elif [[ "$DRY_RUN" == 1 ]]; then
+      echo "[dry-run] AGY agent ${name}：新建链接 → $agent_file"
+    else
+      ln -s "$agent_file" "$link"
+      echo "AGY agent ${name}：已链接 → $agent_file"
+    fi
+  done
+else
+  echo "（无 agy/agents/ 目录，跳过 AGY agent 链接）"
+fi
+
+if [[ "$DRY_RUN" == 1 ]]; then
+  echo "预览完成，未做任何写入。"
+else
+  echo "完成。重启 agy 新开会话使插件、skills、全局规则与 subagent 生效。"
+fi

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "deepseek-search": {
+      "command": "node",
+      "args": [
+        "${PLUGIN_ROOT}/src/server.ts"
+      ],
+      "cwd": "${PLUGIN_ROOT}"
+    }
+  }
+}
