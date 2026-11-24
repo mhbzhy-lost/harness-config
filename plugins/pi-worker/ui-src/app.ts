@@ -5,6 +5,7 @@ import {
 } from "@modelcontextprotocol/ext-apps";
 import { z } from "zod";
 import { parseGitStatusFileUri } from "./git-uri.ts";
+import { createCoalescingRunner } from "./poller.ts";
 
 interface TaskSummary {
   taskId: string;
@@ -70,9 +71,10 @@ let offset = 0;
 let events: FormattedStreamEvent[] = [];
 let latestThinking: FormattedStreamEvent | null = null;
 let requestEpoch = 0;
-let inFlight = false;
 let pollTimer: number | null = null;
 let followScroll = true;
+let thinkingOpen = false;
+let lastRenderKey = "";
 
 const elSelect = document.getElementById("task-select") as HTMLSelectElement;
 const elRefresh = document.getElementById("btn-refresh") as HTMLButtonElement;
@@ -170,16 +172,15 @@ function applyPayload(payload: MonitorPayload, resetStream: boolean): boolean {
   return hasMore;
 }
 
-async function pollSnapshot(forceReset = false): Promise<void> {
-  if (inFlight) return;
-  inFlight = true;
+const poller = createCoalescingRunner(async ({ forceReset }) => {
   const myEpoch = requestEpoch;
   const reqOffset = forceReset ? 0 : offset;
+  const targetId = selectedTaskId;
   try {
     const res = await app.callServerTool({
       name: "pi_worker_app_snapshot",
       arguments: {
-        ...(selectedTaskId ? { taskId: selectedTaskId } : {}),
+        ...(targetId ? { taskId: targetId } : {}),
         offset: reqOffset,
       },
     });
@@ -189,9 +190,11 @@ async function pollSnapshot(forceReset = false): Promise<void> {
     schedulePoll(hasMore);
   } catch {
     if (myEpoch === requestEpoch) schedulePoll(false);
-  } finally {
-    inFlight = false;
   }
+});
+
+function pollSnapshot(forceReset = false): Promise<void> {
+  return poller.trigger({ forceReset });
 }
 
 async function cancelCurrentTask(): Promise<void> {
@@ -250,6 +253,16 @@ function renderTopbar(): void {
 
 function render(): void {
   renderTopbar();
+  const renderKey = currentTask
+    ? `${currentTask.taskId}|${currentTask.status}|${currentTask.roundCount}|${currentTask.turnCount}|${currentTask.lastTool ?? ""}|${currentTask.lastActivityAt}|${offset}|${events.length}|${latestThinking?.seq ?? 0}|${currentTask.gitChanges.length}`
+    : "empty";
+  if (renderKey === lastRenderKey) return;
+  lastRenderKey = renderKey;
+
+  const prevScrollTop = elMain.scrollTop;
+  const existingDetails = elMain.querySelector<HTMLDetailsElement>(".thinking-details");
+  if (existingDetails) thinkingOpen = existingDetails.open;
+
   if (!currentTask) {
     elMain.innerHTML = `<div class="empty">当前没有可展示的 Pi Worker 任务。<br>发起 <code>pi_worker_start</code> 后将自动在此显示实时进度。</div>`;
     return;
@@ -313,7 +326,7 @@ function render(): void {
 
   if (latestThinking) {
     parts.push(`
-      <details class="thinking-details">
+      <details class="thinking-details"${thinkingOpen ? " open" : ""}>
         <summary>💭 ${escapeHtml(latestThinking.title)} (${escapeHtml(fmtTime(latestThinking.timestamp))})</summary>
         <p class="ev-detail">${escapeHtml(latestThinking.detail ?? "")}</p>
       </details>
@@ -382,6 +395,8 @@ function render(): void {
 
   if (followScroll) {
     elMain.scrollTop = elMain.scrollHeight;
+  } else {
+    elMain.scrollTop = prevScrollTop;
   }
 }
 

@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parseGitStatusFileUri } from "../plugins/pi-worker/ui-src/git-uri.ts";
+import { createCoalescingRunner } from "../plugins/pi-worker/ui-src/poller.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MONITOR_HTML = join(ROOT, "plugins", "pi-worker", "ui", "monitor.html");
@@ -25,8 +26,39 @@ test("test_git_status_uri_parser_handles_renames_spaces_and_unicode", () => {
     parseGitStatusFileUri("/repo", '?? "dir/a b.ts"'),
     "file:///repo/dir/a%20b.ts",
   );
+  // 非重命名文件名包含字面 " -> " 不得被误截断
+  assert.equal(
+    parseGitStatusFileUri("/repo", " M docs/a -> b.md"),
+    "file:///repo/docs/a%20-%3E%20b.md",
+  );
+  // git core.quotePath 默认八进制 UTF-8 转义（"中" = \344\270\255）
+  assert.equal(
+    parseGitStatusFileUri("/repo", '?? "docs/\\344\\270\\255.md"'),
+    "file:///repo/docs/%E4%B8%AD.md",
+  );
   assert.equal(parseGitStatusFileUri("/repo", "D  removed.ts"), null);
   assert.equal(parseGitStatusFileUri("/repo", "?? src/"), null);
+});
+
+test("test_coalescing_runner_never_drops_task_switch_while_in_flight", async () => {
+  const calls = [];
+  let releaseFirst;
+  const firstGate = new Promise((r) => { releaseFirst = r; });
+
+  const runner = createCoalescingRunner(async (req) => {
+    calls.push(req);
+    if (calls.length === 1) await firstGate;
+  });
+
+  const p1 = runner.trigger({ forceReset: false });
+  // 在途期间连续触发普通刷新与切任务 forceReset，合并后 forceReset 必须保留并在 p1 结束后立刻执行
+  const p2 = runner.trigger({ forceReset: true });
+  const p3 = runner.trigger({ forceReset: false });
+
+  assert.equal(calls.length, 1);
+  releaseFirst();
+  await Promise.all([p1, p2, p3]);
+  assert.deepEqual(calls, [{ forceReset: false }, { forceReset: true }]);
 });
 
 test("test_monitor_html_is_self_contained_csp_safe_and_served_by_mcp", async () => {

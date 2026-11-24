@@ -339,7 +339,13 @@ async function callTool(
   }
 
   const reqKey = requestKey(reqId);
-  const onProgress = makeProgressEmitter(progressToken);
+  let rpcDone = false;
+  const rawProgress = makeProgressEmitter(progressToken);
+  const onProgress = rawProgress
+    ? (ev: FormattedStreamEvent): void => {
+        if (!rpcDone) rawProgress(ev);
+      }
+    : undefined;
 
   try {
     if (name === "pi_worker_start") {
@@ -362,6 +368,7 @@ async function callTool(
         });
         return textResult(record);
       } finally {
+        rpcDone = true;
         if (reqKey) inFlightRequests.delete(reqKey);
       }
     }
@@ -385,6 +392,7 @@ async function callTool(
         });
         return textResult(record);
       } finally {
+        rpcDone = true;
         if (reqKey) inFlightRequests.delete(reqKey);
       }
     }
