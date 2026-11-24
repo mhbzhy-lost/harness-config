@@ -6,7 +6,7 @@
 import {
 	CHECK_TIMEOUT_SEC, DEFAULT_EXEC_TIMEOUT_SEC, WAKE_TIMEOUT_SEC,
 	acquireCopy, capOutput, channelFor, copyBatchWindows, copyFile, copyBusy,
-	execRemote, isResetInProgress, keyValues, reachable, releaseCopy, resetHomeConnect, run,
+	execRemote, isResetInProgress, keyValues, reachable, releaseCopy, resetHomeConnect, run, wslPrefix,
 	type Target,
 } from "./connection.ts";
 import { failure, textResult, type ToolDefinition } from "./mcp.ts";
@@ -188,7 +188,7 @@ export async function callHomeTool(name: string, args: Record<string, unknown>) 
 	}
 
 	if (name === "home_wake") {
-		const result = await run(["wsl", "wake"], { timeoutSec: WAKE_TIMEOUT_SEC });
+		const result = await run([...wslPrefix(), "wake"], { timeoutSec: WAKE_TIMEOUT_SEC });
 		return textResult({ exitCode: result.code, stdout: capOutput(result.stdout), stderr: capOutput(result.stderr) }, result.code !== 0);
 	}
 

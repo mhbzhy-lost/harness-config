@@ -4,6 +4,7 @@ node_modules/
 *.bak.*
 .DS_Store
 __pycache__/
+.qwen/
 
 # home-connect 运行时凭据（config 下保留 *.example 模板）
 plugins/home-connect/.ssh/
@@ -11,14 +12,18 @@ plugins/home-connect/.remote-files/
 plugins/home-connect/config/*
 !plugins/home-connect/config/*.example
 
+# 宿主模式入口的本机配置与 TLS 私钥（在 mac 上生成，不入库）
+plugins/home-connect/host.json
+plugins/home-connect/tls/
+
 # Pi 本机代理覆盖（实际配置位于 ~/.pi/agent/openai-proxy.json，仓内仅保留 example）
 pi/openai-proxy.json
+
+# remote-terminal 本机配置（实际位于 ~/.harness-remote/config.json，仓内仅保留 example）
+remote-terminal/config.json
 
 # Pi 官方文档本机软链（由 init-pi.sh 按本机 @earendil-works/pi-coding-agent 路径生成，不入库）
 .agents/skills/pi-docs/docs
 .agents/skills/pi-docs/examples
 .agents/skills/pi-docs/schemas
 .agents/skills/pi-docs/README.md
-
-# remote-terminal 本机配置（实际位于 ~/.harness-remote/config.json，仓内仅保留 example）
-remote-terminal/config.json

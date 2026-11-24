@@ -4,11 +4,11 @@
  */
 
 import { startServer } from "./mcp.ts";
-import { COMFYUI_INSTRUCTIONS, COMFYUI_TOOLS, callComfyuiTool } from "./tools-comfyui.ts";
+import { COMFYUI_TOOLS, callComfyuiTool, comfyuiInstructions } from "./tools-comfyui.ts";
 
 startServer({
 	name: "comfyui",
 	tools: COMFYUI_TOOLS,
-	instructions: COMFYUI_INSTRUCTIONS,
+	instructions: comfyuiInstructions(),
 	callTool: callComfyuiTool,
 });

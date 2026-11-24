@@ -2,7 +2,7 @@
 set -euo pipefail
 ROOT="${HOME_CONNECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 CONFIG="$ROOT/config/windows.env"
-KEY="${ROOT}/.ssh/windows_ed25519"
+KEY="${HOME_CONNECT_WIN_KEY:-$ROOT/.ssh/windows_ed25519}"
 KNOWN="${ROOT}/.ssh/known_hosts"
 SSH_BIN="${SSH_BIN:-$(command -v ssh)}"
 SFTP_BIN="${SFTP_BIN:-$(command -v sftp)}"

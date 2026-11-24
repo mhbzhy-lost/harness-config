@@ -1,0 +1,10 @@
+{
+  "bind": "0.0.0.0",
+  "port": 8787,
+  "apiKey": "<Bearer token；首次部署自动生成，不打印，装好后从 mac 上的 host.json 读>",
+  "tls": { "port": 8788, "cert": "tls/server.crt", "key": "tls/server.key", "ca": "tls/ca.crt" },
+  "lanUrl": "http://<mac 局域网 IP>:8787",
+  "relayUrl": "https://<中继公网 IP>:<frp remotePort>",
+  "auditPath": "~/.home-mac-mcp-audit.log",
+  "maxImageBytes": 8388608
+}

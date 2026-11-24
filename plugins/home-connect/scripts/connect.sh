@@ -20,6 +20,7 @@ Usage: connect.sh <target> <operation> [args...]
   lan   <status|require|tcp-check PORT>
   wsl   <status|sh|exec|get|put|wake>   (LAN 可用则直连，否则走中继；sh 支持 stdin/heredoc；wake 唤醒 idle 关机的 WSL)
   wsl-relay <--check|status|sh|exec|get|put|wake>
+  wslwin <--check|status|sh|get|put|wake>   (无 WSL 密钥时经 Windows 的 wsl.exe 操作 WSL；sh 读 stdin)
 
 网络层判断（是否在线 / direct 还是 DERP / 端口可达）一律先走 ts，
 再交给对应传输层；上层认证成功与网络可达是两件事。
@@ -32,6 +33,7 @@ case "${1:-}" in
   windows-relay) shift; WINDOWS_FORCE_RELAY=1 exec "$WINDOWS" "$@" ;;
   lan) shift; exec "$LAN" "$@" ;;
   wsl-relay) shift; exec "$WSL_RELAY" "$@" ;;
+  wslwin) shift; exec "$SCRIPT_DIR/wsl-via-win.sh" "$@" ;;
   wsl)
     shift
     [[ $# -ge 1 ]] || { usage; exit 2; }
