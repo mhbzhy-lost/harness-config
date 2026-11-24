@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # init-agy.sh — 将仓库中的跨运行时插件、独立 skills 与 AGY 专属配置同步到本机：
-#   1. plugins/* 逐插件软链接进 ~/.gemini/config/plugins/（复用 lib-plugins.sh）
-#   2. 确保 ~/.gemini/config/skills.json 的 entries 含 <仓库根>/skills（保留已有条目）
-#   3. agy/rules/*.md 逐文件软链接进 ~/.gemini/config/rules/（全局规则）
-#   4. agy/agents/*.md 逐文件软链接进 ~/.gemini/config/agents/（自定义 subagent）
+#   1. agy/settings.json 深度合并进 ~/.gemini/antigravity-cli/settings.json（保留本机状态）
+#   2. plugins/* 逐插件软链接进 ~/.gemini/config/plugins/（复用 lib-plugins.sh）
+#   3. 确保 ~/.gemini/config/skills.json 的 entries 含 <仓库根>/skills（保留已有条目）
+#   4. agy/rules/*.md 逐文件软链接进 ~/.gemini/config/rules/（全局规则）
+#   5. agy/agents/*.md 逐文件软链接进 ~/.gemini/config/agents/（自定义 subagent）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SETTINGS_TEMPLATE="$SCRIPT_DIR/agy/settings.json"
 PLUGINS_SRC="$SCRIPT_DIR/plugins"
 SKILLS_SRC="$SCRIPT_DIR/skills"
 RULES_SRC="$SCRIPT_DIR/agy/rules"
 AGENTS_SRC="$SCRIPT_DIR/agy/agents"
 
+SETTINGS_TARGET="${AGY_SETTINGS_PATH:-$HOME/.gemini/antigravity-cli/settings.json}"
 CONFIG_DIR="${AGY_CONFIG_DIR:-$HOME/.gemini/config}"
 PLUGINS_DIR="${AGY_PLUGINS_DIR:-$CONFIG_DIR/plugins}"
 SKILLS_JSON="${AGY_SKILLS_JSON:-$CONFIG_DIR/skills.json}"
@@ -23,11 +26,12 @@ usage() {
   cat <<EOF
 用法: ./init-agy.sh [--dry-run]
 
-将仓库中的插件、独立 skills、AGY 全局规则与 subagent 定义同步到 Antigravity 全局配置目录。
+将仓库中的 AGY 设置模板、插件、独立 skills、全局规则与 subagent 定义同步到本机。
   --dry-run   只预览将发生的变更，不写入
   -h, --help  显示本帮助
 
 环境变量:
+  AGY_SETTINGS_PATH 覆盖 AGY CLI 设置路径（默认 ~/.gemini/antigravity-cli/settings.json）
   AGY_CONFIG_DIR    覆盖 AGY 全局配置根目录（默认 ~/.gemini/config）
   AGY_PLUGINS_DIR   覆盖插件链接目录（默认 \$AGY_CONFIG_DIR/plugins）
   AGY_SKILLS_JSON   覆盖 skills.json 路径（默认 \$AGY_CONFIG_DIR/skills.json）
@@ -48,12 +52,84 @@ while [[ $# -gt 0 ]]; do
 done
 
 command -v python3 >/dev/null 2>&1 || die "需要 python3"
+[[ -f "$SETTINGS_TEMPLATE" ]] || die "找不到 AGY 设置模板: $SETTINGS_TEMPLATE"
 
-# --- 1. 插件软链接 ---
+# --- 1. 深度合并 agy/settings.json ---
+AGY_SYNC_DRY_RUN="$DRY_RUN" python3 - "$SETTINGS_TEMPLATE" "$SETTINGS_TARGET" <<'PY'
+import copy, json, os, sys, tempfile
+from datetime import datetime
+
+template_path, target_path = sys.argv[1:3]
+dry_run = os.environ.get("AGY_SYNC_DRY_RUN") == "1"
+
+with open(template_path, encoding="utf-8") as f:
+    template = json.load(f)
+
+existing = {}
+if os.path.exists(target_path):
+    with open(target_path, encoding="utf-8") as f:
+        text = f.read()
+    if text.strip():
+        try:
+            existing = json.loads(text)
+        except json.JSONDecodeError as e:
+            sys.exit(f"错误: 现有配置 {target_path} 不是标准 JSON: {e}")
+    if not isinstance(existing, dict):
+        sys.exit(f"错误: {target_path} 顶层不是 JSON 对象")
+
+def merge(base, override):
+    out = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+merged = merge(copy.deepcopy(existing), template)
+changed = sorted(k for k in merged if existing.get(k) != merged[k])
+
+if merged == existing and os.path.exists(target_path):
+    print(f"AGY 设置已与模板一致，无需写入: {target_path}")
+    sys.exit(0)
+
+if dry_run:
+    print(f"[dry-run] AGY 设置目标: {target_path}")
+    print(f"[dry-run] 将变更的顶层键: {', '.join(changed) or '（无变更）'}")
+    sys.exit(0)
+
+target_dir = os.path.dirname(target_path) or "."
+os.makedirs(target_dir, exist_ok=True)
+
+backup_path = None
+if os.path.exists(target_path):
+    backup_path = f"{target_path}.bak.{datetime.now():%Y%m%d-%H%M%S}"
+    with open(target_path, "rb") as src, open(backup_path, "wb") as dst:
+        dst.write(src.read())
+    os.chmod(backup_path, 0o600)
+
+fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=".settings-", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(merged, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, target_path)
+except BaseException:
+    os.unlink(tmp_path)
+    raise
+
+print(f"AGY 设置已写入: {target_path}（权限 600）")
+if backup_path:
+    print(f"已备份: {backup_path}")
+print(f"同步的顶层键: {', '.join(changed) or '（无变更）'}")
+PY
+
+# --- 2. 插件软链接 ---
 source "$SCRIPT_DIR/lib-plugins.sh"
 link_plugins "$PLUGINS_SRC" "$PLUGINS_DIR" "$DRY_RUN"
 
-# --- 2. 注册独立 skills 到 ~/.gemini/config/skills.json ---
+# --- 3. 注册独立 skills 到 ~/.gemini/config/skills.json ---
 AGY_SYNC_DRY_RUN="$DRY_RUN" python3 - "$SKILLS_JSON" "$SKILLS_SRC" <<'PY'
 import copy, json, os, sys, tempfile
 from datetime import datetime
@@ -117,7 +193,7 @@ if backup_path:
     print(f"已备份: {backup_path}")
 PY
 
-# --- 3. AGY 全局规则软链接 ---
+# --- 4. AGY 全局规则软链接 ---
 if [[ -d "$RULES_SRC" ]]; then
   [[ "$DRY_RUN" == 1 ]] || mkdir -p "$RULES_DIR"
   for rule_file in "$RULES_SRC"/*.md; do
@@ -146,7 +222,7 @@ else
   echo "（无 agy/rules/ 目录，跳过 AGY 规则链接）"
 fi
 
-# --- 4. AGY subagent 定义软链接 ---
+# --- 5. AGY subagent 定义软链接 ---
 if [[ -d "$AGENTS_SRC" ]]; then
   [[ "$DRY_RUN" == 1 ]] || mkdir -p "$AGENTS_DIR"
   for agent_file in "$AGENTS_SRC"/*.md; do

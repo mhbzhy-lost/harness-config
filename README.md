@@ -8,8 +8,9 @@ Qwen Code 个人配置与插件的多机同步仓库。
 |---|---|
 | `init-qwen.sh` | 同步脚本：合并设置 + 注入 HARNESS_CONFIG_ROOT + 链接插件 + 注册 shell 片段 + 链接全局 QWEN.md + 链接 agent 定义 |
 | `init-pi.sh` | 链接插件到 pi 的加载目录（默认 `~/.agents/plugins`） |
-| `init-agy.sh` | 同步到 Antigravity（AGY）：链接插件到 `~/.gemini/config/plugins` + 注册 `skills/` 到 `skills.json` + 链接 `agy/rules/*.md` 到全局 rules + 链接 `agy/agents/*.md` 到全局 agents |
+| `init-agy.sh` | 同步到 Antigravity（AGY）：合并 `agy/settings.json` + 链接插件到 `~/.gemini/config/plugins` + 注册 `skills/` 到 `skills.json` + 链接 `agy/rules/*.md` 到全局 rules + 链接 `agy/agents/*.md` 到全局 agents |
 | `lib-plugins.sh` | 三个 init 脚本共享的插件链接逻辑 |
+| `agy/settings.json` | AGY CLI 设置模板（跨机通用 UI 偏好：全屏 `altScreenMode: always`），深度合并进 `~/.gemini/antigravity-cli/settings.json` |
 | `agy/rules/` | AGY 全局规则（带 `trigger: always_on`），逐文件软链接进 `~/.gemini/config/rules/`（对所有项目生效） |
 | `agy/agents/` | AGY 自定义 subagent 定义（`test-runner` 只读验证），逐文件软链接进 `~/.gemini/config/agents/` |
 | `qwen/settings.json` | 设置模板（跨机通用偏好：TUI 精简 + 主题插值 + Explore 抽象 `fast` 档位） |
@@ -93,7 +94,7 @@ cp plugins/deepseek-search/.env.example plugins/deepseek-search/.env   # 填写�
 ./init-agy.sh --dry-run     # 预览 AGY 变更
 python3 -m unittest discover -s tests -p 'test_*.py'   # 路由与 init 回归测试
 QWEN_SETTINGS_PATH=/tmp/t.json QWEN_EXTENSIONS_DIR=/tmp/ext QWEN_SHELL_RC=/tmp/zshrc QWEN_GLOBAL_MD=/tmp/QWEN.md QWEN_AGENTS_DIR=/tmp/agents ./init-qwen.sh   # 临时目录同步测试
-AGY_CONFIG_DIR=/tmp/agy-config ./init-agy.sh   # AGY 临时目录同步测试
+AGY_SETTINGS_PATH=/tmp/agy-settings.json AGY_CONFIG_DIR=/tmp/agy-config ./init-agy.sh   # AGY 临时目录同步测试
 ```
 
 ## 更新

@@ -87,11 +87,19 @@ class AgySyncTest(unittest.TestCase):
             body,
         )
 
+    def test_agy_settings_enables_alt_screen(self) -> None:
+        settings_path = ROOT / "agy/settings.json"
+        self.assertTrue(settings_path.exists())
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(settings.get("altScreenMode"), "always")
+
     def test_init_agy_dry_run_makes_no_writes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp) / "agy-config"
+            settings_path = Path(tmp) / "antigravity-cli" / "settings.json"
             env = os.environ.copy()
             env["AGY_CONFIG_DIR"] = str(config_dir)
+            env["AGY_SETTINGS_PATH"] = str(settings_path)
 
             result = subprocess.run(
                 ["bash", str(ROOT / "init-agy.sh"), "--dry-run"],
@@ -107,11 +115,20 @@ class AgySyncTest(unittest.TestCase):
                 msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
             self.assertFalse(config_dir.exists())
+            self.assertFalse(settings_path.exists())
 
     def test_init_agy_sync_preserves_existing_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp) / "agy-config"
             config_dir.mkdir(parents=True)
+            settings_path = Path(tmp) / "antigravity-cli" / "settings.json"
+            settings_path.parent.mkdir(parents=True)
+            existing_settings = {
+                "altScreenMode": "default",
+                "machineOnly": {"keep": True},
+            }
+            settings_path.write_text(json.dumps(existing_settings), encoding="utf-8")
+
             skills_json = config_dir / "skills.json"
             existing = {
                 "inherits": [{"path": "/shared/skills.json"}],
@@ -121,6 +138,7 @@ class AgySyncTest(unittest.TestCase):
 
             env = os.environ.copy()
             env["AGY_CONFIG_DIR"] = str(config_dir)
+            env["AGY_SETTINGS_PATH"] = str(settings_path)
 
             first = subprocess.run(
                 ["bash", str(ROOT / "init-agy.sh")],
@@ -135,6 +153,14 @@ class AgySyncTest(unittest.TestCase):
                 0,
                 msg=f"stdout:\n{first.stdout}\nstderr:\n{first.stderr}",
             )
+
+            # 0. AGY settings.json 深度合并并保留本机键
+            merged_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertEqual(merged_settings["altScreenMode"], "always")
+            self.assertEqual(merged_settings["machineOnly"], {"keep": True})
+            self.assertEqual(stat.S_IMODE(settings_path.stat().st_mode), 0o600)
+            settings_backups_first = list(settings_path.parent.glob("settings.json.bak.*"))
+            self.assertEqual(len(settings_backups_first), 1)
 
             # 1. 插件链接
             for name in ("deepseek-search", "home-connect", "playwright"):
@@ -181,6 +207,12 @@ class AgySyncTest(unittest.TestCase):
                 0,
                 msg=f"stdout:\n{second.stdout}\nstderr:\n{second.stderr}",
             )
+            self.assertEqual(
+                json.loads(settings_path.read_text(encoding="utf-8")), merged_settings
+            )
+            self.assertEqual(
+                len(list(settings_path.parent.glob("settings.json.bak.*"))), 1
+            )
             merged_again = json.loads(skills_json.read_text(encoding="utf-8"))
             self.assertEqual(merged_again, merged)
             backups_after_second = list(config_dir.glob("skills.json.bak.*"))
@@ -189,12 +221,14 @@ class AgySyncTest(unittest.TestCase):
     def test_init_agy_skips_regular_rule_file_without_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp) / "agy-config"
+            settings_path = Path(tmp) / "antigravity-cli" / "settings.json"
             rule_path = config_dir / "rules" / "harness-config.md"
             rule_path.parent.mkdir(parents=True)
             rule_path.write_text("# user custom rule\n", encoding="utf-8")
 
             env = os.environ.copy()
             env["AGY_CONFIG_DIR"] = str(config_dir)
+            env["AGY_SETTINGS_PATH"] = str(settings_path)
 
             result = subprocess.run(
                 ["bash", str(ROOT / "init-agy.sh")],
