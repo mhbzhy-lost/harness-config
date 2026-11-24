@@ -1,0 +1,8 @@
+{
+  "webExposure": "off",
+  "webRelay": {
+    "url": "wss://YOUR_ECS_IP:8443",
+    "agentToken": "REPLACE_WITH_ECS_INIT_AGENT_TOKEN",
+    "caFingerprint": "SHA256:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00"
+  }
+}

@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>远程终端 · tmux</title>
+<script>
+(function () {
+  var q = location.search;
+  var css = document.createElement("link");
+  css.rel = "stylesheet";
+  css.href = "/xterm.css" + q;
+  document.head.appendChild(css);
+  var pending = 2;
+  function done() {
+    pending -= 1;
+    if (pending === 0) window.dispatchEvent(new Event("rt:assets-ready"));
+  }
+  ["/xterm.js", "/xterm-fit.js"].forEach(function (src) {
+    var s = document.createElement("script");
+    s.src = src + q;
+    s.async = false;
+    s.onload = done;
+    s.onerror = done;
+    document.head.appendChild(s);
+  });
+})();
+</script>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #101014; color: #d8d8e0; overscroll-behavior: none; }
+  #app { position: fixed; top: 0; left: 0; width: 100%; display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+  #term-wrap { flex: 1; min-height: 0; padding: 4px 2px 0; overflow: hidden; }
+  #term { height: 100%; display: flex; justify-content: center; touch-action: none; }
+  #term > .xterm { height: 100%; }
+  #list { display: none; flex: 1; min-height: 0; overflow-y: auto; padding: 16px 16px calc(16px + env(safe-area-inset-bottom)); }
+  #list h1 { font: 600 18px -apple-system, sans-serif; margin: 4px 0 14px; }
+  #list .hint { font: 12px -apple-system, sans-serif; color: #6a6a78; margin: 14px 0 0; line-height: 1.6; word-break: break-all; }
+  .card {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    background: #17171d; border: 1px solid #26262e; border-radius: 12px;
+    padding: 14px 14px; margin-bottom: 10px; touch-action: manipulation;
+  }
+  .card:active { background: #1e1e26; }
+  .card .name { font: 600 15px ui-monospace, Menlo, monospace; }
+  .card .meta { font: 12px -apple-system, sans-serif; color: #6a6a78; margin-top: 3px; }
+  .card .cmd { font: 11px ui-monospace, Menlo, monospace; color: #8fa6c9; background: #1f2430; border-radius: 5px; padding: 1px 6px; margin-left: 6px; }
+  .card .dot { width: 8px; height: 8px; border-radius: 50%; background: #3a3a46; flex: none; }
+  .card .dot.on { background: #7ec98f; }
+  .card .go { color: #4a6a95; font: 14px -apple-system, sans-serif; }
+  #back-btn { margin-right: 4px; }
+  #bar {
+    display: flex; flex-shrink: 0; gap: 6px; align-items: center; justify-content: space-between;
+    padding: 4px 6px calc(4px + env(safe-area-inset-bottom));
+    background: #17171d; border-top: 1px solid #26262e;
+  }
+  #keys { display: flex; gap: 4px; flex-wrap: wrap; }
+  #keys1 { display: flex; gap: 4px; }
+  #keys2 { display: none; }
+  #keys2.show { display: flex; gap: 4px; }
+  button {
+    font: 12px ui-monospace, Menlo, monospace; color: #d8d8e0; background: #26262e;
+    border: 1px solid #34343e; border-radius: 7px; padding: 6px 9px;
+    touch-action: manipulation; user-select: none; -webkit-user-select: none;
+  }
+  button:active { background: #3a3a46; }
+  button.on { background: #2f4a6d; border-color: #4a6a95; color: #cfe3ff; }
+  #status { font: 11px ui-monospace, Menlo, monospace; color: #6a6a78; padding: 0 2px; white-space: nowrap; }
+  .xterm .xterm-viewport { -webkit-overflow-scrolling: touch; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="list">
+    <h1>终端会话</h1>
+    <div id="cards"></div>
+    <p class="hint" id="hint"></p>
+  </div>
+  <div id="term-wrap"><div id="term"></div></div>
+  <div id="bar">
+    <div id="keys">
+      <div id="keys1">
+        <button id="back-btn">‹</button>
+        <button id="kb">⌨</button>
+        <button data-key="esc">Esc</button>
+        <button data-key="tab">Tab</button>
+        <button id="ctrl" data-key="ctrl">Ctrl</button>
+        <button data-key="ctrlc">^C</button>
+        <button data-key="up">↑</button>
+        <button data-key="down">↓</button>
+        <button id="more">⋯</button>
+      </div>
+      <div id="keys2">
+        <button id="scroll" data-key="scrollmode">滚屏</button>
+        <button data-key="pgup">PgUp</button>
+        <button data-key="pgdn">PgDn</button>
+        <button data-key="left">←</button>
+        <button data-key="right">→</button>
+        <button data-key="enter">Enter</button>
+      </div>
+    </div>
+    <span id="status"></span>
+  </div>
+</div>
+<script>
+function __rtMain() {
+"use strict";
+const term = new Terminal({
+  fontSize: 13,
+  fontFamily: 'ui-monospace, Menlo, "Courier New", monospace',
+  theme: { background: "#101014" },
+  scrollback: 5000,
+  cursorBlink: true,
+  convertEol: false,
+});
+const fit = new FitAddon.FitAddon();
+term.loadAddon(fit);
+term.open(document.getElementById("term"));
+
+const $ = (id) => document.getElementById(id);
+const app = $("app"), statusEl = $("status"), ctrlBtn = $("ctrl"), listEl = $("list"), termWrap = $("term-wrap");
+const query = location.search;
+let ws = null, ctrlArmed = false, lastSent = { cols: 0, rows: 0 }, reconnectTimer = null;
+let currentSession = null, currentHost = null;
+const hostNames = {};
+
+/* ---------- 键盘模式：默认浏览态不拉软键盘；点底部输入区或 ⌨ 才激活 ---------- */
+let keyboardOn = false;
+const kbBtn = $("kb");
+function focusIfOn() { if (keyboardOn) term.focus(); }
+function setKeyboard(on) {
+  keyboardOn = on;
+  kbBtn.classList.toggle("on", on);
+  if (term.textarea) {
+    term.textarea.readOnly = !on;
+    term.textarea.inputMode = on ? "text" : "none";
+  }
+  if (on) term.focus();
+  else term.blur();
+}
+kbBtn.addEventListener("click", () => setKeyboard(!keyboardOn));
+$("bar").addEventListener("mousedown", (e) => e.preventDefault());
+const termHost = $("term");
+function blockTerminalEvent(e) {
+  if (e.cancelable) e.preventDefault();
+  e.stopPropagation();
+}
+function tapTerminal(x, y) {
+  const r = termHost.getBoundingClientRect();
+  if (x < r.left || x > r.right || y < r.top || y > r.bottom) return;
+  if (y > r.top + r.height * 0.85) {
+    const wasOn = keyboardOn;
+    setKeyboard(true);
+    if (wasOn) forwardClick(x, y);
+  } else if (keyboardOn) setKeyboard(false);
+  else forwardClick(x, y);
+}
+
+const TAP_SLOP = 12, WHEEL_STEP = 18;
+let gesture = null;
+termHost.addEventListener("touchstart", (e) => {
+  blockTerminalEvent(e);
+  if (e.touches.length !== 1) { gesture = null; return; }
+  const t = e.touches[0];
+  gesture = { id: t.identifier, x: t.clientX, y: t.clientY, lastY: t.clientY, carry: 0, moved: false };
+}, { capture: true, passive: false });
+termHost.addEventListener("touchmove", (e) => {
+  blockTerminalEvent(e);
+  if (!gesture || e.touches.length !== 1 || e.touches[0].identifier !== gesture.id) {
+    gesture = null;
+    return;
+  }
+  const t = e.touches[0];
+  gesture.moved ||= Math.hypot(t.clientX - gesture.x, t.clientY - gesture.y) >= TAP_SLOP;
+  gesture.carry += t.clientY - gesture.lastY;
+  gesture.lastY = t.clientY;
+  if (!gesture.moved) return;
+  if (keyboardOn) setKeyboard(false);
+  while (Math.abs(gesture.carry) >= WHEEL_STEP) {
+    const up = gesture.carry > 0;
+    send({ type: "input", data: up ? "\x1b[<64;1;1M" : "\x1b[<65;1;1M" });
+    gesture.carry += up ? -WHEEL_STEP : WHEEL_STEP;
+  }
+}, { capture: true, passive: false });
+termHost.addEventListener("touchend", (e) => {
+  blockTerminalEvent(e);
+  const ended = gesture;
+  gesture = null;
+  if (!ended || ended.moved || e.touches.length !== 0) return;
+  const t = Array.from(e.changedTouches).find((t) => t.identifier === ended.id);
+  if (t && Math.hypot(t.clientX - ended.x, t.clientY - ended.y) < TAP_SLOP) tapTerminal(t.clientX, t.clientY);
+}, { capture: true, passive: false });
+termHost.addEventListener("touchcancel", (e) => {
+  gesture = null;
+  blockTerminalEvent(e);
+}, { capture: true, passive: false });
+termHost.addEventListener("mousedown", (e) => {
+  if (e.button !== 0) return;
+  blockTerminalEvent(e);
+  if (!e.sourceCapabilities?.firesTouchEvents) tapTerminal(e.clientX, e.clientY);
+}, { capture: true });
+termHost.addEventListener("click", blockTerminalEvent, { capture: true });
+
+function forwardClick(clientX, clientY) {
+  const screen = term.element?.querySelector(".xterm-screen");
+  if (!screen) return;
+  const r = screen.getBoundingClientRect();
+  const cellW = r.width / Math.max(1, term.cols);
+  const cellH = r.height / Math.max(1, term.rows);
+  const col = Math.min(term.cols, Math.max(1, Math.floor((clientX - r.left) / cellW) + 1));
+  const row = Math.min(term.rows, Math.max(1, Math.floor((clientY - r.top) / cellH) + 1));
+  send({ type: "input", data: `\x1b[<0;${col};${row}M` });
+  send({ type: "input", data: `\x1b[<0;${col};${row}m` });
+}
+term.textarea?.addEventListener("blur", () => setKeyboard(false));
+setKeyboard(false);
+
+function setStatus(text, ok) {
+  statusEl.textContent = text;
+  statusEl.style.color = ok ? "#7ec98f" : "#8a6a4a";
+}
+
+/* ---------- 列表视图 ---------- */
+async function refreshList() {
+  try {
+    const res = await fetch(`/api/sessions${query}`, { cache: "no-store" });
+    if (res.status === 401) { location.replace("/pair" + query); return; }
+    const data = await res.json();
+    const cards = $("cards");
+    cards.innerHTML = "";
+    for (const s of data.sessions || []) {
+      if (s.host) hostNames[s.host] = s.hostName || s.host;
+      const card = document.createElement("div");
+      card.className = "card";
+      const dot = s.attached ? '<span class="dot on"></span>' : '<span class="dot"></span>';
+      const hostBadge = s.hostName ? `<span class="meta">[${escapeHtml(s.hostName)}]</span> ` : "";
+      const cmdBadge = s.command ? `<span class="cmd">${escapeHtml(s.command)}</span>` : "";
+      card.innerHTML = `<div><div class="name">${escapeHtml(s.name)}${cmdBadge}</div><div class="meta">${hostBadge}${s.windows} 窗口 · ${escapeHtml(s.created)}</div></div>${dot}<span class="go">进入 →</span>`;
+      card.addEventListener("click", () => {
+        if (s.lan) {
+          location.href = s.lan + "#/t/" + encodeURIComponent(s.name);
+        } else {
+          location.hash = "#/t/" + (s.host ? encodeURIComponent(s.host) + "/" : "") + encodeURIComponent(s.name);
+        }
+      });
+      cards.appendChild(card);
+    }
+    for (const h of data.hosts || []) {
+      if (h.online) continue;
+      const card = document.createElement("div");
+      card.className = "card";
+      card.style.opacity = "0.45";
+      card.innerHTML = `<div><div class="name">${escapeHtml(h.name)}</div><div class="meta">离线</div></div><span class="dot"></span>`;
+      cards.appendChild(card);
+    }
+    if ((data.sessions || []).length === 0 && (data.hosts || []).length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "hint";
+      empty.textContent = "当前没有在跑的 tmux 会话：在本机终端运行 rt <命令>（或 tmux new）即会出现。";
+      cards.appendChild(empty);
+    }
+    if (data.relay) {
+      const add = document.createElement("p");
+      add.className = "hint";
+      add.innerHTML = '添加主机：<a href="/pair" style="color:#4a6a95">/pair</a>（在新主机上批准本设备）';
+      cards.appendChild(add);
+    }
+  } catch (e) { /* 网络抖动时保留旧列表 */ }
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+/* ---------- 终端视图 ---------- */
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function syncSize() {
+  const viewport = window.visualViewport;
+  app.style.height = `${viewport ? viewport.height : window.innerHeight}px`;
+  app.style.top = `${viewport ? viewport.offsetTop : 0}px`;
+  if (!currentSession) return;
+  try { fit.fit(); } catch (e) { /* 容器不可见时忽略 */ }
+  if (term.cols !== lastSent.cols || term.rows !== lastSent.rows) {
+    lastSent = { cols: term.cols, rows: term.rows };
+    send({ type: "resize", cols: term.cols, rows: term.rows });
+  }
+}
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const name = encodeURIComponent(currentSession);
+  const hostPart = currentHost ? `&host=${encodeURIComponent(currentHost)}` : "";
+  ws = new WebSocket(`${proto}://${location.host}/ws?session=${name}${hostPart}${query ? "&" + query.slice(1) : ""}`);
+  ws.onopen = () => { setStatus(currentHost ? `${hostNames[currentHost] || currentHost} · ${currentSession}` : currentSession, true); focusIfOn(); syncSize(); };
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (msg.type === "output") term.write(msg.data);
+    else if (msg.type === "hello") {
+      lastSent = { cols: 0, rows: 0 };
+      syncSize();
+      setTimeout(() => { if (currentSession) { lastSent = { cols: 0, rows: 0 }; syncSize(); } }, 120);
+      setTimeout(() => { if (currentSession) { lastSent = { cols: 0, rows: 0 }; syncSize(); } }, 450);
+    }
+  };
+  ws.onclose = async () => {
+    try {
+      const res = await fetch(`/api/sessions${query}`, { cache: "no-store" });
+      if (res.status === 401) { location.replace("/pair" + query); return; }
+      const data = await res.json();
+      const alive = (data.sessions || []).some((s) => s.name === currentSession && (!currentHost || s.host === currentHost || !s.host));
+      if (!alive) { location.hash = "#/"; return; }
+    } catch (e) { /* 查询失败走默认重连 */ }
+    setStatus("重连中…", false);
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connect, 1200);
+  };
+  ws.onerror = () => { try { ws.close(); } catch (e) {} };
+}
+
+term.onData((d) => {
+  if (scrollArmed && d.length === 1 && d >= " ") setScrollArmed(false);
+  if (ctrlArmed && d.length === 1) {
+    const code = d.toUpperCase().charCodeAt(0);
+    if (code >= 64 && code <= 95) {
+      send({ type: "input", data: String.fromCharCode(code & 0x1f) });
+      ctrlArmed = false;
+      ctrlBtn.classList.remove("on");
+      return;
+    }
+  }
+  send({ type: "input", data: d });
+});
+
+const KEYMAP = {
+  esc: "\x1b", tab: "\t", ctrlc: "\x03",
+  up: "\x1b[A", down: "\x1b[B", right: "\x1b[C", left: "\x1b[D",
+  enter: "\r", pgup: "\x1b[5~", pgdn: "\x1b[6~",
+};
+let scrollArmed = false;
+const scrollBtn = $("scroll");
+function setScrollArmed(on) {
+  scrollArmed = on;
+  scrollBtn.classList.toggle("on", on);
+}
+$("keys").addEventListener("click", (ev) => {
+  const key = ev.target && ev.target.dataset ? ev.target.dataset.key : null;
+  if (!key) return;
+  if (key === "ctrl") {
+    ctrlArmed = !ctrlArmed;
+    ctrlBtn.classList.toggle("on", ctrlArmed);
+    focusIfOn();
+    return;
+  }
+  if (key === "scrollmode") {
+    if (scrollArmed) { setScrollArmed(false); send({ type: "input", data: "q" }); }
+    else { setScrollArmed(true); send({ type: "input", data: "\x02[" }); }
+    focusIfOn();
+    return;
+  }
+  const data = KEYMAP[key];
+  if (data) { send({ type: "input", data }); focusIfOn(); }
+});
+
+$("back-btn").addEventListener("click", () => { location.hash = "#/"; });
+$("more").addEventListener("click", () => {
+  document.getElementById("keys2").classList.toggle("show");
+  focusIfOn();
+});
+
+let sizeFrame = null;
+function scheduleSize() {
+  if (sizeFrame !== null) return;
+  sizeFrame = requestAnimationFrame(() => { sizeFrame = null; syncSize(); });
+}
+new ResizeObserver(scheduleSize).observe(termWrap);
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", scheduleSize);
+  window.visualViewport.addEventListener("scroll", scheduleSize);
+}
+window.addEventListener("resize", scheduleSize);
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(scheduleSize);
+
+let listTimer = null;
+const BUILD = "__BUILD__";
+function route() {
+  const match = location.hash.match(/^#\/t(?:\/([0-9a-f]{8}|host-1))?\/(.+)$/);
+  const nextHost = match && match[1] ? decodeURIComponent(match[1]) : null;
+  const nextSession = match ? decodeURIComponent(match[2]) : null;
+  if (listTimer) { clearInterval(listTimer); listTimer = null; }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} ws = null; }
+  currentHost = nextHost;
+  setKeyboard(false);
+  gesture = null;
+  if (nextSession) {
+    currentSession = nextSession;
+    listEl.style.display = "none";
+    termWrap.style.display = "";
+    $("bar").style.display = "";
+    $("back-btn").style.display = "";
+    term.reset();
+    setStatus("连接中…", false);
+    connect();
+  } else {
+    currentSession = null;
+    listEl.style.display = "block";
+    termWrap.style.display = "none";
+    $("bar").style.display = "none";
+    $("back-btn").style.display = "none";
+    $("hint").textContent = `本机接入同一会话：tmux attach -t <名字> · 页面版本 ${BUILD} · ${location.host}`;
+    refreshList();
+    listTimer = setInterval(refreshList, 3000);
+  }
+  scheduleSize();
+}
+window.addEventListener("hashchange", route);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) scheduleSize();
+  if (!document.hidden && currentSession && (!ws || ws.readyState !== WebSocket.OPEN)) connect();
+  if (!document.hidden && !currentSession) refreshList();
+});
+route();
+}
+if (window.Terminal && window.FitAddon) __rtMain();
+else window.addEventListener("rt:assets-ready", __rtMain, { once: true });
+</script>
+</body>
+</html>

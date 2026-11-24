@@ -15,6 +15,8 @@ Qwen Code 个人配置与插件的多机同步仓库。
 | `pi/extensions/` | Pi 专属扩展（每个扩展 `<name>/<name>.ts`）：`agent-plugins`（Agent Plugins 1.0.0 加载 `~/.agents/plugins/`）、`ask-user-question`、`dcp`、`compact-tools`、`bash-cwd`、`bash-async`、`endpoint-fallback`、`network-recovery`、`openai-proxy`、`security-gates`、`session-owner`、`tool-timing`、`tui-lite` |
 | `pi/shell.zsh` + `pi/launcher.zsh` | Pi shell 包装与 `session-owner` 启动预检器（`pi/scripts/pi-session-owner.ts`），防止多窗口 `pi -c` 写坏同一会话 |
 | `init-agy.sh` | 同步到 Antigravity（AGY）：合并 `agy/settings.json` + 链接插件到 `~/.gemini/config/plugins` + 注册 `skills/` 到 `skills.json` + 链接 `agy/rules/*.md` 到全局 rules + 链接 `agy/agents/*.md` 到全局 agents + 注入 `agy/hooks/` 到 `hooks.json` |
+| `init-remote.sh` | 初始化通用远程终端 `remote-terminal/`（按需安装 `node-pty`/`xterm`/`ws`、检查 `tmux`、注册 `rt`/`rtctl` 包装进 `~/.zshrc`） |
+| `remote-terminal/` | 通用 tmux Web 终端与公网中继客户端（兼容 ECS `pi-relay-server` v2 协议，支持承载 `pi`/`qwen`/`agy`/普通 shell 等任意会话；状态保存在 `~/.harness-remote/`） |
 | `lib-plugins.sh` | 三个 init 脚本共享的插件链接逻辑 |
 | `agy/settings.json` | AGY CLI 设置模板（跨机通用 UI 偏好：全屏 `altScreenMode: always`），深度合并进 `~/.gemini/antigravity-cli/settings.json` |
 | `agy/rules/` | AGY 全局规则（带 `trigger: always_on`），逐文件软链接进 `~/.gemini/config/rules/`（对所有项目生效） |

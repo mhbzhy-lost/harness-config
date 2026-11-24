@@ -19,3 +19,6 @@ pi/openai-proxy.json
 .agents/skills/pi-docs/examples
 .agents/skills/pi-docs/schemas
 .agents/skills/pi-docs/README.md
+
+# remote-terminal 本机配置（实际位于 ~/.harness-remote/config.json，仓内仅保留 example）
+remote-terminal/config.json
