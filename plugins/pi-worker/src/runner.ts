@@ -139,7 +139,11 @@ export function resolvePiBinary(env: NodeJS.ProcessEnv = process.env): string {
   }
 
   const home = env.HOME?.trim() || homedir();
-  candidates.push(join(home, ".local", "share", "pitty", "node_modules", ".bin", "pi"));
+  candidates.push(
+    "/opt/homebrew/bin/pi",
+    "/usr/local/bin/pi",
+    join(home, ".local", "share", "pitty", "node_modules", ".bin", "pi"),
+  );
 
   for (const candidate of candidates) {
     if (isUsableExecutable(candidate)) return candidate;
