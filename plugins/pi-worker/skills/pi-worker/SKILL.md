@@ -21,9 +21,9 @@ description: Use when delegating a self-contained, multi-step long-running codin
 
 ## MCP 工具
 
-- `pi_worker_start(cwd, prompt, model?, provider?, thinking?, excludeTools?, waitSeconds?)`：在独立隔离 Session 启动新长任务（同一 `cwd` 仅允许 1 个运行中任务，不设总墙钟超时）。
-- `pi_worker_status(taskId, waitSeconds?)`：查看实时进度（`turnCount`/`lastTool`/`lastActivityAt`/`recentEvents`）、挂起问题或最终摘要与 `gitChanges`；`waitSeconds` 可设 `0–30` 做短等待，避免高频空轮询。
-- `pi_worker_reply(taskId, reply, waitSeconds?)`：向 `needs_input`（或 `done`/`blocked` 需续做）的任务发送回复，沿原隔离 Session 续跑。
+- `pi_worker_start(cwd, prompt, model?, provider?, thinking?, excludeTools?, waitSeconds?)`：在独立隔离 Session 启动新长任务（同一 `cwd` 仅允许 1 个运行中任务，不设总墙钟超时）。在 Antigravity 下自动作为后台任务执行并在本轮结束时唤醒主会话；其他 Harness 下立即返回 `taskId`。
+- `pi_worker_status(taskId, waitSeconds?)`：查看实时进度（`turnCount`/`lastTool`/`lastActivityAt`/`recentEvents`）、挂起问题或最终摘要与 `gitChanges`；非 Antigravity 环境下可传 `waitSeconds: 0–30` 短等。
+- `pi_worker_reply(taskId, reply, model?, provider?, thinking?, waitSeconds?)`：向非运行中的任务（`needs_input`/`done`/`blocked`/`failed`/`cancelled`）发送回复沿原隔离 Session 续跑，支持覆盖模型与思考档位；在 Antigravity 下同样作为后台任务异步唤醒。
 - `pi_worker_cancel(taskId)`：优雅取消运行中或挂起的任务。
 - `pi_worker_list(status?, cwd?, limit?)`：列出任务摘要。
 

@@ -40,6 +40,40 @@ if (mode === "sleep") {
   process.stdout.write("[startup] noisy line\\n");
   process.stdout.write(JSON.stringify({ type: "tool_execution_start", toolName: "bash" }) + "\\n");
   setInterval(() => {}, 1000);
+} else if (mode === "fail-then-succeed") {
+  const lines = readFileSync(${JSON.stringify(recordFile)}, "utf8").trim().split("\\n");
+  if (lines.length === 1) {
+    process.stdout.write(JSON.stringify({
+      type: "message_end",
+      message: { role: "assistant", stopReason: "error", errorMessage: "503 transient", content: [] },
+    }) + "\\n");
+    process.exit(0);
+  }
+  writeFileSync(process.env.PI_WORKER_OUTCOME_FILE, JSON.stringify({
+    status: "done",
+    summary: "重试后成功",
+    question: null,
+    options: [],
+    verifiedCommands: ["node --test"],
+    stopReason: null,
+    error: null,
+  }), { mode: 0o600 });
+  process.exit(0);
+} else if (mode === "sleep-then-resume") {
+  if (stdinText.includes("sleep first")) {
+    setInterval(() => {}, 1000);
+  } else {
+    writeFileSync(process.env.PI_WORKER_OUTCOME_FILE, JSON.stringify({
+      status: "done",
+      summary: "取消后续跑完成",
+      question: null,
+      options: [],
+      verifiedCommands: [],
+      stopReason: null,
+      error: null,
+    }), { mode: 0o600 });
+    process.exit(0);
+  }
 } else if (mode === "error-exit-zero") {
   process.stdout.write(JSON.stringify({
     type: "message_end",
@@ -402,6 +436,103 @@ test("test_cancel_during_finalizing_does_not_overwrite_completed_task", async ()
     assert.equal(cancelResult.wasRunning, false);
     assert.equal(cancelResult.task.status, "needs_input");
     assert.deepEqual(cancelResult.task.gitChanges, [" M file.ts"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_reply_overrides_model_thinking_and_resumes_failed_and_cancelled_tasks", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-resume-"));
+  try {
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const recordFile = join(dir, "invocations.jsonl");
+    const fakePi = createFakePi(dir, recordFile);
+
+    // 1. failed 状态续跑并覆盖 provider/model/thinking
+    const failRunner = new PiWorkerRunner({
+      store: new TaskStore(join(dir, "state-fail")),
+      piBinary: fakePi,
+      env: { ...process.env, FAKE_PI_SCENARIO: "fail-then-succeed" },
+    });
+    const failed = await failRunner.start({ cwd: workDir, prompt: "first try", waitSeconds: 5 });
+    assert.equal(failed.status, "failed");
+
+    // 仅传 provider 且无既有/新传 model 必须报错
+    await assert.rejects(
+      () => failRunner.reply({ taskId: failed.taskId, reply: "bad", provider: "zai-coding-cn" }),
+      /provider.*model/i,
+    );
+
+    const retried = await failRunner.reply({
+      taskId: failed.taskId,
+      reply: "retry with lower thinking",
+      provider: "zai-coding-cn",
+      model: "glm-5.4",
+      thinking: "low",
+      waitSeconds: 5,
+    });
+    assert.equal(retried.status, "done");
+    assert.equal(retried.roundCount, 2);
+    assert.equal(retried.error, null);
+    assert.equal(retried.provider, "zai-coding-cn");
+    assert.equal(retried.model, "glm-5.4");
+    assert.equal(retried.thinking, "low");
+
+    const records = readFileSync(recordFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const r2 = records[1];
+    assert.equal(r2.argv[r2.argv.indexOf("--provider") + 1], "zai-coding-cn");
+    assert.equal(r2.argv[r2.argv.indexOf("--model") + 1], "glm-5.4");
+    assert.equal(r2.argv[r2.argv.indexOf("--thinking") + 1], "low");
+
+    // 2. cancelled 状态续跑并覆盖 thinking
+    const cancelRecordFile = join(dir, "cancel-invocations.jsonl");
+    const cancelFakePi = createFakePi(dir, cancelRecordFile);
+    const cancelRunner = new PiWorkerRunner({
+      store: new TaskStore(join(dir, "state-cancel")),
+      piBinary: cancelFakePi,
+      env: { ...process.env, FAKE_PI_SCENARIO: "sleep-then-resume" },
+    });
+    const started = await cancelRunner.start({ cwd: workDir, prompt: "sleep first", waitSeconds: 0 });
+    const cancelled = await cancelRunner.cancel({ taskId: started.taskId });
+    assert.equal(cancelled.task.status, "cancelled");
+
+    const resumed = await cancelRunner.reply({
+      taskId: started.taskId,
+      reply: "continue now",
+      thinking: "minimal",
+      waitSeconds: 5,
+    });
+    assert.equal(resumed.status, "done");
+    assert.equal(resumed.roundCount, 2);
+    assert.equal(resumed.thinking, "minimal");
+    const cancelRecords = readFileSync(cancelRecordFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const lastCancelRecord = cancelRecords[cancelRecords.length - 1];
+    assert.equal(lastCancelRecord.argv[lastCancelRecord.argv.indexOf("--thinking") + 1], "minimal");
+    await cancelRunner.shutdown();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_wait_until_settled_blocks_until_round_finishes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-settled-"));
+  try {
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const fakePi = createFakePi(dir, join(dir, "invocations.jsonl"));
+    const runner = new PiWorkerRunner({
+      store: new TaskStore(join(dir, "state")),
+      piBinary: fakePi,
+      env: { ...process.env, FAKE_PI_SCENARIO: "two-round" },
+    });
+
+    const first = await runner.start({ cwd: workDir, prompt: "go", waitUntilSettled: true });
+    assert.equal(first.status, "needs_input");
+
+    const second = await runner.reply({ taskId: first.taskId, reply: "A", waitUntilSettled: true });
+    assert.equal(second.status, "done");
+    assert.equal(second.roundCount, 2);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

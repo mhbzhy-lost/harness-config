@@ -5,7 +5,19 @@
       "args": [
         "${PLUGIN_ROOT}/src/server.ts"
       ],
-      "cwd": "${PLUGIN_ROOT}"
+      "cwd": "${PLUGIN_ROOT}",
+      "timeoutSeconds": -1,
+      "env": {
+        "PI_WORKER_AGY": "1"
+      },
+      "tools": {
+        "pi_worker_start": {
+          "background": "always"
+        },
+        "pi_worker_reply": {
+          "background": "always"
+        }
+      }
     }
   }
 }

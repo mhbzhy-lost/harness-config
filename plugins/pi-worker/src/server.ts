@@ -65,12 +65,19 @@ const TOOLS: ToolDefinition[] = [
   {
     name: "pi_worker_reply",
     description:
-      "向处于 needs_input（或 done/blocked 需继续迭代）的任务发送回复，并沿原隔离 Session 续跑。收到 needs_input 时优先由主代理依据已有上下文秒答续跑以保持前缀缓存命中；无法拍板时再转问人类。",
+      "向非运行中的任务（needs_input / done / blocked / failed / cancelled）发送回复，沿原隔离 Session 续跑，并支持按需覆盖 model/provider/thinking。收到 needs_input 时优先由主代理依据已有上下文秒答续跑以保持前缀缓存命中；无法拍板时再转问人类。",
     inputSchema: {
       type: "object",
       properties: {
         taskId: { type: "string", description: "由 pi_worker_start 返回的任务 UUID" },
         reply: { type: "string", description: "给 Pi 的明确回复或补充指示" },
+        model: { type: "string", description: "可选：覆盖本轮及后续 --model 参数" },
+        provider: { type: "string", description: "可选：覆盖 --provider 参数（须已有或同时指定 model）" },
+        thinking: {
+          type: "string",
+          enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+          description: "可选：覆盖本轮及后续 --thinking 思考档位",
+        },
         waitSeconds: {
           type: "number",
           minimum: 0,
@@ -135,16 +142,33 @@ const TOOLS: ToolDefinition[] = [
 
 const TOOL_NAME_SET = new Set(TOOLS.map((t) => t.name));
 
-const INSTRUCTIONS = [
+const agyMode = process.env.PI_WORKER_AGY === "1";
+
+const BASE_INSTRUCTIONS = [
   "仅将规格明确、具备硬验收命令、需要多轮工具执行的独立长任务委派给 pi-worker。",
   "小改动直接主会话完成；宽探索/测试日志/Diff 文档交给更轻量的只读或验证子代理；严禁在 Pi 会话内部自嵌套调用。",
   "当任务返回 status=needs_input 时，优先依据主会话已有上下文通过 pi_worker_reply 秒答续跑（命中前缀缓存），拍不了板再转问用户。",
   "委派运行期间主会话不得同时修改同一工作区文件；任务 done 后由主会话核验 gitChanges 与 diff。",
-].join("\n");
+];
+
+const INSTRUCTIONS = (
+  agyMode
+    ? [
+        ...BASE_INSTRUCTIONS,
+        "当前运行于 Antigravity 原生后台模式：pi_worker_start 与 pi_worker_reply 由宿主作为后台任务异步执行并在本轮结束时自动唤醒主会话，无需循环轮询 pi_worker_status。",
+      ]
+    : BASE_INSTRUCTIONS
+).join("\n");
 
 const nested = isNestedWorkerEnv(process.env);
 const store = new TaskStore(resolveStateDir(process.env));
 const runner = new PiWorkerRunner({ store, env: process.env });
+const inFlightRequests = new Map<string, string>();
+
+function requestKey(id: unknown): string | null {
+  if (typeof id === "string" || typeof id === "number") return String(id);
+  return null;
+}
 
 function textResult(
   data: unknown,
@@ -177,7 +201,7 @@ function optionalStringArray(value: unknown, field: string): string[] | undefine
   return value;
 }
 
-async function callTool(name: string, args: Record<string, unknown>) {
+async function callTool(name: string, args: Record<string, unknown>, reqId?: unknown) {
   if (nested) {
     return textResult(
       { error: "检测到处于 pi-worker / Pi 子代理嵌套环境中，禁止调用任何 pi-worker 工具" },
@@ -188,22 +212,29 @@ async function callTool(name: string, args: Record<string, unknown>) {
     return textResult({ error: `未知工具: ${name}` }, true);
   }
 
+  const reqKey = requestKey(reqId);
   try {
     if (name === "pi_worker_start") {
       const cwd = optionalString(args.cwd, "cwd");
       const prompt = optionalString(args.prompt, "prompt");
       if (!cwd) throw new Error("缺少必填参数 cwd");
       if (!prompt) throw new Error("缺少必填参数 prompt");
-      const record = await runner.start({
-        cwd,
-        prompt,
-        model: optionalString(args.model, "model"),
-        provider: optionalString(args.provider, "provider"),
-        thinking: optionalString(args.thinking, "thinking"),
-        excludeTools: optionalStringArray(args.excludeTools, "excludeTools"),
-        waitSeconds: optionalNumber(args.waitSeconds, "waitSeconds"),
-      });
-      return textResult(record);
+      try {
+        const record = await runner.start({
+          cwd,
+          prompt,
+          model: optionalString(args.model, "model"),
+          provider: optionalString(args.provider, "provider"),
+          thinking: optionalString(args.thinking, "thinking"),
+          excludeTools: optionalStringArray(args.excludeTools, "excludeTools"),
+          waitSeconds: optionalNumber(args.waitSeconds, "waitSeconds"),
+          ...(agyMode ? { waitUntilSettled: true } : {}),
+          ...(reqKey ? { onTaskCreated: (taskId) => { inFlightRequests.set(reqKey, taskId); } } : {}),
+        });
+        return textResult(record);
+      } finally {
+        if (reqKey) inFlightRequests.delete(reqKey);
+      }
     }
 
     if (name === "pi_worker_reply") {
@@ -211,12 +242,21 @@ async function callTool(name: string, args: Record<string, unknown>) {
       const reply = optionalString(args.reply, "reply");
       if (!taskId) throw new Error("缺少必填参数 taskId");
       if (!reply) throw new Error("缺少必填参数 reply");
-      const record = await runner.reply({
-        taskId,
-        reply,
-        waitSeconds: optionalNumber(args.waitSeconds, "waitSeconds"),
-      });
-      return textResult(record);
+      try {
+        const record = await runner.reply({
+          taskId,
+          reply,
+          model: optionalString(args.model, "model"),
+          provider: optionalString(args.provider, "provider"),
+          thinking: optionalString(args.thinking, "thinking"),
+          waitSeconds: optionalNumber(args.waitSeconds, "waitSeconds"),
+          ...(agyMode ? { waitUntilSettled: true } : {}),
+          ...(reqKey ? { onTaskCreated: (id) => { inFlightRequests.set(reqKey, id); } } : {}),
+        });
+        return textResult(record);
+      } finally {
+        if (reqKey) inFlightRequests.delete(reqKey);
+      }
     }
 
     if (name === "pi_worker_status") {
@@ -258,7 +298,17 @@ async function callTool(name: string, args: Record<string, unknown>) {
 
 async function handleRequest(message: { id?: unknown; method?: string; params?: unknown }): Promise<unknown> {
   const method = message.method ?? "";
-  if (message.id === undefined) return null;
+  if (message.id === undefined) {
+    if (method === "notifications/cancelled") {
+      const params = message.params as { requestId?: unknown } | undefined;
+      const key = requestKey(params?.requestId);
+      const taskId = key ? inFlightRequests.get(key) : undefined;
+      if (taskId) {
+        void runner.cancel({ taskId }).catch(() => undefined);
+      }
+    }
+    return null;
+  }
   if (method === "initialize") {
     const params = message.params as { protocolVersion?: string } | undefined;
     return {
@@ -276,7 +326,7 @@ async function handleRequest(message: { id?: unknown; method?: string; params?: 
     const callArgs = params.arguments && typeof params.arguments === "object" && !Array.isArray(params.arguments)
       ? params.arguments
       : {};
-    return callTool(params.name, callArgs);
+    return callTool(params.name, callArgs, message.id);
   }
   if (method === "resources/list") return { resources: [] };
   if (method === "prompts/list") return { prompts: [] };

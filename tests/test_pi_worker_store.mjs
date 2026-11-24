@@ -14,6 +14,7 @@ function makeRecord(store, overrides = {}) {
     cwd: "/repo/a",
     sessionDir: paths.sessionDir,
     logPath: paths.logPath,
+    eventsPath: paths.eventsPath,
     outcomePath: paths.outcomePath,
     status: "running",
     pid: 12345,
@@ -182,6 +183,31 @@ test("test_list_returns_compact_summaries_and_rejects_invalid_task_id", () => {
 
     assert.throws(() => store.allocateTaskPaths("../escape"));
     assert.throws(() => store.load("bad/id"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_load_skips_orphan_reconcile_when_cwd_lock_owner_is_still_alive", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-store-owner-"));
+  try {
+    const alivePids = new Set([4001]); // ownerPid 存活，worker child pid 4002 已死（模拟 finalize 窗口）
+    const store = new TaskStore(dir, { isPidAlive: (pid) => alivePids.has(pid) });
+    const id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    store.save(makeRecord(store, { taskId: id, cwd: "/repo/finalizing", status: "running", pid: 4002 }));
+    const lock = store.acquireCwdLock("/repo/finalizing", { taskId: id, ownerPid: 4001 });
+    assert.ok("lockPath" in lock);
+
+    // 跨进程 load（无 inFlightTaskIds）见 cwd 锁仍被活 ownerPid 持有，不得误判 orphan_process
+    const stillRunning = store.load(id);
+    assert.equal(stillRunning?.status, "running");
+    assert.equal(stillRunning?.error, null);
+
+    // ownerPid 也死亡后，正常校正为 orphan_process 并释放锁
+    alivePids.delete(4001);
+    const reconciled = store.load(id);
+    assert.equal(reconciled?.status, "failed");
+    assert.equal(reconciled?.error, "orphan_process");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

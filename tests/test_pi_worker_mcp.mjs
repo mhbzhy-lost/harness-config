@@ -290,3 +290,109 @@ test("test_mcp_handles_null_array_and_malformed_json_without_crashing", async ()
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("test_mcp_agy_mode_blocks_start_reply_and_cancels_via_notification", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-mcp-agy-"));
+  let client;
+  let cancelClient;
+  try {
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const countFile = join(dir, "rounds.txt");
+    const pidFile = join(dir, "sleep.pid");
+    const fakePi = createFakePiForMcp(dir, countFile, pidFile);
+
+    // 1. AGY 模式下 start/reply 直接阻塞等到本轮结束，且 reply schema 支持 model/provider/thinking
+    client = startMcpClient({
+      PI_WORKER_BIN: fakePi,
+      PI_WORKER_STATE_DIR: join(dir, "state-agy"),
+      PI_WORKER_AGY: "1",
+    });
+
+    const listRes = await client.request("tools/list");
+    const replyTool = listRes.result.tools.find((t) => t.name === "pi_worker_reply");
+    assert.ok("model" in replyTool.inputSchema.properties);
+    assert.ok("provider" in replyTool.inputSchema.properties);
+    assert.ok("thinking" in replyTool.inputSchema.properties);
+    assert.equal(listRes.result.tools.some((t) => t.name === "pi_worker_wait"), false);
+
+    // 不传 waitSeconds，AGY 模式直接等到 needs_input 返回
+    const startRes = await client.request("tools/call", {
+      name: "pi_worker_start",
+      arguments: { cwd: workDir, prompt: "agy job" },
+    });
+    assert.equal(startRes.result.isError, undefined);
+    assert.equal(startRes.result.structuredContent.status, "needs_input");
+
+    const replyRes = await client.request("tools/call", {
+      name: "pi_worker_reply",
+      arguments: { taskId: startRes.result.structuredContent.taskId, reply: "camelCase", thinking: "low" },
+    });
+    assert.equal(replyRes.result.isError, undefined);
+    assert.equal(replyRes.result.structuredContent.status, "done");
+    assert.equal(replyRes.result.structuredContent.thinking, "low");
+    await client.close();
+    client = undefined;
+
+    // 2. AGY 模式下通过 JSON-RPC notifications/cancelled 取消后台运行中的 start
+    cancelClient = startMcpClient({
+      PI_WORKER_BIN: fakePi,
+      PI_WORKER_STATE_DIR: join(dir, "state-agy-cancel"),
+      PI_WORKER_AGY: "1",
+      FAKE_MCP_MODE: "sleep",
+    });
+
+    const startReqId = 42;
+    const cancelStartPromise = new Promise((resolveDone) => {
+      let buf = "";
+      const onData = (chunk) => {
+        buf += chunk;
+        let idx = buf.indexOf("\n");
+        while (idx >= 0) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          idx = buf.indexOf("\n");
+          if (!line) continue;
+          const msg = JSON.parse(line);
+          if (msg.id === startReqId) {
+            cancelClient.child.stdout.off("data", onData);
+            resolveDone(msg);
+          }
+        }
+      };
+      cancelClient.child.stdout.on("data", onData);
+      cancelClient.child.stdin.write(`${JSON.stringify({
+        jsonrpc: "2.0",
+        id: startReqId,
+        method: "tools/call",
+        params: { name: "pi_worker_start", arguments: { cwd: workDir, prompt: "sleep" } },
+      })}\n`);
+    });
+
+    for (let i = 0; i < 40; i += 1) {
+      try {
+        if (readFileSync(pidFile, "utf8").trim()) break;
+      } catch { /* 等待 */ }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const childPid = Number(readFileSync(pidFile, "utf8").trim());
+    assert.ok(childPid > 0);
+
+    // 发送 MCP 标准取消通知
+    cancelClient.child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      method: "notifications/cancelled",
+      params: { requestId: startReqId, reason: "user cancelled" },
+    })}\n`);
+
+    const cancelledMsg = await cancelStartPromise;
+    assert.equal(cancelledMsg.result.structuredContent.status, "cancelled");
+    assert.throws(() => process.kill(childPid, 0));
+    await cancelClient.close();
+    cancelClient = undefined;
+  } finally {
+    if (client) await client.close().catch(() => {});
+    if (cancelClient) await cancelClient.close().catch(() => {});
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

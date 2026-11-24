@@ -49,12 +49,19 @@ export interface StartTaskInput {
   thinking?: string;
   excludeTools?: string[];
   waitSeconds?: number;
+  waitUntilSettled?: boolean;
+  onTaskCreated?: (taskId: string) => void;
 }
 
 export interface ReplyTaskInput {
   taskId: string;
   reply: string;
+  model?: string;
+  provider?: string;
+  thinking?: string;
   waitSeconds?: number;
+  waitUntilSettled?: boolean;
+  onTaskCreated?: (taskId: string) => void;
 }
 
 export interface StatusTaskInput {
@@ -300,9 +307,6 @@ export class PiWorkerRunner {
     const args = this.buildArgs(record);
     const childEnv = this.buildChildEnv(record);
 
-    // 清理上一轮残留 outcome 文件，确保本轮读到的结果必属当前轮次
-    try { unlinkSync(record.outcomePath); } catch { /* 文件不存在忽略 */ }
-
     const lockResult = this.store.acquireCwdLock(
       record.cwd,
       { taskId: record.taskId, ownerPid: process.pid },
@@ -313,6 +317,9 @@ export class PiWorkerRunner {
         `同一工作区 ${record.cwd} 已有运行中任务（taskId=${lockResult.conflictTaskId}），禁止并发写入`,
       );
     }
+
+    // 获锁后再清理上一轮残留 outcome 文件，避免并发冲突时误删原结果
+    try { unlinkSync(record.outcomePath); } catch { /* 文件不存在忽略 */ }
 
     let child: ChildProcess;
     try {
@@ -559,6 +566,7 @@ export class PiWorkerRunner {
       cwd: canonicalCwd,
       sessionDir: paths.sessionDir,
       logPath: paths.logPath,
+      eventsPath: paths.eventsPath,
       outcomePath: paths.outcomePath,
       status: "running",
       pid: null,
@@ -583,7 +591,12 @@ export class PiWorkerRunner {
       gitChanges: [],
     };
 
-    this.launchRound(record, input.prompt);
+    const execState = this.launchRound(record, input.prompt);
+    input.onTaskCreated?.(taskId);
+    if (input.waitUntilSettled) {
+      const settled = await execState.settled;
+      return { ...settled, recentEvents: [...settled.recentEvents] };
+    }
     return this.waitForState(taskId, waitSeconds);
   }
 
@@ -598,13 +611,20 @@ export class PiWorkerRunner {
     if (existing.status === "running") {
       throw new Error(`任务 ${existing.taskId} 正在运行中，无法立即回复`);
     }
-    if (existing.status !== "needs_input" && existing.status !== "done" && existing.status !== "blocked") {
-      throw new Error(`任务 ${existing.taskId} 当前状态为 ${existing.status}，不支持续跑回复`);
+
+    const nextModel = input.model ?? existing.model;
+    const nextProvider = input.provider ?? existing.provider;
+    const nextThinking = input.thinking ?? existing.thinking;
+    if (nextProvider && !nextModel) {
+      throw new Error("指定 provider 时必须同时指定 model");
     }
 
     // 重置上一轮终态字段，避免新轮运行期间 status 读到旧问题/旧摘要
     const nextRecord: TaskRecord = {
       ...existing,
+      ...(nextModel ? { model: nextModel } : {}),
+      ...(nextProvider ? { provider: nextProvider } : {}),
+      ...(nextThinking ? { thinking: nextThinking } : {}),
       roundCount: existing.roundCount + 1,
       status: "running",
       summary: null,
@@ -616,7 +636,12 @@ export class PiWorkerRunner {
       error: null,
     };
 
-    this.launchRound(nextRecord, input.reply);
+    const execState = this.launchRound(nextRecord, input.reply);
+    input.onTaskCreated?.(nextRecord.taskId);
+    if (input.waitUntilSettled) {
+      const settled = await execState.settled;
+      return { ...settled, recentEvents: [...settled.recentEvents] };
+    }
     return this.waitForState(nextRecord.taskId, waitSeconds);
   }
 

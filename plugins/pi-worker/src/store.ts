@@ -22,6 +22,7 @@ export interface TaskRecord {
   cwd: string;
   sessionDir: string;
   logPath: string;
+  eventsPath: string;
   outcomePath: string;
   status: TaskStatus;
   pid: number | null;
@@ -65,6 +66,7 @@ export interface TaskPaths {
   taskFile: string;
   sessionDir: string;
   logPath: string;
+  eventsPath: string;
   outcomePath: string;
 }
 
@@ -190,6 +192,7 @@ export class TaskStore {
       taskFile: join(this.stateDir, "tasks", `${validId}.json`),
       sessionDir: join(this.stateDir, "sessions"),
       logPath: join(this.stateDir, "logs", `${validId}.jsonl`),
+      eventsPath: join(this.stateDir, "logs", `${validId}.events.jsonl`),
       outcomePath: join(this.stateDir, "outcomes", `${validId}.json`),
     };
   }
@@ -309,6 +312,9 @@ export class TaskStore {
     try {
       const parsed = JSON.parse(readFileSync(taskFile, "utf8")) as TaskRecord;
       if (!parsed || typeof parsed !== "object" || parsed.taskId !== validId) return null;
+      if (typeof parsed.eventsPath !== "string" || !parsed.eventsPath) {
+        parsed.eventsPath = join(this.stateDir, "logs", `${validId}.events.jsonl`);
+      }
       return parsed;
     } catch {
       return null;
@@ -333,6 +339,11 @@ export class TaskStore {
     if (record.status !== "running") return record;
     if (options.inFlightTaskIds?.has(record.taskId)) return record;
     if (record.pid !== null && this.isPidAlive(record.pid)) return record;
+    // 跨进程 finalize 窗口（例如正跑 git status）期间：worker child 已死，但 cwd 锁仍被活 ownerPid 持有
+    const lock = this.readLockPayload(this.lockPathForCwd(record.cwd));
+    if (lock && lock.taskId === record.taskId && this.isPidAlive(lock.ownerPid)) {
+      return record;
+    }
     return this.markOrphanFailed(record);
   }
 
