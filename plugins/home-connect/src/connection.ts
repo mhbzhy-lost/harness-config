@@ -104,11 +104,13 @@ function settle(child: ChildProcess, options: { input?: string; timeoutSec?: num
 		let stderr = "";
 		let timedOut = false;
 		activeChildren.add(child);
-		const killTimer = setTimeout(() => {
-			timedOut = true;
-			stopChild(child);
-			setTimeout(() => stopChild(child), 2_000).unref?.();
-		}, timeoutSec * 1_000);
+		const killTimer = timeoutSec > 0
+			? setTimeout(() => {
+				timedOut = true;
+				stopChild(child);
+				setTimeout(() => stopChild(child), 2_000).unref?.();
+			}, timeoutSec * 1_000)
+			: null;
 		child.stdout?.on("data", (chunk: Buffer) => {
 			stdout += chunk.toString("utf8");
 		});
@@ -116,12 +118,12 @@ function settle(child: ChildProcess, options: { input?: string; timeoutSec?: num
 			stderr += chunk.toString("utf8");
 		});
 		child.on("error", (error: Error) => {
-			clearTimeout(killTimer);
+			if (killTimer) clearTimeout(killTimer);
 			activeChildren.delete(child);
 			settleDone({ code: 127, stdout, stderr: `${stderr}${error.message}\n`, timedOut });
 		});
 		child.on("close", (code: number | null) => {
-			clearTimeout(killTimer);
+			if (killTimer) clearTimeout(killTimer);
 			activeChildren.delete(child);
 			settleDone({ code: code ?? 1, stdout, stderr, timedOut });
 		});
@@ -196,14 +198,21 @@ export async function execRemote(target: Target, command: string, timeoutSec: nu
 	return { result, channel: HOST_MODE ? hostChannel(lan) : channelFor(target, lan), woke };
 }
 
-export async function copyFile(target: Target, direction: "put" | "get", localPath: string, remotePath: string) {
+export async function copyFile(
+	target: Target,
+	direction: "put" | "get",
+	localPath: string,
+	remotePath: string,
+	options: { timeoutSec?: number } = {},
+) {
 	if (HOST_MODE && target === "mac") {
-		return { result: await runLocalBinary("/bin/cp", ["-f", direction === "put" ? localPath : remotePath, direction === "put" ? remotePath : localPath], { timeoutSec: 300 }), channel: "local" };
+		return { result: await runLocalBinary("/bin/cp", ["-f", direction === "put" ? localPath : remotePath, direction === "put" ? remotePath : localPath], { timeoutSec: options.timeoutSec ?? 300 }), channel: "local" };
 	}
 	if (HOST_MODE && target === "wsl") {
 		const args = direction === "put" ? ["wslwin", "put", localPath, remotePath] : ["wslwin", "get", remotePath, localPath];
-		return { result: await run(args, { timeoutSec: 300 }), channel: "lan" };
+		return { result: await run(args, { timeoutSec: options.timeoutSec ?? 300 }), channel: "lan" };
 	}
+	const runOpts = options.timeoutSec !== undefined ? { timeoutSec: options.timeoutSec } : {};
 	const lan = await isLan();
 	if (target === "mac") {
 		const args = direction === "put"
@@ -211,7 +220,7 @@ export async function copyFile(target: Target, direction: "put" | "get", localPa
 			: lan
 				? ["mac", "get-lan", remotePath, localPath]
 				: ["mac", "get", remotePath, localPath];
-		return { result: await run(args), channel: channelFor(target, lan) };
+		return { result: await run(args, runOpts), channel: channelFor(target, lan) };
 	}
 	if (target === "windows") {
 		if (direction === "get") {
@@ -220,17 +229,21 @@ export async function copyFile(target: Target, direction: "put" | "get", localPa
 				channel: channelFor(target, lan),
 			};
 		}
-		return { result: await run(["windows", "win-put", localPath, remotePath]), channel: channelFor(target, lan) };
+		return { result: await run(["windows", "win-put", localPath, remotePath], runOpts), channel: channelFor(target, lan) };
 	}
 	const args = direction === "put" ? ["wsl", "put", localPath, remotePath] : ["wsl", "get", remotePath, localPath];
-	return { result: await run(args), channel: channelFor(target, lan) };
+	return { result: await run(args, runOpts), channel: channelFor(target, lan) };
 }
 
 /** 批量上传（仅 windows put）：单条 sftp 会话内串行 put 全部文件 + 逐个大小核验。windows 通道恒为 auto。 */
-export async function copyBatchWindows(pairs: Array<{ localPath: string; remotePath: string }>) {
+export async function copyBatchWindows(
+	pairs: Array<{ localPath: string; remotePath: string }>,
+	options: { timeoutSec?: number } = {},
+) {
 	const args = ["windows", "win-put-batch"];
 	for (const p of pairs) args.push(p.localPath, p.remotePath);
-	return { result: await run(args), channel: "auto" };
+	const runOpts = options.timeoutSec !== undefined ? { timeoutSec: options.timeoutSec } : {};
+	return { result: await run(args, runOpts), channel: "auto" };
 }
 
 /** 传输单飞门禁：并发多路复用上传会卡死 Windows OpenSSH 多数通道（实测 7 并发 6 个 hang >60s）。

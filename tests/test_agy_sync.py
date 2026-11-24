@@ -45,6 +45,50 @@ class AgySyncTest(unittest.TestCase):
 
         self.assertGreaterEqual(checked, 4)
 
+    def test_agy_mcp_configs_declare_async_background_settings(self) -> None:
+        pi_agy = json.loads(
+            (ROOT / "plugins/pi-worker/mcp_config.json").read_text(encoding="utf-8")
+        )["mcpServers"]["pi-worker"]
+        self.assertEqual(pi_agy.get("timeoutSeconds"), -1)
+        self.assertEqual(pi_agy.get("env", {}).get("PI_WORKER_AGY"), "1")
+        self.assertEqual(
+            pi_agy.get("tools", {}).get("pi_worker_start", {}).get("background"),
+            "always",
+        )
+        self.assertEqual(
+            pi_agy.get("tools", {}).get("pi_worker_reply", {}).get("background"),
+            "always",
+        )
+
+        hc_agy = json.loads(
+            (ROOT / "plugins/home-connect/mcp_config.json").read_text(encoding="utf-8")
+        )["mcpServers"]
+        self.assertEqual(hc_agy["home"].get("timeoutSeconds"), -1)
+        self.assertEqual(hc_agy["home"].get("env", {}).get("HOME_CONNECT_AGY_ASYNC"), "1")
+        self.assertEqual(
+            hc_agy["home"].get("tools", {}).get("home_exec_bg", {}).get("background"),
+            "always",
+        )
+        self.assertEqual(
+            hc_agy["home"].get("tools", {}).get("home_copy_bg", {}).get("background"),
+            "always",
+        )
+        self.assertEqual(hc_agy["comfyui"].get("timeoutSeconds"), -1)
+        self.assertEqual(
+            hc_agy["comfyui"].get("tools", {}).get("comfyui_generate", {}).get("background"),
+            "always",
+        )
+
+        # 标准跨运行时 mcp.json 必须保持纯净，不含 AGY 专属后台字段或 env 开关
+        for rel in ("plugins/pi-worker/mcp.json", "plugins/home-connect/mcp.json"):
+            servers = json.loads((ROOT / rel).read_text(encoding="utf-8"))["mcpServers"]
+            for srv in servers.values():
+                self.assertNotIn("timeoutSeconds", srv, msg=f"{rel} 不应含 AGY timeoutSeconds")
+                self.assertNotIn("tools", srv, msg=f"{rel} 不应含 AGY tools 后台配置")
+                env_map = srv.get("env") or {}
+                self.assertNotIn("PI_WORKER_AGY", env_map)
+                self.assertNotIn("HOME_CONNECT_AGY_ASYNC", env_map)
+
     def test_agy_global_rule_has_no_qwen_specific_routing(self) -> None:
         rule_path = ROOT / "agy/rules/harness-config.md"
         self.assertTrue(rule_path.exists())

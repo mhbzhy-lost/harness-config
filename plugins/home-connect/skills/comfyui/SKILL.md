@@ -11,7 +11,7 @@ description: Use when the user asks to generate images with ComfyUI on the home 
 
 | 工具 | 用途 |
 |---|---|
-| `comfyui_generate` | 生图并取回本地；返回 `localPath` 可直接 read_file 查看 |
+| `comfyui_generate` | 生图并取回本地；返回 `localPath` 可直接 read_file 查看（在 Antigravity 下自动作为后台任务异步执行，完成后唤醒主会话） |
 | `comfyui_list` | 查询可用模型（附绑定状态 `bound`）、LoRA、放大模型；选名字前先查，不要猜 |
 
 ## /draw 命令（comfyui-draw 扩展，Mod 实现）

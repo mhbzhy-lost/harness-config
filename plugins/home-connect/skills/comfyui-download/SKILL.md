@@ -5,7 +5,7 @@ description: Use when the user asks to download models, LoRAs, upscalers or VAEs
 
 # Civitai 模型下载（经 home-connect wsl 通用操作）
 
-**没有专用 MCP 工具**：资源类型繁多，不用 MCP schema 限制死。直接用 `home_exec`（target=wsl）执行 curl 等命令完成下载；本 skill 只约定 token、目标目录与流程。生图/查询用 `comfyui` skill。
+**没有专用 MCP 工具**：资源类型繁多，不用 MCP schema 限制死。直接用 `home_exec`（target=wsl；在 Antigravity 下若暴露 `home_exec_bg`，大文件下载优先用 `home_exec_bg` 后台异步执行）执行 curl 等命令完成下载；本 skill 只约定 token、目标目录与流程。生图/查询用 `comfyui` skill。
 
 ## Token
 

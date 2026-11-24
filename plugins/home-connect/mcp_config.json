@@ -5,14 +5,32 @@
       "args": [
         "${PLUGIN_ROOT}/src/server.ts"
       ],
-      "cwd": "${PLUGIN_ROOT}"
+      "cwd": "${PLUGIN_ROOT}",
+      "timeoutSeconds": -1,
+      "env": {
+        "HOME_CONNECT_AGY_ASYNC": "1"
+      },
+      "tools": {
+        "home_exec_bg": {
+          "background": "always"
+        },
+        "home_copy_bg": {
+          "background": "always"
+        }
+      }
     },
     "comfyui": {
       "command": "node",
       "args": [
         "${PLUGIN_ROOT}/src/server-comfyui.ts"
       ],
-      "cwd": "${PLUGIN_ROOT}"
+      "cwd": "${PLUGIN_ROOT}",
+      "timeoutSeconds": -1,
+      "tools": {
+        "comfyui_generate": {
+          "background": "always"
+        }
+      }
     }
   }
 }

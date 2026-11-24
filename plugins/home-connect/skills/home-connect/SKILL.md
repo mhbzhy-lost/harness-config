@@ -14,8 +14,10 @@ description: Use when the user asks to connect to or operate the home machines �
 | 工具 | 用途 |
 |---|---|
 | `home_status` | Tailscale 在线、是否在家（LAN）、指定通道可达性、实际走 LAN 还是中继 |
-| `home_exec` | 在通道上执行命令：`windows` 用 PowerShell，`mac` / `wsl` 用 bash；可多行 |
+| `home_exec` | 在通道上执行命令：`windows` 用 PowerShell，`mac` / `wsl` 用 bash；可多行（短时命令首选） |
+| `home_exec_bg` | **仅 Antigravity 暴露**：后台异步执行长时远程命令（下载、编译、安装、长脚本等，默认不设本地超时），完成后由宿主自动唤醒；其他环境沿用 `home_exec` |
 | `home_copy` | 传文件：mac 上传走 LAN、下载按 LAN 选路；windows 仅上传（多文件用 `files` 批量模式，单条 sftp 会话）；wsl 双向。同一时刻只允许一个 copy 任务（含批量），并发立即报错 |
+| `home_copy_bg` | **仅 Antigravity 暴露**：后台异步大文件/批量传输（共享同一单飞传输门禁，不设本地超时）；其他环境沿用 `home_copy` |
 | `home_wake` | 显式唤醒 WSL（`home_exec` 已自动重试，通常无需单独调用） |
 | `home_reset` | 救援：终止本插件正在执行的远程命令/传输、清理 SSH ControlMaster；不终止远端脱离 SSH 的后台任务 |
 
