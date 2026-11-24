@@ -25,9 +25,6 @@ import {
 import { TaskStore, defaultIsPidAlive } from "./store.ts";
 import type { TaskRecord, TaskStatus, TaskSummary } from "./store.ts";
 
-export const DEFAULT_TIMEOUT_SECONDS = 1800;
-export const MIN_TIMEOUT_SECONDS = 1;
-export const MAX_TIMEOUT_SECONDS = 7200;
 export const MAX_WAIT_SECONDS = 30;
 export const DEFAULT_EXCLUDE_TOOLS = [
   "ask_question",
@@ -50,7 +47,6 @@ export interface StartTaskInput {
   model?: string;
   provider?: string;
   thinking?: string;
-  timeoutSeconds?: number;
   excludeTools?: string[];
   waitSeconds?: number;
 }
@@ -58,7 +54,6 @@ export interface StartTaskInput {
 export interface ReplyTaskInput {
   taskId: string;
   reply: string;
-  timeoutSeconds?: number;
   waitSeconds?: number;
 }
 
@@ -88,9 +83,7 @@ interface ActiveExecution {
   record: TaskRecord;
   child: ChildProcess;
   cancelled: boolean;
-  timedOut: boolean;
   finalizing: boolean;
-  timer: NodeJS.Timeout | null;
   killTimer: NodeJS.Timeout | null;
   settled: Promise<TaskRecord>;
   waiters: Set<(record: TaskRecord) => void>;
@@ -170,14 +163,6 @@ function validateCwd(cwd: string): string {
     throw new Error(`cwd 不存在或不是目录: ${cwd}`);
   }
   return canonical;
-}
-
-function validateTimeoutSeconds(value: number | undefined): number {
-  if (value === undefined) return DEFAULT_TIMEOUT_SECONDS;
-  if (!Number.isInteger(value) || value < MIN_TIMEOUT_SECONDS || value > MAX_TIMEOUT_SECONDS) {
-    throw new Error(`timeoutSeconds 必须是 ${MIN_TIMEOUT_SECONDS}–${MAX_TIMEOUT_SECONDS} 的整数`);
-  }
-  return value;
 }
 
 function validateWaitSeconds(value: number | undefined): number {
@@ -310,7 +295,7 @@ export class PiWorkerRunner {
     return childEnv;
   }
 
-  private launchRound(record: TaskRecord, promptText: string, timeoutSeconds: number): ActiveExecution {
+  private launchRound(record: TaskRecord, promptText: string): ActiveExecution {
     const piBinary = this.resolveBinary();
     const args = this.buildArgs(record);
     const childEnv = this.buildChildEnv(record);
@@ -358,9 +343,7 @@ export class PiWorkerRunner {
       record,
       child,
       cancelled: false,
-      timedOut: false,
       finalizing: false,
-      timer: null,
       killTimer: null,
       settled,
       waiters: new Set(),
@@ -434,21 +417,7 @@ export class PiWorkerRunner {
       spawnError = err;
     });
 
-    execState.timer = setTimeout(() => {
-      execState.timedOut = true;
-      signalProcessGroup(child, "SIGTERM");
-      execState.killTimer = setTimeout(() => {
-        signalProcessGroup(child, "SIGKILL");
-      }, CANCEL_GRACE_MS);
-      execState.killTimer.unref?.();
-    }, timeoutSeconds * 1000);
-    execState.timer.unref?.();
-
     const finalize = async (exitCode: number | null, signal: NodeJS.Signals | null): Promise<void> => {
-      if (execState.timer) {
-        clearTimeout(execState.timer);
-        execState.timer = null;
-      }
       if (execState.killTimer) {
         clearTimeout(execState.killTimer);
         execState.killTimer = null;
@@ -470,9 +439,6 @@ export class PiWorkerRunner {
       if (execState.cancelled) {
         record.status = "cancelled";
         record.error = "cancelled by user";
-      } else if (execState.timedOut) {
-        record.status = "failed";
-        record.error = `timeout after ${timeoutSeconds}s`;
       } else if (spawnError) {
         record.status = "failed";
         record.error = `spawn error: ${spawnError.message}`;
@@ -581,7 +547,6 @@ export class PiWorkerRunner {
     if (input.provider && !input.model) {
       throw new Error("指定 provider 时必须同时指定 model");
     }
-    const timeoutSeconds = validateTimeoutSeconds(input.timeoutSeconds);
     const waitSeconds = validateWaitSeconds(input.waitSeconds);
     const excludeTools = mergeExcludeTools(input.excludeTools);
 
@@ -618,7 +583,7 @@ export class PiWorkerRunner {
       gitChanges: [],
     };
 
-    this.launchRound(record, input.prompt, timeoutSeconds);
+    this.launchRound(record, input.prompt);
     return this.waitForState(taskId, waitSeconds);
   }
 
@@ -627,7 +592,6 @@ export class PiWorkerRunner {
     if (typeof input.reply !== "string" || !input.reply.trim()) {
       throw new Error("reply 不能为空");
     }
-    const timeoutSeconds = validateTimeoutSeconds(input.timeoutSeconds);
     const waitSeconds = validateWaitSeconds(input.waitSeconds);
 
     const existing = this.getSnapshot(input.taskId);
@@ -652,7 +616,7 @@ export class PiWorkerRunner {
       error: null,
     };
 
-    this.launchRound(nextRecord, input.reply, timeoutSeconds);
+    this.launchRound(nextRecord, input.reply);
     return this.waitForState(nextRecord.taskId, waitSeconds);
   }
 

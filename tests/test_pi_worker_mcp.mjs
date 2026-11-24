@@ -122,6 +122,10 @@ test("test_mcp_full_lifecycle_validation_and_graceful_shutdown", async () => {
         "pi_worker_list",
       ],
     );
+    const startSchema = listRes.result.tools.find((t) => t.name === "pi_worker_start").inputSchema;
+    const replySchema = listRes.result.tools.find((t) => t.name === "pi_worker_reply").inputSchema;
+    assert.equal("timeoutSeconds" in startSchema.properties, false);
+    assert.equal("timeoutSeconds" in replySchema.properties, false);
 
     // 1. start -> needs_input
     const startRes = await client.request("tools/call", {

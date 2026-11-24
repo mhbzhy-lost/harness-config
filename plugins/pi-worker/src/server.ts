@@ -4,10 +4,7 @@
  */
 
 import {
-  DEFAULT_TIMEOUT_SECONDS,
-  MAX_TIMEOUT_SECONDS,
   MAX_WAIT_SECONDS,
-  MIN_TIMEOUT_SECONDS,
   PiWorkerRunner,
   isNestedWorkerEnv,
 } from "./runner.ts";
@@ -49,12 +46,6 @@ const TOOLS: ToolDefinition[] = [
           enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
           description: "可选：传给 Pi 的 --thinking 思考档位",
         },
-        timeoutSeconds: {
-          type: "integer",
-          minimum: MIN_TIMEOUT_SECONDS,
-          maximum: MAX_TIMEOUT_SECONDS,
-          description: `单轮超时秒数（默认 ${DEFAULT_TIMEOUT_SECONDS}，范围 ${MIN_TIMEOUT_SECONDS}–${MAX_TIMEOUT_SECONDS}）`,
-        },
         excludeTools: {
           type: "array",
           items: { type: "string" },
@@ -80,12 +71,6 @@ const TOOLS: ToolDefinition[] = [
       properties: {
         taskId: { type: "string", description: "由 pi_worker_start 返回的任务 UUID" },
         reply: { type: "string", description: "给 Pi 的明确回复或补充指示" },
-        timeoutSeconds: {
-          type: "integer",
-          minimum: MIN_TIMEOUT_SECONDS,
-          maximum: MAX_TIMEOUT_SECONDS,
-          description: `本轮超时秒数（默认 ${DEFAULT_TIMEOUT_SECONDS}）`,
-        },
         waitSeconds: {
           type: "number",
           minimum: 0,
@@ -215,7 +200,6 @@ async function callTool(name: string, args: Record<string, unknown>) {
         model: optionalString(args.model, "model"),
         provider: optionalString(args.provider, "provider"),
         thinking: optionalString(args.thinking, "thinking"),
-        timeoutSeconds: optionalNumber(args.timeoutSeconds, "timeoutSeconds"),
         excludeTools: optionalStringArray(args.excludeTools, "excludeTools"),
         waitSeconds: optionalNumber(args.waitSeconds, "waitSeconds"),
       });
@@ -230,7 +214,6 @@ async function callTool(name: string, args: Record<string, unknown>) {
       const record = await runner.reply({
         taskId,
         reply,
-        timeoutSeconds: optionalNumber(args.timeoutSeconds, "timeoutSeconds"),
         waitSeconds: optionalNumber(args.waitSeconds, "waitSeconds"),
       });
       return textResult(record);

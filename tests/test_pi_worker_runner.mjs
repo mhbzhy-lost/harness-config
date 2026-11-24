@@ -276,8 +276,8 @@ test("test_concurrent_cwd_lock_cancel_semantics_and_no_finalizing_orphan_race", 
   }
 });
 
-test("test_timeout_terminates_detached_process_group", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-worker-timeout-"));
+test("test_cancel_terminates_detached_process_group", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-cancel-pg-"));
   try {
     const workDir = join(dir, "repo");
     mkdirSync(workDir, { recursive: true });
@@ -288,9 +288,14 @@ test("test_timeout_terminates_detached_process_group", async () => {
       env: { ...process.env, FAKE_PI_SCENARIO: "sleep" },
     });
 
-    const rec = await runner.start({ cwd: workDir, prompt: "hang", timeoutSeconds: 1, waitSeconds: 5 });
-    assert.equal(rec.status, "failed");
-    assert.match(rec.error ?? "", /timeout/i);
+    const started = await runner.start({ cwd: workDir, prompt: "hang", waitSeconds: 0 });
+    assert.equal(started.status, "running");
+    assert.ok(started.pid && started.pid > 0);
+
+    const cancelled = await runner.cancel({ taskId: started.taskId });
+    assert.equal(cancelled.wasRunning, true);
+    assert.equal(cancelled.task.status, "cancelled");
+    assert.throws(() => process.kill(started.pid, 0));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

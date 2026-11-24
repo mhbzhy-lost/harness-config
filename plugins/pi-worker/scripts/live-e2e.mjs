@@ -139,7 +139,6 @@ try {
     arguments: {
       cwd: repoDir,
       prompt: startPrompt,
-      timeoutSeconds: 180,
       waitSeconds: 0,
     },
   });
@@ -175,7 +174,6 @@ try {
     arguments: {
       taskId: round1.taskId,
       reply: "选择方案 A：`Hello, <NAME>!`（name 转为全大写，例如 formatUser('alice') === 'Hello, ALICE!'）。请立即在 src/greet.mjs 实现并导出 formatUser，在 test.mjs 补充单元测试，运行 `node --test test.mjs` 验证全部通过，然后调用 `worker_finish` 汇报结果。",
-      timeoutSeconds: 180,
       waitSeconds: 0,
     },
   });

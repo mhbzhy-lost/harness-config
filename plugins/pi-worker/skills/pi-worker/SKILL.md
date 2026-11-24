@@ -21,9 +21,9 @@ description: Use when delegating a self-contained, multi-step long-running codin
 
 ## MCP 工具
 
-- `pi_worker_start(cwd, prompt, model?, provider?, thinking?, timeoutSeconds?, excludeTools?, waitSeconds?)`：在独立隔离 Session 启动新长任务（同一 `cwd` 仅允许 1 个运行中任务）。
-- `pi_worker_status(taskId, waitSeconds?)`：查看实时进度（`turnCount`/`lastTool`/`recentEvents`）、挂起问题或最终摘要与 `gitChanges`；`waitSeconds` 可设 `0–30` 做短等待，避免高频空轮询。
-- `pi_worker_reply(taskId, reply, timeoutSeconds?, waitSeconds?)`：向 `needs_input`（或 `done`/`blocked` 需续做）的任务发送回复，沿原隔离 Session 续跑。
+- `pi_worker_start(cwd, prompt, model?, provider?, thinking?, excludeTools?, waitSeconds?)`：在独立隔离 Session 启动新长任务（同一 `cwd` 仅允许 1 个运行中任务，不设总墙钟超时）。
+- `pi_worker_status(taskId, waitSeconds?)`：查看实时进度（`turnCount`/`lastTool`/`lastActivityAt`/`recentEvents`）、挂起问题或最终摘要与 `gitChanges`；`waitSeconds` 可设 `0–30` 做短等待，避免高频空轮询。
+- `pi_worker_reply(taskId, reply, waitSeconds?)`：向 `needs_input`（或 `done`/`blocked` 需续做）的任务发送回复，沿原隔离 Session 续跑。
 - `pi_worker_cancel(taskId)`：优雅取消运行中或挂起的任务。
 - `pi_worker_list(status?, cwd?, limit?)`：列出任务摘要。
 
