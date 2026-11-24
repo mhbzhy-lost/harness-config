@@ -189,7 +189,7 @@ class PiSyncTest(unittest.TestCase):
             self.assertEqual(copied_bin.read_bytes(), (ROOT / "pi/bin/apply_patch").read_bytes())
 
             # 3. 插件软链
-            for name in ("deepseek-search", "home-connect", "playwright"):
+            for name in ("deepseek-search", "home-connect", "pi-worker", "playwright"):
                 link = plugins_dir / name
                 self.assertTrue(link.is_symlink(), msg=f"缺少插件软链: {link}")
                 self.assertEqual(link.resolve(), (ROOT / "plugins" / name).resolve())

@@ -29,7 +29,7 @@ Qwen Code 个人配置与插件的多机同步仓库。
 | `qwen/extensions/` | 原生 Qwen extension（codex-proxy：/codex-login、/codex-status + 生命周期脚本），软链接进 `~/.qwen/extensions/` |
 | `skills/` | 跨项目独立 skill（superpowers 改写版：`writing-skills` / `writing-plans`），分别注入 Qwen `skills.directories`、AGY `skills.json` 与 Pi `skills` 加载 |
 | `.agents/skills/` | 仅在本仓加载的项目级 skill：`pi-manage-provider`（安全管理 `~/.pi/agent/models.json` 与 `/dev/tty` 凭据录入）、`pi-docs`（Pi 官方文档索引，本机 `docs`/`examples`/`schemas`/`README.md` 软链由 `init-pi.sh` 自动生成且 gitignore） |
-| `plugins/` | Agent Plugins v1 插件：deepseek-search / home-connect / playwright |
+| `plugins/` | Agent Plugins v1 插件：deepseek-search / home-connect / pi-worker / playwright |
 
 ## 同步范围
 

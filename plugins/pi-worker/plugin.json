@@ -1,0 +1,8 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "pi-worker",
+  "version": "0.1.0",
+  "description": "将本地自定义 Pi 封装为跨 Harness 的异步长任务工作器：支持独立隔离 Session、内部尾部压缩、挂起提问续跑与进度观测",
+  "license": "MIT",
+  "keywords": ["pi", "worker", "subagent", "mcp", "long-running", "suspend-resume"]
+}

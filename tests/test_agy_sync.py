@@ -43,7 +43,7 @@ class AgySyncTest(unittest.TestCase):
                 ]
                 self.assertEqual(agy_spec.get("args", []), expected_args)
 
-        self.assertGreaterEqual(checked, 3)
+        self.assertGreaterEqual(checked, 4)
 
     def test_agy_global_rule_has_no_qwen_specific_routing(self) -> None:
         rule_path = ROOT / "agy/rules/harness-config.md"
@@ -234,7 +234,7 @@ class AgySyncTest(unittest.TestCase):
             self.assertEqual(len(settings_backups_first), 1)
 
             # 1. 插件链接
-            for name in ("deepseek-search", "home-connect", "playwright"):
+            for name in ("deepseek-search", "home-connect", "pi-worker", "playwright"):
                 link = config_dir / "plugins" / name
                 self.assertTrue(link.is_symlink(), msg=f"缺少插件软链: {link}")
                 self.assertEqual(link.resolve(), (ROOT / "plugins" / name).resolve())
