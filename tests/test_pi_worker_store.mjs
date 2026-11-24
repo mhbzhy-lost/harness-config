@@ -119,6 +119,22 @@ test("test_cwd_lock_prevents_cross_process_conflict_and_reclaims_dead_owner", ()
 
     store.releaseCwdLock("/repo/shared", idB);
     assert.ok("lockPath" in store.acquireCwdLock("/repo/shared", { taskId: idB, ownerPid: 2002 }));
+
+    // 关键场景（Important #4c）：原 MCP ownerPid 已死，但 detached worker 子进程 record.pid 仍存活时不得回收锁
+    store.releaseCwdLock("/repo/shared", idB);
+    const idC = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const idD = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    alivePids.add(3003); // detached worker child PID 存活
+    // MCP server ownerPid=3000 已死（不在 alivePids 中）
+    store.save(makeRecord(store, { taskId: idC, cwd: "/repo/detached", status: "running", pid: 3003 }));
+    const lockC = store.acquireCwdLock("/repo/detached", { taskId: idC, ownerPid: 3000 });
+    assert.ok("lockPath" in lockC);
+
+    const conflictWithLiveChild = store.acquireCwdLock("/repo/detached", { taskId: idD, ownerPid: 2002 });
+    assert.ok("conflictTaskId" in conflictWithLiveChild);
+    assert.equal(conflictWithLiveChild.conflictTaskId, idC);
+    assert.equal(conflictWithLiveChild.ownerPid, 3003);
+    assert.equal(store.load(idC)?.status, "running");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

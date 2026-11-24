@@ -324,3 +324,80 @@ test("test_resolve_pi_binary_skips_symlink_to_launcher_zsh", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("test_cross_process_cancel_waits_for_detached_pid_exit_before_releasing_lock", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-xproc-"));
+  try {
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const stateDir = join(dir, "state");
+    const fakePi = createFakePi(dir, join(dir, "invocations.jsonl"));
+
+    // Runner 1 启动一个长睡 detached 子进程
+    const runner1 = new PiWorkerRunner({
+      store: new TaskStore(stateDir),
+      piBinary: fakePi,
+      env: { ...process.env, FAKE_PI_SCENARIO: "sleep" },
+    });
+    const started = await runner1.start({ cwd: workDir, prompt: "sleep", waitSeconds: 0 });
+    assert.equal(started.status, "running");
+    assert.ok(started.pid && started.pid > 0);
+
+    // 模拟另一个独立的 MCP Server 进程（不持有 runner1 内存 active 表）执行 cancel
+    const runner2 = new PiWorkerRunner({
+      store: new TaskStore(stateDir),
+      piBinary: fakePi,
+      env: { ...process.env, FAKE_PI_SCENARIO: "sleep" },
+    });
+    const res = await runner2.cancel({ taskId: started.taskId });
+    assert.equal(res.wasRunning, true);
+    assert.equal(res.task.status, "cancelled");
+
+    // 关键：cancel 返回时目标进程必须已经真正退出（process.kill(pid, 0) 抛 ESRCH）
+    assert.throws(() => process.kill(started.pid, 0));
+
+    // 等待 runner1 内部收尾后清理
+    await runner1.shutdown();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_cancel_during_finalizing_does_not_overwrite_completed_task", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-fin-"));
+  try {
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const fakePi = createFakePi(dir, join(dir, "invocations.jsonl"));
+
+    let enteredGitStatus;
+    const gitStatusStarted = new Promise((r) => { enteredGitStatus = r; });
+    let releaseGitStatus;
+    const gitStatusGate = new Promise((r) => { releaseGitStatus = r; });
+
+    const runner = new PiWorkerRunner({
+      store: new TaskStore(join(dir, "state")),
+      piBinary: fakePi,
+      env: { ...process.env, FAKE_PI_SCENARIO: "two-round" },
+      collectGitChanges: async () => {
+        enteredGitStatus();
+        await gitStatusGate;
+        return [" M file.ts"];
+      },
+    });
+
+    const started = await runner.start({ cwd: workDir, prompt: "fast exit", waitSeconds: 0 });
+    await gitStatusStarted;
+
+    // 此时子进程已退出并进入 finalizing（正在等 collectGitChanges）
+    const cancelPromise = runner.cancel({ taskId: started.taskId });
+    releaseGitStatus();
+    const cancelResult = await cancelPromise;
+
+    assert.equal(cancelResult.wasRunning, false);
+    assert.equal(cancelResult.task.status, "needs_input");
+    assert.deepEqual(cancelResult.task.gitChanges, [" M file.ts"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

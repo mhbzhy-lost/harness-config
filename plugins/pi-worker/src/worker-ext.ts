@@ -8,6 +8,7 @@ export interface PiExtensionContextLike {
 export interface PiToolResultLike {
   content: Array<{ type: "text"; text: string }>;
   details?: unknown;
+  terminate?: boolean;
 }
 
 export interface PiToolDefLike {
@@ -61,11 +62,20 @@ export function registerPiWorkerExtension(
   const setExitCode = options.setExitCode ?? ((code: number) => { process.exitCode = code; });
   let terminalWritten = false;
   let abortOnTurnEnd = false;
+  let forcedErrorExitCode = false;
+
+  const clearForcedErrorExitCode = (): void => {
+    if (forcedErrorExitCode) {
+      forcedErrorExitCode = false;
+      setExitCode(0);
+    }
+  };
 
   const commitTerminal = (outcome: WorkerOutcome): void => {
     writeOutcomeFile(outcomeFile, outcome);
     terminalWritten = true;
     abortOnTurnEnd = true;
+    clearForcedErrorExitCode();
   };
 
   pi.registerTool({
@@ -110,6 +120,8 @@ export function registerPiWorkerExtension(
             text: "已记录挂起问题并准备通知父代理，本轮将在当前 turn 结束时自动挂起退出；请勿再调用其他工具。",
           },
         ],
+        details: {},
+        terminate: true,
       };
     },
   });
@@ -151,6 +163,8 @@ export function registerPiWorkerExtension(
             text: "已记录阻塞状态，本轮将在当前 turn 结束时自动退出；请勿再调用其他工具。",
           },
         ],
+        details: {},
+        terminate: true,
       };
     },
   });
@@ -193,6 +207,8 @@ export function registerPiWorkerExtension(
             text: "已记录完成结果，本轮将在当前 turn 结束时自动退出；请勿再调用其他工具。",
           },
         ],
+        details: {},
+        terminate: true,
       };
     },
   });
@@ -223,6 +239,7 @@ export function registerPiWorkerExtension(
         stopReason,
         error: errorMessage ?? stopReason,
       });
+      forcedErrorExitCode = true;
       setExitCode(1);
       return;
     }
@@ -237,6 +254,7 @@ export function registerPiWorkerExtension(
       stopReason,
       error: null,
     });
+    clearForcedErrorExitCode();
   });
 }
 

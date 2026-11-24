@@ -259,17 +259,19 @@ export class TaskStore {
     const existing = this.readLockPayload(lockPath);
     if (existing) {
       const inFlight = options.inFlightTaskIds?.has(existing.taskId) ?? false;
-      const alive = inFlight || this.isPidAlive(existing.ownerPid);
-      if (alive) {
+      const ownerAlive = inFlight || this.isPidAlive(existing.ownerPid);
+      if (ownerAlive) {
         return { conflictTaskId: existing.taskId, ownerPid: existing.ownerPid };
       }
-      // 持有者进程已死：回收陈旧锁并校正旧任务记录
+      // 即使原 MCP ownerPid 已死，仍须核查 detached worker 子进程是否仍在运行
+      const stale = TASK_ID_RE.test(existing.taskId) ? this.readRawTask(existing.taskId) : null;
+      if (stale && stale.status === "running" && stale.pid !== null && this.isPidAlive(stale.pid)) {
+        return { conflictTaskId: stale.taskId, ownerPid: stale.pid };
+      }
+      // 宿主与 worker 进程均已死：回收陈旧锁并校正旧任务记录
       try { unlinkSync(lockPath); } catch { /* 已被并发清理 */ }
-      if (TASK_ID_RE.test(existing.taskId)) {
-        const stale = this.readRawTask(existing.taskId);
-        if (stale && stale.status === "running") {
-          this.markOrphanFailed(stale);
-        }
+      if (stale && stale.status === "running") {
+        this.markOrphanFailed(stale);
       }
     } else {
       // 锁文件损坏：删除后重试

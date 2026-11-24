@@ -235,3 +235,54 @@ test("test_mcp_hides_and_blocks_all_tools_in_nested_worker_env", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("test_mcp_handles_null_array_and_malformed_json_without_crashing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-mcp-invalid-"));
+  try {
+    const client = startMcpClient({
+      PI_WORKER_STATE_DIR: join(dir, "state"),
+    });
+
+    const received = [];
+    const origLines = new Promise((resolveDone) => {
+      let buf = "";
+      client.child.stdout.on("data", (chunk) => {
+        buf += chunk;
+        let idx = buf.indexOf("\n");
+        while (idx >= 0) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          idx = buf.indexOf("\n");
+          if (!line) continue;
+          const msg = JSON.parse(line);
+          if (msg.id === null) {
+            received.push(msg);
+            if (received.length >= 3) resolveDone();
+          }
+        }
+      });
+    });
+
+    client.child.stdin.write("null\n");
+    client.child.stdin.write("[1, 2]\n");
+    client.child.stdin.write("{not-valid-json\n");
+
+    await Promise.race([
+      origLines,
+      new Promise((_, rej) => setTimeout(() => rej(new Error("expected 3 JSON-RPC error responses")), 2000)),
+    ]);
+
+    assert.equal(received[0].error.code, -32600);
+    assert.equal(received[1].error.code, -32600);
+    assert.equal(received[2].error.code, -32700);
+
+    // 关键：服务进程必须仍存活并正常响应后续 ping
+    const pingRes = await client.request("ping");
+    assert.deepEqual(pingRes.result, {});
+
+    const exitCode = await client.close();
+    assert.equal(exitCode, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

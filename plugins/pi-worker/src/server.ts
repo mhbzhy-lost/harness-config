@@ -325,12 +325,18 @@ process.stdin.on("data", (chunk: string) => {
     buffer = buffer.slice(index + 1);
     index = buffer.indexOf("\n");
     if (!line) continue;
-    let message: { id?: unknown; method?: string; params?: unknown };
+    let parsed: unknown;
     try {
-      message = JSON.parse(line);
+      parsed = JSON.parse(line);
     } catch {
+      send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
       continue;
     }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      send({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } });
+      continue;
+    }
+    const message = parsed as { id?: unknown; method?: string; params?: unknown };
     handleRequest(message)
       .then((result) => {
         if (result !== null) send({ jsonrpc: "2.0", id: message.id, result });

@@ -66,8 +66,10 @@ test("test_worker_ask_parent_writes_outcome_returns_tool_result_then_aborts_on_t
       summary: "已完成前置调研",
     }, undefined, undefined, ctx);
 
-    // 关键：tool execute 阶段不直接 abort，确保 tool_result 先落盘
+    // 关键：tool execute 阶段不直接 abort，确保 tool_result 先落盘，且返回 terminate: true + details: {} 阻止进入多余第 2 轮
     assert.equal(abortCalls, 0);
+    assert.equal(toolResult.terminate, true);
+    assert.deepEqual(toolResult.details, {});
     assert.ok(Array.isArray(toolResult.content) && toolResult.content.length > 0);
     assert.deepEqual(readOutcomeFile(outcomeFile), {
       status: "needs_input",
@@ -105,10 +107,12 @@ test("test_worker_report_blocked_and_worker_finish_write_structured_outcomes", a
     let abortCalls = 0;
     const ctx = { abort: () => { abortCalls += 1; } };
 
-    await mockBlocked.tools.get("worker_report_blocked").execute("tc_2", {
+    const blockedResult = await mockBlocked.tools.get("worker_report_blocked").execute("tc_2", {
       reason: "缺少数据库凭据",
       summary: "迁移脚本已就绪，待提供测试库密码",
     }, undefined, undefined, ctx);
+    assert.equal(blockedResult.terminate, true);
+    assert.deepEqual(blockedResult.details, {});
     assert.equal(abortCalls, 0);
     await mockBlocked.emit("turn_end", { type: "turn_end" }, ctx);
     assert.equal(abortCalls, 1);
@@ -128,10 +132,12 @@ test("test_worker_report_blocked_and_worker_finish_write_structured_outcomes", a
     registerPiWorkerExtension(mockDone, { outcomeFile: doneFile, setExitCode: () => {} });
     let finishAborts = 0;
     const finishCtx = { abort: () => { finishAborts += 1; } };
-    await mockDone.tools.get("worker_finish").execute("tc_3", {
+    const finishResult = await mockDone.tools.get("worker_finish").execute("tc_3", {
       summary: "完成重构并全部通过测试",
       verifiedCommands: ["npm test", "npm run lint"],
     }, undefined, undefined, finishCtx);
+    assert.equal(finishResult.terminate, true);
+    assert.deepEqual(finishResult.details, {});
     await mockDone.emit("turn_end", { type: "turn_end" }, finishCtx);
     assert.equal(finishAborts, 1);
     assert.deepEqual(readOutcomeFile(doneFile), {
@@ -195,6 +201,38 @@ test("test_agent_end_handles_natural_done_and_sets_exit_code_on_error_stop_reaso
       stopReason: "error",
       error: "429 Too Many Requests",
     });
+
+    // 3. stopReason: aborted (非工具触发) -> failed + exitCode 1
+    const abortedFile = join(dir, "aborted.json");
+    const mockAborted = createMockPi();
+    let abortedExit = null;
+    registerPiWorkerExtension(mockAborted, { outcomeFile: abortedFile, setExitCode: (c) => { abortedExit = c; } });
+    await mockAborted.emit("agent_end", {
+      type: "agent_end",
+      messages: [{ role: "assistant", stopReason: "aborted", content: [] }],
+    }, {});
+    assert.equal(abortedExit, 1);
+    assert.equal(readOutcomeFile(abortedFile)?.status, "failed");
+
+    // 4. 自动重试恢复成功：首次 error 置 exitCode=1，后续重试成功必须清零 exitCode=0
+    const retryFile = join(dir, "retry-recover.json");
+    const mockRetry = createMockPi();
+    const exitHistory = [];
+    registerPiWorkerExtension(mockRetry, {
+      outcomeFile: retryFile,
+      setExitCode: (c) => { exitHistory.push(c); },
+    });
+    await mockRetry.emit("agent_end", {
+      type: "agent_end",
+      messages: [{ role: "assistant", stopReason: "error", errorMessage: "429 retryable", content: [] }],
+    }, {});
+    assert.deepEqual(exitHistory, [1]);
+    await mockRetry.emit("agent_end", {
+      type: "agent_end",
+      messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "重试后完成" }] }],
+    }, {});
+    assert.deepEqual(exitHistory, [1, 0]);
+    assert.equal(readOutcomeFile(retryFile)?.status, "done");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

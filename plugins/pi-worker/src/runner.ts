@@ -22,7 +22,7 @@ import {
   readOutcomeFile,
   truncateTail,
 } from "./protocol.ts";
-import { TaskStore } from "./store.ts";
+import { TaskStore, defaultIsPidAlive } from "./store.ts";
 import type { TaskRecord, TaskStatus, TaskSummary } from "./store.ts";
 
 export const DEFAULT_TIMEOUT_SECONDS = 1800;
@@ -81,6 +81,7 @@ export interface PiWorkerRunnerOptions {
   store?: TaskStore;
   env?: NodeJS.ProcessEnv;
   piBinary?: string;
+  collectGitChanges?: (cwd: string) => Promise<string[]>;
 }
 
 interface ActiveExecution {
@@ -88,6 +89,7 @@ interface ActiveExecution {
   child: ChildProcess;
   cancelled: boolean;
   timedOut: boolean;
+  finalizing: boolean;
   timer: NodeJS.Timeout | null;
   killTimer: NodeJS.Timeout | null;
   settled: Promise<TaskRecord>;
@@ -239,10 +241,20 @@ function signalProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
   try { child.kill(signal); } catch { /* 已退出 */ }
 }
 
+async function waitUntilPidExits(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!defaultIsPidAlive(pid)) return true;
+    await new Promise((r) => setTimeout(r, 40));
+  }
+  return !defaultIsPidAlive(pid);
+}
+
 export class PiWorkerRunner {
   readonly store: TaskStore;
   private readonly baseEnv: NodeJS.ProcessEnv;
   private readonly explicitPiBinary?: string;
+  private readonly collectGitChangesFn: (cwd: string) => Promise<string[]>;
   private readonly active = new Map<string, ActiveExecution>();
   private readonly inFlight = new Set<string>();
   private shutdownPromise: Promise<void> | null = null;
@@ -251,6 +263,7 @@ export class PiWorkerRunner {
     this.baseEnv = options.env ?? process.env;
     this.store = options.store ?? new TaskStore(undefined);
     this.explicitPiBinary = options.piBinary;
+    this.collectGitChangesFn = options.collectGitChanges ?? collectGitChanges;
   }
 
   private assertNotNested(): void {
@@ -342,6 +355,7 @@ export class PiWorkerRunner {
       child,
       cancelled: false,
       timedOut: false,
+      finalizing: false,
       timer: null,
       killTimer: null,
       settled,
@@ -490,7 +504,7 @@ export class PiWorkerRunner {
         record.error = null;
       }
 
-      record.gitChanges = await collectGitChanges(record.cwd);
+      record.gitChanges = await this.collectGitChangesFn(record.cwd);
       tightenSessionPermissions(record.sessionDir, record.taskId);
 
       // 终态一次性原子落盘后再释放锁与 inFlight 保护，消除 orphan_process 竞态
@@ -510,6 +524,7 @@ export class PiWorkerRunner {
     child.on("close", (code, signal) => {
       if (finalized) return;
       finalized = true;
+      execState.finalizing = true;
       void finalize(code, signal);
     });
 
@@ -645,6 +660,10 @@ export class PiWorkerRunner {
   async cancel(input: CancelTaskInput): Promise<{ task: TaskRecord; wasRunning: boolean }> {
     const active = this.active.get(input.taskId);
     if (active) {
+      if (active.finalizing) {
+        const finalRecord = await active.settled;
+        return { task: finalRecord, wasRunning: false };
+      }
       active.cancelled = true;
       signalProcessGroup(active.child, "SIGTERM");
       if (!active.killTimer) {
@@ -671,9 +690,20 @@ export class PiWorkerRunner {
     }
 
     if (existing.status === "running" && existing.pid !== null) {
-      // 跨进程运行的任务：尝试向进程组/进程发 SIGTERM 并落盘 cancelled
-      try { process.kill(-existing.pid, "SIGTERM"); } catch {
-        try { process.kill(existing.pid, "SIGTERM"); } catch { /* 忽略 */ }
+      // 跨进程运行的 detached 任务：发 SIGTERM 并等待真正退出，超时再发 SIGKILL，确认已死才释放 cwd 锁
+      const targetPid = existing.pid;
+      try { process.kill(-targetPid, "SIGTERM"); } catch {
+        try { process.kill(targetPid, "SIGTERM"); } catch { /* 忽略 */ }
+      }
+      let exited = await waitUntilPidExits(targetPid, CANCEL_GRACE_MS);
+      if (!exited) {
+        try { process.kill(-targetPid, "SIGKILL"); } catch {
+          try { process.kill(targetPid, "SIGKILL"); } catch { /* 忽略 */ }
+        }
+        exited = await waitUntilPidExits(targetPid, 1000);
+      }
+      if (!exited) {
+        throw new Error(`无法终止跨进程任务 ${existing.taskId}（pid=${targetPid}），已保留工作区写锁以防并发写入`);
       }
       const updated: TaskRecord = {
         ...existing,
