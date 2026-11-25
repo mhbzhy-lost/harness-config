@@ -7,16 +7,22 @@ const UI_SRC = dirname(fileURLToPath(import.meta.url));
 const OUT_HTML = resolve(UI_SRC, "..", "ui", "monitor.html");
 
 const result = await build({
-  entryPoints: [join(UI_SRC, "app.ts")],
+  entryPoints: [join(UI_SRC, "app.tsx")],
   bundle: true,
   format: "iife",
+  jsx: "automatic",
   target: ["es2022"],
+  define: {
+    "process.env.NODE_ENV": '"production"',
+  },
   minify: true,
   write: false,
 });
 
 const jsCode = result.outputFiles[0].text.replace(/<\/script/gi, "<\\/script");
-const cssCode = readFileSync(join(UI_SRC, "styles.css"), "utf8").replace(/<\/style/gi, "<\\/style");
+const streamdownCss = readFileSync(join(UI_SRC, "node_modules", "streamdown", "styles.css"), "utf8");
+const appCss = readFileSync(join(UI_SRC, "styles.css"), "utf8");
+const cssCode = `${streamdownCss}\n${appCss}`.replace(/<\/style/gi, "<\\/style");
 
 const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -27,15 +33,7 @@ const html = `<!DOCTYPE html>
 <style>${cssCode}</style>
 </head>
 <body>
-<div class="shell">
-  <header class="topbar">
-    <span class="brand">Pi Worker</span>
-    <select id="task-select" class="task-select" aria-label="选择任务"></select>
-    <button id="btn-refresh" class="btn" type="button">刷新</button>
-    <button id="btn-cancel" class="btn btn-danger" type="button" disabled>取消</button>
-  </header>
-  <main id="main" class="main"></main>
-</div>
+<div id="root"></div>
 <script>${jsCode}</script>
 </body>
 </html>

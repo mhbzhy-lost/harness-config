@@ -6,9 +6,13 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parseGitStatusFileUri } from "../plugins/pi-worker/ui-src/git-uri.ts";
-import { renderMarkdown } from "../plugins/pi-worker/ui-src/markdown.ts";
 import { createCoalescingRunner } from "../plugins/pi-worker/ui-src/poller.ts";
-import { iconForEvent, isExpandableDetail, summarizeDetailPreview } from "../plugins/pi-worker/ui-src/timeline.ts";
+import {
+  iconForEvent,
+  isExpandableDetail,
+  reduceTimelineItems,
+  summarizeDetailPreview,
+} from "../plugins/pi-worker/ui-src/timeline.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MONITOR_HTML = join(ROOT, "plugins", "pi-worker", "ui", "monitor.html");
@@ -65,7 +69,7 @@ test("test_coalescing_runner_never_drops_task_switch_while_in_flight", async () 
 
 test("test_timeline_helpers_avoid_misleading_caret_and_gate_expandable_details", () => {
   // 静态事件图标不得使用 "▶"，避免看起来像可展开的折叠三角却无法点击
-  for (const kind of ["tool_start", "tool_end", "assistant", "compact", "retry_failed", "status", "turn_end", "session"]) {
+  for (const kind of ["tool_start", "tool_end", "assistant", "text_delta", "thinking", "compact", "retry_failed", "status", "turn_end", "session"]) {
     assert.notEqual(iconForEvent({ kind }), "▶", `static icon for ${kind} must not look like a disclosure triangle`);
   }
   assert.equal(iconForEvent({ kind: "tool_start" }), "⚙");
@@ -84,54 +88,69 @@ test("test_timeline_helpers_avoid_misleading_caret_and_gate_expandable_details",
   assert.ok(longPreview.endsWith("…"));
 });
 
-test("test_markdown_renderer_supports_gfm_and_blocks_xss", () => {
-  const md = [
-    "## 排查报告",
-    "",
-    "状态：**正常**，调用 `pi_worker_start` 与 say_voice_route。",
-    "",
-    "| 项 | 现状 |",
-    "|---|---|",
-    "| `voices` | `{}` |",
-    "",
-    "```sh",
-    "echo <script>alert(1)</script>",
-    "```",
-    "",
-    "- 第一项",
-    "  - 子项 *斜体*",
-    "- [安全链接](https://example.com) / [危险链接](javascript:alert(1))",
-    "",
-    "<img src=x onerror=alert(1)>",
-  ].join("\n");
+test("test_reduce_timeline_merges_streaming_blocks_tool_pairs_and_multi_round_keys", () => {
+  const t = "2026-11-25T10:00:00.000Z";
+  const events = [
+    // Round 1: 分片 thinking 无损拼接
+    { seq: 1, round: 1, blockId: 1, kind: "thinking", title: "思考中", detail: "第一步分析，", thinkingChars: 6, timestamp: t },
+    { seq: 2, round: 1, blockId: 1, kind: "thinking", title: "思考中", detail: "第二步验证。", thinkingChars: 12, timestamp: t },
+    // Round 1: 成对 tool_start + tool_end 按 toolCallId 合并为单张工具卡
+    { seq: 3, round: 1, kind: "tool_start", toolName: "bash", toolCallId: "tc-1", title: "bash", detail: "npm test", preview: "npm test", timestamp: t },
+    { seq: 4, round: 1, kind: "tool_end", toolName: "bash", toolCallId: "tc-1", title: "bash", detail: "ALL PASS\n" + "ok\n".repeat(100), isError: false, durationMs: 420, timestamp: t },
+    // Round 1: text_delta 流式拼接并由同 blockId 的 assistant 收口
+    { seq: 5, round: 1, blockId: 2, kind: "text_delta", title: "助手输出", detail: "## 进度\n", timestamp: t },
+    { seq: 6, round: 1, blockId: 2, kind: "text_delta", title: "助手输出", detail: "- 已完成", timestamp: t },
+    { seq: 7, round: 1, blockId: 2, kind: "assistant", title: "助手输出", detail: "## 进度\n- 已完成全部测试", timestamp: t },
+    // Round 2: seq 重置为 1，自动插入 round 分隔且所有 key 唯一；模拟正在流式的 text_delta 与运行中工具
+    { seq: 1, round: 2, kind: "tool_start", toolName: "read", toolCallId: "tc-2", title: "read", detail: "src/index.ts", preview: "src/index.ts", timestamp: t },
+    { seq: 2, round: 2, blockId: 1, kind: "text_delta", title: "助手输出", detail: "正在输出第二轮...", timestamp: t },
+  ];
 
-  const html = renderMarkdown(md);
-  assert.match(html, /<h2 class="md-h md-h2">排查报告<\/h2>/);
-  assert.match(html, /<strong>正常<\/strong>/);
-  assert.match(html, /<code>pi_worker_start<\/code>/);
-  // 下划线标识符不得被误渲染成斜体
-  assert.match(html, /say_voice_route/);
-  assert.doesNotMatch(html, /<em>voice<\/em>/);
-  // 表格与代码块
-  assert.match(html, /<table class="md-table">/);
-  assert.match(html, /<th>项<\/th>/);
-  assert.match(html, /<pre class="md-code" data-lang="sh"><code>echo &lt;script&gt;alert\(1\)&lt;\/script&gt;<\/code><\/pre>/);
-  // 嵌套列表
-  assert.match(html, /<ul class="md-list"><li>第一项<ul class="md-list"><li>子项 <em>斜体<\/em><\/li><\/ul><\/li>/);
-  // 链接协议白名单与原始 HTML 转义
-  assert.match(html, /<a href="https:\/\/example\.com" target="_blank" rel="noopener noreferrer">安全链接<\/a>/);
-  assert.doesNotMatch(html, /href="javascript:/i);
-  assert.doesNotMatch(html, /<img\b/i);
-  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  const runningItems = reduceTimelineItems(events, true);
+  assert.equal(runningItems.length, 6);
+  // 1. 思考块完整无损拼接且已关闭流式态
+  assert.equal(runningItems[0].type, "thinking");
+  assert.equal(runningItems[0].text, "第一步分析，第二步验证。");
+  assert.equal(runningItems[0].isStreaming, false);
+  // 2. 工具卡合并了输入输出和耗时
+  assert.equal(runningItems[1].type, "tool");
+  assert.equal(runningItems[1].status, "done");
+  assert.equal(runningItems[1].input, "npm test");
+  assert.match(runningItems[1].output ?? "", /^ALL PASS/);
+  assert.equal(runningItems[1].durationMs, 420);
+  // 3. Round 1 助手消息由定稿收口
+  assert.equal(runningItems[2].type, "assistant");
+  assert.equal(runningItems[2].text, "## 进度\n- 已完成全部测试");
+  assert.equal(runningItems[2].isStreaming, false);
+  // 4. Round 分隔
+  assert.equal(runningItems[3].type, "round");
+  assert.equal(runningItems[3].round, 2);
+  // 5. Round 2 未结束工具在任务 running 时保持 running
+  assert.equal(runningItems[4].type, "tool");
+  assert.equal(runningItems[4].status, "running");
+  // 6. Round 2 流式文本保持 isStreaming: true
+  assert.equal(runningItems[5].type, "assistant");
+  assert.equal(runningItems[5].text, "正在输出第二轮...");
+  assert.equal(runningItems[5].isStreaming, true);
+
+  // 所有 key 必须全局唯一
+  const keys = runningItems.map((it) => it.key);
+  assert.equal(new Set(keys).size, keys.length);
+
+  // 当任务已离开 running，未收口工具自动降级为 interrupted，流式文本置 isStreaming: false
+  const settledItems = reduceTimelineItems(events, false);
+  assert.equal(settledItems[4].status, "interrupted");
+  assert.equal(settledItems[5].isStreaming, false);
 });
 
 test("test_monitor_html_is_self_contained_csp_safe_and_served_by_mcp", async () => {
   const st = statSync(MONITOR_HTML);
-  assert.ok(st.size > 1024 && st.size < 2 * 1024 * 1024, `unexpected monitor.html size: ${st.size}`);
+  assert.ok(st.size > 1024 && st.size < 4 * 1024 * 1024, `unexpected monitor.html size: ${st.size}`);
   const html = readFileSync(MONITOR_HTML, "utf8");
   assert.match(html, /<!DOCTYPE html>/i);
   assert.match(html, /<style>/i);
   assert.match(html, /<script>/i);
+  assert.match(html, /<div id="root"><\/div>/i);
   // 严格遵守 default-src 'none' 默认 CSP：禁止外部 http(s) script/link
   assert.doesNotMatch(html, /<script[^>]+src=["']https?:/i);
   assert.doesNotMatch(html, /<link[^>]+href=["']https?:/i);
