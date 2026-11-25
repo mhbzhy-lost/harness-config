@@ -89,6 +89,17 @@ class AgySyncTest(unittest.TestCase):
                 self.assertNotIn("PI_WORKER_AGY", env_map)
                 self.assertNotIn("HOME_CONNECT_AGY_ASYNC", env_map)
 
+        # 使用 mcp_config.json AGY 扩展能力的插件必须提供 .antigravity-plugin/plugin.json 覆盖根 Agent Plugins 清单
+        for plugin_name in ("pi-worker", "home-connect"):
+            agy_manifest_path = ROOT / "plugins" / plugin_name / ".antigravity-plugin" / "plugin.json"
+            self.assertTrue(agy_manifest_path.exists(), msg=f"缺少 {agy_manifest_path}")
+            agy_manifest = json.loads(agy_manifest_path.read_text(encoding="utf-8"))
+            root_manifest = json.loads(
+                (ROOT / "plugins" / plugin_name / "plugin.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(agy_manifest.get("name"), root_manifest.get("name"))
+            self.assertNotIn("agent-plugins.org", str(agy_manifest.get("$schema", "")))
+
     def test_agy_global_rule_has_no_qwen_specific_routing(self) -> None:
         rule_path = ROOT / "agy/rules/harness-config.md"
         self.assertTrue(rule_path.exists())

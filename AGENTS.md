@@ -16,7 +16,7 @@
 ## 插件与初始化
 
 - `init-qwen.sh`、`init-pi.sh` 和 `init-agy.sh` 分别管理各自运行时的插件链接，复用 `lib-plugins.sh`。pi 默认从 `~/.agents/plugins` 加载，AGY 默认从 `~/.gemini/config/plugins` 加载；不要为旧目录新增临时反向软链接。
-- 仓内插件遵循 Agent Plugins 1.0.0（`plugin.json` + `mcp.json` + `skills/`），同时在插件根目录提供兼容 AGY 原生模式的 `mcp_config.json`（使用 `${PLUGIN_ROOT}`，与 `mcp.json` 保持 server 定义同步，AGY 侧按 `enable-agent-plugins-spec` 自动互斥加载）。
+- 仓内插件遵循 Agent Plugins 1.0.0（`plugin.json` + `mcp.json` + `skills/`），同时在插件根目录提供兼容 AGY 原生模式的 `mcp_config.json`（使用 `${PLUGIN_ROOT}`，与 `mcp.json` 保持核心 server 启动定义同步）。需要使用 AGY 专属能力（如 `timeoutSeconds`、`tools.*.background`、`env` 开关、MCP App 侧面板）的插件在 `<plugin>/.antigravity-plugin/plugin.json` 提供 AGY 原生清单（覆盖根 Agent Plugins `$schema` 以确保 AGY 走 `mcp_config.json` 加载，同时保持根 `plugin.json`/`mcp.json` 对 Qwen/Pi 完全纯净）。
 - 初始化须幂等。受管链接已正确时跳过，目标错误时重指，遇到同名真实文件或目录则警告并跳过；不要覆盖用户已有文件或改动未受管条目。
 - 插件凭据放在仓内对应插件约定的位置，并纳入 `.gitignore`；只提交不含真实凭据的示例，不把凭据放到 `~/.pi` 再做兼容链接。这与模型通道凭据留在本机 Qwen Code 配置是两回事。
 - ComfyUI 与 home-connect 保持同一个插件，共用连接层，但各自提供独立的 skill 和 MCP server 入口；不要把两组工具合并进同一个 `server.ts`。
