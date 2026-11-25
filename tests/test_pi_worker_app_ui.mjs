@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parseGitStatusFileUri } from "../plugins/pi-worker/ui-src/git-uri.ts";
+import { renderMarkdown } from "../plugins/pi-worker/ui-src/markdown.ts";
 import { createCoalescingRunner } from "../plugins/pi-worker/ui-src/poller.ts";
 import { iconForEvent, isExpandableDetail, summarizeDetailPreview } from "../plugins/pi-worker/ui-src/timeline.ts";
 
@@ -81,6 +82,47 @@ test("test_timeline_helpers_avoid_misleading_caret_and_gate_expandable_details",
   const longPreview = summarizeDetailPreview("x".repeat(150), 40);
   assert.equal(longPreview.length, 41);
   assert.ok(longPreview.endsWith("…"));
+});
+
+test("test_markdown_renderer_supports_gfm_and_blocks_xss", () => {
+  const md = [
+    "## 排查报告",
+    "",
+    "状态：**正常**，调用 `pi_worker_start` 与 say_voice_route。",
+    "",
+    "| 项 | 现状 |",
+    "|---|---|",
+    "| `voices` | `{}` |",
+    "",
+    "```sh",
+    "echo <script>alert(1)</script>",
+    "```",
+    "",
+    "- 第一项",
+    "  - 子项 *斜体*",
+    "- [安全链接](https://example.com) / [危险链接](javascript:alert(1))",
+    "",
+    "<img src=x onerror=alert(1)>",
+  ].join("\n");
+
+  const html = renderMarkdown(md);
+  assert.match(html, /<h2 class="md-h md-h2">排查报告<\/h2>/);
+  assert.match(html, /<strong>正常<\/strong>/);
+  assert.match(html, /<code>pi_worker_start<\/code>/);
+  // 下划线标识符不得被误渲染成斜体
+  assert.match(html, /say_voice_route/);
+  assert.doesNotMatch(html, /<em>voice<\/em>/);
+  // 表格与代码块
+  assert.match(html, /<table class="md-table">/);
+  assert.match(html, /<th>项<\/th>/);
+  assert.match(html, /<pre class="md-code" data-lang="sh"><code>echo &lt;script&gt;alert\(1\)&lt;\/script&gt;<\/code><\/pre>/);
+  // 嵌套列表
+  assert.match(html, /<ul class="md-list"><li>第一项<ul class="md-list"><li>子项 <em>斜体<\/em><\/li><\/ul><\/li>/);
+  // 链接协议白名单与原始 HTML 转义
+  assert.match(html, /<a href="https:\/\/example\.com" target="_blank" rel="noopener noreferrer">安全链接<\/a>/);
+  assert.doesNotMatch(html, /href="javascript:/i);
+  assert.doesNotMatch(html, /<img\b/i);
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
 });
 
 test("test_monitor_html_is_self_contained_csp_safe_and_served_by_mcp", async () => {

@@ -5,6 +5,7 @@ import {
 } from "@modelcontextprotocol/ext-apps";
 import { z } from "zod";
 import { parseGitStatusFileUri } from "./git-uri.ts";
+import { escapeHtml, renderMarkdown } from "./markdown.ts";
 import { createCoalescingRunner } from "./poller.ts";
 import { iconForEvent, isExpandableDetail, summarizeDetailPreview } from "./timeline.ts";
 
@@ -100,14 +101,6 @@ function fmtTime(iso: string): string {
 function fmtDuration(ms?: number): string {
   if (ms === undefined) return "";
   return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
-}
-
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
 }
 
 function clearPoll(): void {
@@ -306,7 +299,7 @@ function render(): void {
     parts.push(`
       <div class="card callout-question">
         <div class="section-title">等待确认 (needs_input)</div>
-        <p class="pre-wrap">${escapeHtml(t.question)}</p>
+        <div class="md-body">${renderMarkdown(t.question)}</div>
         ${optsHtml}
       </div>
     `);
@@ -328,7 +321,7 @@ function render(): void {
     parts.push(`
       <div class="card">
         <div class="section-title">任务摘要</div>
-        <p class="pre-wrap">${escapeHtml(t.summary)}</p>
+        <div class="md-body">${renderMarkdown(t.summary)}</div>
         ${cmdsHtml}
       </div>
     `);
@@ -367,6 +360,15 @@ function render(): void {
         const icon = iconForEvent(ev);
         const headText = `${icon} ${escapeHtml(ev.title)}${dur ? ` (${escapeHtml(dur)})` : ""}`;
         const timeText = escapeHtml(fmtTime(ev.timestamp));
+        const renderDetailHtml = (detailText: string): string => {
+          if (ev.kind === "tool_start") {
+            return `<pre class="ev-detail ev-code">${escapeHtml(detailText)}</pre>`;
+          }
+          if ((ev.kind === "assistant" || ev.kind === "status") && !ev.isError) {
+            return `<div class="ev-detail md-body">${renderMarkdown(detailText)}</div>`;
+          }
+          return `<div class="ev-detail">${escapeHtml(detailText)}</div>`;
+        };
         if (ev.detail && isExpandableDetail(ev.detail)) {
           const isOpen = openEventSeqs.has(ev.seq);
           const preview = summarizeDetailPreview(ev.detail);
@@ -379,11 +381,11 @@ function render(): void {
                 </div>
                 <div class="ev-preview">${escapeHtml(preview)}</div>
               </summary>
-              <div class="ev-detail">${escapeHtml(ev.detail)}</div>
+              ${renderDetailHtml(ev.detail)}
             </details>
           `;
         }
-        const detail = ev.detail ? `<div class="ev-detail">${escapeHtml(ev.detail)}</div>` : "";
+        const detail = ev.detail ? renderDetailHtml(ev.detail) : "";
         return `
           <div class="${cls}">
             <div class="ev-head">
