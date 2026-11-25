@@ -183,8 +183,7 @@ If you find issues, fix them inline. No need to re-review — just fix and move 
 After Self-Review and before Execution Handoff, always run one fresh-context,
 read-only independent review of the plan and its spec. Do this without waiting
 for the user to request review and before asking for an execution method.
-Prefer a fresh `review-agent`; if it is unavailable, use a fresh
-`general-purpose` reviewer. This plan review is separate from the final
+Prefer a fresh independent read-only reviewer (`pi-worker` with `tier: "heavy"` and `readOnly: true` when available, or a fresh `review-agent` / `general-purpose` reviewer). This plan review is separate from the final
 implementation review and does not replace it.
 
 Give the reviewer both document paths, the confirmed decisions and constraints,
@@ -212,8 +211,9 @@ execution method before implementation.
 
 - **Subagent-driven** - A fresh subagent implements each task and a fresh reviewer checks it before the next one starts, then a whole-branch review at the end. Most thorough; costs a fresh context per task and per review.
 - **Native** - I implement every task myself in this session, the way this harness runs work, then one fresh reviewer on the most capable model checks the whole branch. Cheapest and fastest; no independent implementation review until the end. Runs well with a mid-tier session model, since the plan carries the design.
+- **Pi-worker (whole-plan delegation)** *(when `pi-worker` is available)* - Hand the entire saved plan (`docs/plans/<filename>.md` + its Spec) to an isolated `pi-worker` (`tier: "default"` or a requested tier, read-write) to implement end-to-end in its own session, while I stay in the **acceptance & review** role: answering `needs_input` rulings, verifying disk evidence (`executedCommands`, `eventsPath`, `git diff BASE..HEAD`), and running a fresh independent review before reporting.
 
-**For this plan I recommend <one of the two>, because <one sentence from the plan: how much the tasks depend on each other's interfaces, how many there are, what a shipped mistake would cost>. Does the plan capture what you want, and which approach should we use?"**
+**For this plan I recommend <one of the options>, because <one sentence from the plan: how much the tasks depend on each other's interfaces, how many there are, what a shipped mistake would cost>. Does the plan capture what you want, and which approach should we use?"**
 
 **When an execution method has already been supplied:**
 
@@ -239,3 +239,13 @@ execution method before implementation.
 - Output mismatch: code wrong → find the root cause, never patch the symptom; plan wrong → make the smallest change that satisfies the spec, ledger the Ruling, continue.
 - Task completion contract: every named test exists and ran, you read the outputs, the final run passed, and every deviation has a Ruling line. Missing evidence = not complete.
 - Final review: dispatch a fresh reviewer if a subagent tool exists; otherwise do a separate, explicit self-review pass and tell your human partner it was self-review (weaker than a fresh reviewer — they decide whether it is enough before merge).
+
+**If Pi-worker (whole-plan delegation) chosen:**
+- Record `BASE` (`git rev-parse HEAD`) before dispatching `pi_worker_start` (passing `cwd`, `parentSessionId` when available, `tier: "default"` unless user specifies another tier, read-write mode).
+- Dispatch prompt must include: exact paths to the plan and its Spec, Global Constraints, the TDD/commit/ledger rules from the Execution protocol above, and explicit instruction to call `worker_ask_parent` on genuine spec/plan ambiguities rather than guessing.
+- While `pi-worker` runs, the main agent freezes writes to the same `cwd` and handles `status: "needs_input"` via `pi_worker_reply` (resolving from context when clear or escalating to the human partner; record every deviation as a `Ruling:`).
+- **Main agent acceptance (mandatory — never trust `summary` / `verifiedCommands` alone):**
+  1. Cross-check tamper-proof disk evidence: `executedCommands` (real commands & `isError`), `eventsPath` (untruncated tool outputs/failure traces), and `git diff BASE..HEAD` + `git status` against every task in the plan and Spec;
+  2. Verify the ledger, every named test, and key modified files by reading them directly;
+  3. Run one fresh-context, read-only independent review (`pi-worker` with `tier: "heavy"` + `readOnly: true`, or another fresh reviewer) covering the plan's Review Focus. Critical/Important findings → ONE scoped fix pass (via `pi_worker_reply` or direct targeted edit by main agent) + re-verify disk evidence; Minor → deferred list;
+  4. Report verified results, all Rulings, and deferred minors to the user.
