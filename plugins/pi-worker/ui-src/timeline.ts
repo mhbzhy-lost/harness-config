@@ -90,6 +90,8 @@ export function iconForEvent(ev: Pick<TimelineEventLike, "kind" | "isError">): s
       return "🗜";
     case "retry_failed":
       return "⚠";
+    case "steer":
+      return "🧭";
     case "status":
       return "●";
     case "turn_end":

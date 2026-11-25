@@ -3,13 +3,17 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, w
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { PROTOCOL_APPEND_PROMPT } from "../plugins/pi-worker/src/protocol.ts";
+import { PROTOCOL_APPEND_PROMPT, appendSteerEntry, readSteerEntries } from "../plugins/pi-worker/src/protocol.ts";
+import { readFormattedEventsDelta } from "../plugins/pi-worker/src/stream.ts";
 import {
   DEFAULT_EXCLUDE_TOOLS,
+  MAX_TITLE_CHARS,
   PiWorkerRunner,
   READONLY_EXCLUDE_TOOLS,
   WORKER_EXTENSION_PATH,
+  extractTitleFromPrompt,
   resolvePiBinary,
+  sanitizeTaskTitle,
 } from "../plugins/pi-worker/src/runner.ts";
 import { TaskStore } from "../plugins/pi-worker/src/store.ts";
 
@@ -44,6 +48,7 @@ const record = {
     PI_SUBAGENT_CHILD: process.env.PI_SUBAGENT_CHILD ?? null,
     PI_WORKER_DEPTH: process.env.PI_WORKER_DEPTH ?? null,
     PI_WORKER_OUTCOME_FILE: process.env.PI_WORKER_OUTCOME_FILE ?? null,
+    PI_WORKER_STEER_FILE: process.env.PI_WORKER_STEER_FILE ?? null,
     PI_SESSION_OWNER_ID: process.env.PI_SESSION_OWNER_ID ?? null,
     PI_WORKER_AGY: process.env.PI_WORKER_AGY ?? null,
   },
@@ -52,7 +57,45 @@ appendFileSync(${JSON.stringify(recordFile)}, JSON.stringify(record) + "\\n", "u
 
 const mode = process.env.FAKE_PI_SCENARIO || "two-round";
 
-if (mode === "sleep") {
+if (mode === "steer-e2e") {
+  // 模拟长工具执行中消费 steer 队列：轮到 steer 后 echo 其正文并写 done 终态
+  process.stdout.write(JSON.stringify({ type: "tool_execution_start", toolCallId: "s-1", toolName: "bash", args: { command: "long build" } }) + "\\n");
+  const steerFile = process.env.PI_WORKER_STEER_FILE;
+  const deadline = Date.now() + 15000;
+  const timer = setInterval(() => {
+    let entries = [];
+    try {
+      entries = readFileSync(steerFile, "utf8").trim().split("\\n").filter(Boolean).map((l) => JSON.parse(l));
+    } catch { /* 队列尚未创建 */ }
+    if (entries.length > 0) {
+      clearInterval(timer);
+      const msg = entries[0].message;
+      process.stdout.write(JSON.stringify({ type: "queue_update", steering: [msg], followUp: [] }) + "\\n");
+      process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "user", content: [{ type: "text", text: msg }] } }) + "\\n");
+      process.stdout.write(JSON.stringify({ type: "tool_execution_end", toolCallId: "s-1", toolName: "bash", isError: false }) + "\\n");
+      process.stdout.write(JSON.stringify({ type: "turn_end" }) + "\\n");
+      process.stdout.write(JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "已按插话执行: " + msg }] },
+      }) + "\\n");
+      writeFileSync(process.env.PI_WORKER_OUTCOME_FILE, JSON.stringify({
+        status: "done",
+        summary: "已按插话执行: " + msg,
+        question: null,
+        options: [],
+        verifiedCommands: [],
+        stopReason: null,
+        error: null,
+      }), { mode: 0o600 });
+      process.exit(0);
+    }
+    if (Date.now() > deadline) {
+      clearInterval(timer);
+      process.stderr.write("steer-e2e timeout: no steer entry consumed\\n");
+      process.exit(2);
+    }
+  }, 50);
+} else if (mode === "sleep") {
   process.stdout.write("[startup] noisy line\\n");
   process.stdout.write(JSON.stringify({ type: "tool_execution_start", toolName: "bash" }) + "\\n");
   setInterval(() => {}, 1000);
@@ -752,6 +795,241 @@ test("test_tier_resolution_reply_switch_and_readonly_concurrency", async () => {
     assert.equal(ro1.status, "running");
     assert.equal(ro2.status, "running");
     await sleepRunner.shutdown();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_title_sanitization_and_prompt_first_line_extraction", () => {
+  assert.equal(MAX_TITLE_CHARS, 48);
+  // 清洗：去首尾空白、合并换行/连续空白
+  assert.equal(sanitizeTaskTitle("  修复\n  登录   崩溃  "), "修复 登录 崩溃");
+  assert.equal(sanitizeTaskTitle("   "), undefined);
+  assert.equal(sanitizeTaskTitle(42), undefined);
+  assert.equal(sanitizeTaskTitle(undefined), undefined);
+  // 截断到 48 字 + 省略号
+  assert.equal(sanitizeTaskTitle("字".repeat(60)), `${"字".repeat(48)}…`);
+  assert.equal(sanitizeTaskTitle("字".repeat(48)), "字".repeat(48));
+
+  // prompt 首条有意义行：剥离 Markdown/列表/编号/引用/常见任务前缀，跳过分隔线
+  assert.equal(extractTitleFromPrompt("\n---\n# 任务目标：修复监控面板\n\n细节"), "修复监控面板");
+  assert.equal(extractTitleFromPrompt("- 只读调研：分析崩溃根因"), "分析崩溃根因");
+  assert.equal(extractTitleFromPrompt("1. 第一条有意义行\nsecond"), "第一条有意义行");
+  assert.equal(extractTitleFromPrompt("> 引用行内容"), "引用行内容");
+  assert.equal(extractTitleFromPrompt("```\n---\n"), undefined);
+  assert.equal(extractTitleFromPrompt(""), undefined);
+  assert.equal(extractTitleFromPrompt("任务目标："), undefined);
+  assert.equal(extractTitleFromPrompt(`# ${"长".repeat(60)}`), `${"长".repeat(48)}…`);
+});
+
+test("test_start_persists_explicit_title_and_auto_extracted_title_and_parent_session_title", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-run-title-"));
+  try {
+    const stateDir = join(dir, "state");
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const recordFile = join(dir, "invocations.jsonl");
+    const fakePi = createFakePi(dir, recordFile);
+    const store = new TaskStore(stateDir);
+    const runner = new PiWorkerRunner({
+      store,
+      piBinary: fakePi,
+      env: cleanEnv({ FAKE_PI_SCENARIO: "two-round" }),
+    });
+
+    // 显式 title 优先，且与 parentSessionTitle 一并清洗落盘
+    const explicit = await runner.start({
+      cwd: workDir,
+      prompt: "# 任务目标：不应被用作标题\n其余说明",
+      title: "  显式\n 标题 ",
+      parentSessionId: "conv-title",
+      parentSessionTitle: " 父会话\n标题 ",
+      waitSeconds: 5,
+    });
+    assert.equal(explicit.title, "显式 标题");
+    assert.equal(explicit.parentSessionTitle, "父会话 标题");
+    const loaded = store.load(explicit.taskId);
+    assert.equal(loaded.title, "显式 标题");
+    assert.equal(loaded.parentSessionTitle, "父会话 标题");
+
+    // reply 续跑保留标题字段
+    const resumed = await runner.reply({ taskId: explicit.taskId, reply: "@confirm 继续", waitSeconds: 5 });
+    assert.equal(resumed.status, "done");
+    assert.equal(resumed.title, "显式 标题");
+    assert.equal(resumed.parentSessionTitle, "父会话 标题");
+
+    // 未显式传 title：自动从 prompt 首条有意义行提取；未传 parentSessionTitle 则不落盘
+    const auto = await runner.start({
+      cwd: workDir,
+      prompt: "\n---\n任务目标：自动提取标题\n后续细节",
+      parentSessionId: "conv-title",
+      waitSeconds: 5,
+    });
+    assert.equal(auto.title, "自动提取标题");
+    assert.equal(auto.parentSessionTitle, undefined);
+    assert.equal("parentSessionTitle" in store.load(auto.taskId), false);
+
+    // list 摘要携带 title
+    const summary = store.list({ parentSessionId: "conv-title" }).find((t) => t.taskId === auto.taskId);
+    assert.equal(summary.title, "自动提取标题");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_steer_queues_entry_writes_event_and_fake_pi_consumes_end_to_end", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-steer-e2e-"));
+  try {
+    const stateDir = join(dir, "state");
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const recordFile = join(dir, "invocations.jsonl");
+    const fakePi = createFakePi(dir, recordFile);
+    const store = new TaskStore(stateDir);
+    const progressEvents = [];
+    const runner = new PiWorkerRunner({
+      store,
+      piBinary: fakePi,
+      env: cleanEnv({ FAKE_PI_SCENARIO: "steer-e2e" }),
+    });
+
+    const started = await runner.start({
+      cwd: workDir,
+      prompt: "long job",
+      waitSeconds: 0,
+      onProgress: (ev) => progressEvents.push(ev),
+    });
+    assert.equal(started.status, "running");
+    assert.equal(started.steerPath, join(stateDir, "steers", `${started.taskId}.jsonl`));
+
+    const res = await runner.steer({ taskId: started.taskId, message: "改用方案 B 并补测试", source: "agent" });
+    assert.equal(res.queued, true);
+    assert.equal(res.status, "running");
+    assert.equal(res.taskId, started.taskId);
+    assert.equal(res.message, "改用方案 B 并补测试");
+    assert.equal(res.source, "agent");
+    assert.ok(res.steerId);
+    assert.ok(res.queuedAt);
+
+    // 磁盘队列条目与入队回执一致
+    const entries = readSteerEntries(started.steerPath);
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].id, res.steerId);
+    assert.equal(entries[0].message, "改用方案 B 并补测试");
+    assert.equal(entries[0].source, "agent");
+
+    // eventsPath 立即出现统一格式的 steer 事件，且进程内 onProgress 同步收到
+    const delta = readFormattedEventsDelta(started.eventsPath, 0);
+    const steerEvents = delta.events.filter((ev) => ev.kind === "steer");
+    assert.equal(steerEvents.length, 1);
+    assert.match(steerEvents[0].title, /主代理/);
+    assert.equal(steerEvents[0].detail, "改用方案 B 并补测试");
+    assert.ok(progressEvents.some((ev) => ev.kind === "steer" && ev.detail === "改用方案 B 并补测试"));
+
+    // 假 Pi 消费 steer 后继续执行并正常结束（端到端注入闭环）
+    const final = await runner.status({ taskId: started.taskId, waitSeconds: 15 });
+    assert.equal(final.status, "done");
+    assert.match(final.summary ?? "", /已按插话执行: 改用方案 B 并补测试/);
+
+    // 子进程 env 收到 PI_WORKER_STEER_FILE；queue_update 等未知事件不产生乱码条目
+    const records = readFileSync(recordFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(records[0].env.PI_WORKER_STEER_FILE, started.steerPath);
+    const allEvents = readFormattedEventsDelta(started.eventsPath, 0, { maxEvents: 500 }).events;
+    assert.equal(allEvents.some((ev) => ev.kind === "other"), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_steer_rejects_non_running_and_invalid_input_and_supports_cross_process", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-steer-guard-"));
+  try {
+    const stateDir = join(dir, "state");
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const fakePi = createFakePi(dir, join(dir, "invocations.jsonl"));
+
+    // 参数校验
+    const runner = new PiWorkerRunner({
+      store: new TaskStore(stateDir),
+      piBinary: fakePi,
+      env: cleanEnv({ FAKE_PI_SCENARIO: "sleep" }),
+    });
+    await assert.rejects(() => runner.steer({ taskId: "  ", message: "x" }), /taskId 不能为空/);
+    await assert.rejects(() => runner.steer({ taskId: "some-task", message: "   " }), /message 不能为空/);
+
+    // 跨进程：runner1 启动 detached 长睡任务，runner2（无内存 active 表）steer 成功入队
+    const runner1 = new PiWorkerRunner({
+      store: new TaskStore(stateDir),
+      piBinary: fakePi,
+      env: cleanEnv({ FAKE_PI_SCENARIO: "sleep" }),
+    });
+    const started = await runner1.start({ cwd: workDir, prompt: "sleep", waitSeconds: 0 });
+    assert.equal(started.status, "running");
+
+    const runner2 = new PiWorkerRunner({
+      store: new TaskStore(stateDir),
+      piBinary: fakePi,
+      env: cleanEnv({ FAKE_PI_SCENARIO: "sleep" }),
+    });
+    const res = await runner2.steer({ taskId: started.taskId, message: "面板纠偏", source: "app" });
+    assert.equal(res.queued, true);
+    assert.equal(res.source, "app");
+    const entries = readSteerEntries(started.steerPath);
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].source, "app");
+    const delta = readFormattedEventsDelta(started.eventsPath, 0, { maxEvents: 500 });
+    const steerEv = delta.events.find((ev) => ev.kind === "steer");
+    assert.ok(steerEv);
+    assert.match(steerEv.title, /面板/);
+
+    await runner1.shutdown();
+
+    // 非运行态（cancelled）拒绝 steer 并引导 pi_worker_reply
+    await assert.rejects(
+      () => runner2.steer({ taskId: started.taskId, message: "迟到插话" }),
+      /非运行中无法实时插话.*pi_worker_reply/s,
+    );
+
+    // needs_input 同样拒绝
+    const twoRunner = new PiWorkerRunner({
+      store: new TaskStore(join(dir, "state-two")),
+      piBinary: fakePi,
+      env: cleanEnv({ FAKE_PI_SCENARIO: "two-round" }),
+    });
+    const pending = await twoRunner.start({ cwd: workDir, prompt: "go", waitSeconds: 5 });
+    assert.equal(pending.status, "needs_input");
+    await assert.rejects(
+      () => twoRunner.steer({ taskId: pending.taskId, message: "插话" }),
+      /needs_input.*pi_worker_reply/s,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_launch_round_clears_stale_steer_queue_before_reply", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-steer-clean-"));
+  try {
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const fakePi = createFakePi(dir, join(dir, "invocations.jsonl"));
+    const runner = new PiWorkerRunner({
+      store: new TaskStore(join(dir, "state")),
+      piBinary: fakePi,
+      env: cleanEnv({ FAKE_PI_SCENARIO: "two-round" }),
+    });
+
+    const first = await runner.start({ cwd: workDir, prompt: "go", waitSeconds: 5 });
+    assert.equal(first.status, "needs_input");
+
+    // 上一轮残留的失效 steer：reply 启动前必须被清理，不得误触发新一轮
+    appendSteerEntry(first.steerPath, { id: "stale", message: "过期插话", createdAt: "old" });
+    assert.equal(readSteerEntries(first.steerPath).length, 1);
+
+    const second = await runner.reply({ taskId: first.taskId, reply: "A", waitSeconds: 5 });
+    assert.equal(second.status, "done");
+    assert.deepEqual(readSteerEntries(first.steerPath), []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

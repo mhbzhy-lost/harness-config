@@ -9,6 +9,21 @@ import { z } from "zod";
 import { parseGitStatusFileUri } from "./git-uri.ts";
 import { createCoalescingRunner } from "./poller.ts";
 import {
+  EMPTY_SCOPE,
+  INITIAL_FALLBACK_MS,
+  buildSnapshotScopeArgs,
+  fallbackGroupTasks,
+  formatGroupLabel,
+  formatSessionBadge,
+  formatTaskOptionLabel,
+  isSessionLocked,
+  parseToolInputScope,
+  resolvePollDelayMs,
+  resolveScopeMode,
+  shortDir,
+} from "./scope.ts";
+import type { MonitorScope, ScopeGroupLike, ScopeMode, ScopeTaskLike } from "./scope.ts";
+import {
   iconForEvent,
   isExpandableDetail,
   reduceTimelineItems,
@@ -16,33 +31,12 @@ import {
 } from "./timeline.ts";
 import type { TimelineEventLike, TimelineItem } from "./timeline.ts";
 
-interface TaskSummary {
-  taskId: string;
-  cwd: string;
-  parentSessionId?: string;
-  status: string;
-  roundCount: number;
-  turnCount: number;
-  lastTool: string | null;
-  updatedAt: string;
-  lastActivityAt: string;
-}
+interface TaskSummary extends ScopeTaskLike {}
 
-interface TaskSessionGroup {
-  groupKey: string;
-  parentSessionId: string | null;
-  cwd: string;
-  runningCount: number;
-  latestActivityAt: string;
-  tasks: TaskSummary[];
-}
-
-interface MonitorScope {
-  parentSessionId: string | null;
-  cwd: string | null;
-}
+type TaskSessionGroup = ScopeGroupLike;
 
 interface TaskRecord extends TaskSummary {
+  lastTool: string | null;
   tier?: string;
   readOnly?: boolean;
   model?: string;
@@ -74,8 +68,6 @@ interface MonitorPayload {
   stream?: EventsDeltaResult | null;
 }
 
-type ScopeMode = "session" | "cwd" | "all";
-
 const ToggleAuxPaneResultSchema = z.object({
   isError: z.boolean().optional(),
 }).passthrough();
@@ -88,41 +80,6 @@ const STREAMDOWN_CONTROLS = {
 } as const;
 
 const LINK_SAFETY = { enabled: false } as const;
-
-function shortDir(cwd: string): string {
-  const parts = cwd.replace(/\/+$/, "").split("/");
-  return parts[parts.length - 1] || cwd;
-}
-
-function formatGroupLabel(group: TaskSessionGroup): string {
-  const dir = shortDir(group.cwd);
-  const sess = group.parentSessionId
-    ? `会话 ${group.parentSessionId.slice(0, 8)}`
-    : "未标记会话";
-  const running = group.runningCount > 0 ? ` · ${group.runningCount} 运行中` : "";
-  return `${dir} · ${sess} (${group.tasks.length}${running})`;
-}
-
-function fallbackGroupTasks(list: TaskSummary[]): TaskSessionGroup[] {
-  const map = new Map<string, TaskSessionGroup>();
-  for (const t of list) {
-    const pid = t.parentSessionId?.trim() || null;
-    const key = pid ? `session:${pid}` : `cwd:${t.cwd}`;
-    const activity = t.lastActivityAt || t.updatedAt;
-    let grp = map.get(key);
-    if (!grp) {
-      grp = { groupKey: key, parentSessionId: pid, cwd: t.cwd, runningCount: 0, latestActivityAt: activity, tasks: [] };
-      map.set(key, grp);
-    }
-    grp.tasks.push(t);
-    if (t.status === "running") grp.runningCount += 1;
-    if (activity.localeCompare(grp.latestActivityAt) > 0) {
-      grp.latestActivityAt = activity;
-      grp.cwd = t.cwd;
-    }
-  }
-  return [...map.values()];
-}
 
 function fmtTime(iso?: string): string {
   return iso && iso.length >= 19 ? iso.slice(11, 19) : iso || "";
@@ -391,7 +348,7 @@ function GenericEventRow({
 function MonitorApp() {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [groups, setGroups] = useState<TaskSessionGroup[]>([]);
-  const [initialScope, setInitialScope] = useState<MonitorScope>({ parentSessionId: null, cwd: null });
+  const [initialScope, setInitialScope] = useState<MonitorScope>(EMPTY_SCOPE);
   const [scopeMode, setScopeMode] = useState<ScopeMode>("all");
   const [selectedGroupKey, setSelectedGroupKey] = useState<string | null>(null);
   const [currentTask, setCurrentTask] = useState<TaskRecord | null>(null);
@@ -399,15 +356,21 @@ function MonitorApp() {
   const [events, setEvents] = useState<TimelineEventLike[]>([]);
   const [loadingInitial, setLoadingInitial] = useState(true);
   const [cancelling, setCancelling] = useState(false);
+  const [steerText, setSteerText] = useState("");
+  const [steerSending, setSteerSending] = useState(false);
+  const [steerNotice, setSteerNotice] = useState<string | null>(null);
+  const [steerError, setSteerError] = useState<string | null>(null);
 
   const appRef = useRef<McpApp | null>(null);
   const offsetRef = useRef(0);
   const selectedTaskIdRef = useRef<string | null>(null);
   const currentTaskIdRef = useRef<string | null>(null);
-  const initialScopeRef = useRef<MonitorScope>({ parentSessionId: null, cwd: null });
+  const initialScopeRef = useRef<MonitorScope>(EMPTY_SCOPE);
   const scopeModeRef = useRef<ScopeMode>("all");
   const requestEpochRef = useRef(0);
   const pollTimerRef = useRef<number | null>(null);
+  const receivedToolEventRef = useRef(false);
+  const fallbackTimerRef = useRef<number | null>(null);
 
   const { scrollRef, contentRef, isAtBottom, scrollToBottom } = useStickToBottom({
     resize: "instant",
@@ -418,6 +381,13 @@ function MonitorApp() {
     if (pollTimerRef.current !== null) {
       window.clearTimeout(pollTimerRef.current);
       pollTimerRef.current = null;
+    }
+  }, []);
+
+  const clearFallback = useCallback(() => {
+    if (fallbackTimerRef.current !== null) {
+      window.clearTimeout(fallbackTimerRef.current);
+      fallbackTimerRef.current = null;
     }
   }, []);
 
@@ -433,12 +403,7 @@ function MonitorApp() {
     const mode = scopeModeRef.current;
     const scope = initialScopeRef.current;
 
-    const filterArgs: Record<string, unknown> = {};
-    if (mode === "session" && scope.parentSessionId) {
-      filterArgs.parentSessionId = scope.parentSessionId;
-    } else if (mode === "cwd" && scope.cwd) {
-      filterArgs.cwd = scope.cwd;
-    }
+    const filterArgs = buildSnapshotScopeArgs(mode, scope);
 
     try {
       const res = await mcpApp.callServerTool({
@@ -472,17 +437,12 @@ function MonitorApp() {
 
   schedulePollRef.current = (hasMore: boolean, nextTask: TaskRecord | null, nextTasks: TaskSummary[]) => {
     clearPoll();
-    const status = nextTask?.status;
-    let delayMs: number | null = null;
-    if (hasMore) {
-      delayMs = 80;
-    } else if (status === "running") {
-      delayMs = 500;
-    } else if (status === "needs_input") {
-      delayMs = 3000;
-    } else if (!nextTask && nextTasks.some((t) => t.status === "running")) {
-      delayMs = 1500;
-    }
+    const delayMs = resolvePollDelayMs({
+      hasMore,
+      taskStatus: nextTask?.status ?? null,
+      tasks: nextTasks,
+      sessionLocked: isSessionLocked(initialScopeRef.current),
+    });
     if (delayMs !== null) {
       pollTimerRef.current = window.setTimeout(() => {
         void pollSnapshot(false);
@@ -493,17 +453,18 @@ function MonitorApp() {
   applyPayloadRef.current = (payload: MonitorPayload, resetStream: boolean, fromToolResult = false): boolean => {
     setLoadingInitial(false);
     if (fromToolResult && payload.scope) {
+      const prevScope = initialScopeRef.current;
+      const incomingPid = payload.scope.parentSessionId ?? null;
       const nextScope: MonitorScope = {
-        parentSessionId: payload.scope.parentSessionId ?? null,
+        parentSessionId: incomingPid,
+        // 服务端未解析出标题时，保留 ontoolinput 已锁定的同会话标题
+        parentSessionTitle: payload.scope.parentSessionTitle
+          ?? (prevScope.parentSessionId === incomingPid ? prevScope.parentSessionTitle : null),
         cwd: payload.scope.cwd ?? null,
       };
       initialScopeRef.current = nextScope;
       setInitialScope(nextScope);
-      const nextMode: ScopeMode = nextScope.parentSessionId
-        ? "session"
-        : nextScope.cwd
-          ? "cwd"
-          : "all";
+      const nextMode = resolveScopeMode(nextScope);
       scopeModeRef.current = nextMode;
       setScopeMode(nextMode);
       setSelectedGroupKey(null);
@@ -557,12 +518,34 @@ function MonitorApp() {
     capabilities: {},
     onAppCreated: (createdApp) => {
       appRef.current = createdApp;
-      createdApp.ontoolinput = () => {
+      createdApp.ontoolinput = (params) => {
+        // 首屏竞态修复：立即解析工具入参并锁定作用域，取消无作用域兜底快照
+        receivedToolEventRef.current = true;
+        clearFallback();
+        const parsed = parseToolInputScope(params);
+        if (parsed.scope.parentSessionId || parsed.scope.cwd) {
+          initialScopeRef.current = parsed.scope;
+          setInitialScope(parsed.scope);
+          const nextMode = resolveScopeMode(parsed.scope);
+          scopeModeRef.current = nextMode;
+          setScopeMode(nextMode);
+          setSelectedGroupKey(null);
+        }
+        if (parsed.taskId) {
+          selectedTaskIdRef.current = parsed.taskId;
+          setSelectedTaskId(parsed.taskId);
+        }
         if (!currentTaskIdRef.current) {
           setLoadingInitial(true);
         }
+        requestEpochRef.current += 1;
+        offsetRef.current = 0;
+        clearPoll();
+        void pollSnapshot(true);
       };
       createdApp.ontoolresult = (result) => {
+        receivedToolEventRef.current = true;
+        clearFallback();
         const sc = (result as { structuredContent?: MonitorPayload } | undefined)?.structuredContent;
         if (!sc) return;
         requestEpochRef.current += 1;
@@ -580,11 +563,21 @@ function MonitorApp() {
 
   useEffect(() => {
     if (!isConnected) return;
-    if (!currentTaskIdRef.current) {
-      void pollSnapshot(true);
+    // 不再在连接瞬间盲发无作用域快照：等待 ontoolinput/ontoolresult，
+    // 仅在短兜底窗口内两者均未到达时才发一次兜底快照。
+    if (!receivedToolEventRef.current && !currentTaskIdRef.current) {
+      fallbackTimerRef.current = window.setTimeout(() => {
+        fallbackTimerRef.current = null;
+        if (!receivedToolEventRef.current && !currentTaskIdRef.current) {
+          void pollSnapshot(true);
+        }
+      }, INITIAL_FALLBACK_MS);
     }
-    return () => clearPoll();
-  }, [isConnected, pollSnapshot, clearPoll]);
+    return () => {
+      clearPoll();
+      clearFallback();
+    };
+  }, [isConnected, pollSnapshot, clearPoll, clearFallback]);
 
   const switchTask = useCallback((nextId: string | null) => {
     if (nextId === selectedTaskIdRef.current) return;
@@ -597,12 +590,20 @@ function MonitorApp() {
     void pollSnapshot(true);
   }, [clearPoll, pollSnapshot]);
 
+  // 切换任务时清空未提交的插话提示/错误状态（自动聚焦切换同样生效）
+  useEffect(() => {
+    setSteerNotice(null);
+    setSteerError(null);
+  }, [selectedTaskId]);
+
   const handleSelectChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
     switchTask(e.target.value || null);
   }, [switchTask]);
 
   const handleScopeModeChange = useCallback((nextMode: ScopeMode) => {
     if (nextMode === scopeModeRef.current) return;
+    // 严格会话锁定：禁止切到跨会话视图（全局查看走左侧栏 global 入口）
+    if (isSessionLocked(initialScopeRef.current) && nextMode !== "session") return;
     scopeModeRef.current = nextMode;
     setScopeMode(nextMode);
     setSelectedGroupKey(null);
@@ -643,6 +644,40 @@ function MonitorApp() {
     }
   }, [currentTask, pollSnapshot]);
 
+  const handleSendSteer = useCallback(async () => {
+    const mcpApp = appRef.current;
+    const text = steerText.trim();
+    if (!mcpApp || !currentTask || !text || steerSending) return;
+    setSteerSending(true);
+    setSteerNotice(null);
+    setSteerError(null);
+    try {
+      const res = await mcpApp.callServerTool({
+        name: "pi_worker_app_steer",
+        arguments: { taskId: currentTask.taskId, message: text },
+      });
+      const r = res as { isError?: boolean; structuredContent?: { error?: string } } | undefined;
+      if (r?.isError) {
+        setSteerError(r.structuredContent?.error ?? "插话失败，请重试");
+      } else {
+        setSteerText("");
+        setSteerNotice("已入队，将在当前 turn 结束后注入");
+        void pollSnapshot(false);
+      }
+    } catch (err) {
+      setSteerError(err instanceof Error ? err.message : "插话失败，请重试");
+    } finally {
+      setSteerSending(false);
+    }
+  }, [steerText, steerSending, currentTask, pollSnapshot]);
+
+  const handleSteerKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+      e.preventDefault();
+      void handleSendSteer();
+    }
+  }, [handleSendSteer]);
+
   const handleOpenFile = useCallback(async (uri: string) => {
     const mcpApp = appRef.current;
     if (!mcpApp) return;
@@ -677,7 +712,8 @@ function MonitorApp() {
   }, [groups, tasks, selectedGroupKey]);
 
   const hasInitialScope = Boolean(initialScope.parentSessionId || initialScope.cwd);
-  const showGroupBar = hasInitialScope || groups.length > 1;
+  const sessionLocked = isSessionLocked(initialScope);
+  const showGroupBar = sessionLocked || hasInitialScope || groups.length > 1;
 
   const isRunning = currentTask?.status === "running";
   const timelineItems = useMemo(
@@ -705,14 +741,24 @@ function MonitorApp() {
           value={selectedTaskId ?? ""}
           onChange={handleSelectChange}
         >
-          {visibleGroups.length === 0 ? (
+          {sessionLocked ? (
+            tasks.length === 0 ? (
+              <option value="">暂无任务</option>
+            ) : (
+              tasks.map((t) => (
+                <option key={t.taskId} value={t.taskId}>
+                  {formatTaskOptionLabel(t)}
+                </option>
+              ))
+            )
+          ) : visibleGroups.length === 0 ? (
             <option value="">暂无任务</option>
           ) : (
             visibleGroups.map((grp) => (
               <optgroup key={grp.groupKey} label={formatGroupLabel(grp)}>
                 {grp.tasks.map((t) => (
                   <option key={t.taskId} value={t.taskId}>
-                    [{t.status}] {shortDir(t.cwd)} · R{t.roundCount} T{t.turnCount} ({t.taskId.slice(0, 8)})
+                    {formatTaskOptionLabel(t)}
                   </option>
                 ))}
               </optgroup>
@@ -735,7 +781,14 @@ function MonitorApp() {
 
       {showGroupBar && (
         <div className="scopebar" role="toolbar" aria-label="父会话与项目分组">
-          {hasInitialScope ? (
+          {sessionLocked ? (
+            <span
+              className="scope-pill active scope-locked"
+              title={initialScope.parentSessionId ?? undefined}
+            >
+              🔒 当前会话 · {formatSessionBadge(initialScope.parentSessionId ?? "", initialScope.parentSessionTitle)} ({tasks.length})
+            </span>
+          ) : hasInitialScope ? (
             <>
               {initialScope.parentSessionId && (
                 <button
@@ -744,7 +797,7 @@ function MonitorApp() {
                   onClick={() => handleScopeModeChange("session")}
                   title={initialScope.parentSessionId}
                 >
-                  当前会话 ({initialScope.parentSessionId.slice(0, 8)})
+                  当前会话 · {formatSessionBadge(initialScope.parentSessionId, initialScope.parentSessionTitle)}
                 </button>
               )}
               {initialScope.cwd && (
@@ -815,6 +868,9 @@ function MonitorApp() {
             ) : (
               <>
                 <div className="card">
+                  {currentTask.title && (
+                    <div className="task-title">{currentTask.title}</div>
+                  )}
                   <div className="meta-row">
                     <span className={`badge badge-${currentTask.status}`}>
                       {isRunning && <span className="dot-pulse" />}
@@ -824,7 +880,7 @@ function MonitorApp() {
                     {currentTask.readOnly && <span className="tag">read-only</span>}
                     {currentTask.parentSessionId && (
                       <span className="tag" title={currentTask.parentSessionId}>
-                        会话 {currentTask.parentSessionId.slice(0, 8)}
+                        {formatSessionBadge(currentTask.parentSessionId, currentTask.parentSessionTitle)}
                       </span>
                     )}
                     <span>Round {currentTask.roundCount} · Turn {currentTask.turnCount}</span>
@@ -935,10 +991,39 @@ function MonitorApp() {
           <button
             type="button"
             className="scroll-bottom-btn"
+            style={isRunning ? { bottom: 88 } : undefined}
             onClick={() => void scrollToBottom()}
           >
             ↓ 回到底部
           </button>
+        )}
+
+        {isRunning && currentTask && (
+          <div className="steer-bar">
+            <div className="steer-row">
+              <textarea
+                id="steer-input"
+                className="steer-input"
+                rows={1}
+                placeholder="实时插话运行中的任务…（Enter 发送，Shift+Enter 换行）"
+                value={steerText}
+                disabled={steerSending}
+                onChange={(e) => setSteerText(e.target.value)}
+                onKeyDown={handleSteerKeyDown}
+              />
+              <button
+                id="btn-steer"
+                className="btn btn-steer"
+                type="button"
+                disabled={steerSending || !steerText.trim()}
+                onClick={() => void handleSendSteer()}
+              >
+                {steerSending ? "发送中…" : "🧭 插话"}
+              </button>
+            </div>
+            {steerNotice && <div className="steer-hint steer-ok">{steerNotice}</div>}
+            {steerError && <div className="steer-hint steer-err">{steerError}</div>}
+          </div>
         )}
       </div>
     </div>

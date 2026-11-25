@@ -60,6 +60,14 @@ const BASE_TOOLS: ToolDefinition[] = [
           type: "string",
           description: "可选：父会话标识（如宿主会话/对话 ID），用于跨 Harness 按父会话归组与隔离查询（缺省时回退 PI_WORKER_PARENT_SESSION_ID 环境变量）",
         },
+        title: {
+          type: "string",
+          description: "可选：任务简短可读标题（建议传入；未传时自动从 prompt 首条有意义文本行提取，清洗并截断到 48 字）",
+        },
+        parentSessionTitle: {
+          type: "string",
+          description: "可选：父会话可读标题（用于监控面板会话归属展示；清洗并截断到 48 字）",
+        },
         tier: {
           type: "string",
           enum: ["fast", "default", "heavy"],
@@ -125,6 +133,20 @@ const BASE_TOOLS: ToolDefinition[] = [
     },
   },
   {
+    name: "pi_worker_steer",
+    description:
+      "向运行中（status=running）的任务实时插话纠偏：同步入队立即返回（非阻塞），消息在当前 turn 工具执行完、下一次 LLM 请求前注入运行中的 worker，不打断当前工具执行；支持跨进程 steer 其他 MCP server 启动的 detached 任务。仅限运行中任务；非运行态（needs_input/done/blocked/failed/cancelled）请改用 pi_worker_reply 续跑。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "目标任务 UUID（必须处于 running 状态）" },
+        message: { type: "string", description: "插话内容：纠偏、补充约束或调整方向的明确指示" },
+      },
+      required: ["taskId", "message"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "pi_worker_status",
     description:
       "查询任务实时进度（turnCount/lastTool/recentEvents）、挂起提问（question/options）或终态结果（summary、机器提取的 executedCommands、eventsPath 磁盘轨迹与 gitChanges）；可传 waitSeconds（0–30）短等状态变化。",
@@ -185,8 +207,9 @@ const AGY_APP_TOOLS: ToolDefinition[] = [
       type: "object",
       properties: {
         taskId: { type: "string", description: "可选：默认聚焦的任务 UUID；省略时自动选中当前作用域内最新运行中或最近任务" },
-        parentSessionId: { type: "string", description: "可选：按父会话标识过滤默认作用域" },
-        cwd: { type: "string", description: "可选：按工作区绝对路径过滤默认作用域" },
+        parentSessionId: { type: "string", description: "可选：按父会话标识过滤默认作用域（传入时仅按会话过滤，不叠加 cwd，避免漏掉同会话跨 worktree 任务）" },
+        parentSessionTitle: { type: "string", description: "可选：父会话可读标题，用于侧面板锁定标识与会话归属展示" },
+        cwd: { type: "string", description: "可选：按工作区绝对路径过滤默认作用域（仅在未传 parentSessionId 时生效）" },
       },
       additionalProperties: false,
     },
@@ -207,10 +230,11 @@ const AGY_APP_TOOLS: ToolDefinition[] = [
       type: "object",
       properties: {
         taskId: { type: "string", description: "可选：目标任务 UUID" },
-        parentSessionId: { type: "string", description: "可选：按父会话标识过滤" },
-        cwd: { type: "string", description: "可选：按工作区绝对路径过滤" },
+        parentSessionId: { type: "string", description: "可选：按父会话标识过滤（传入时仅按会话过滤，不叠加 cwd）" },
+        parentSessionTitle: { type: "string", description: "可选：父会话可读标题，随 scope 原样回传供面板展示" },
+        cwd: { type: "string", description: "可选：按工作区绝对路径过滤（仅在未传 parentSessionId 时生效）" },
         offset: { type: "integer", minimum: 0, description: "可选：events.jsonl 增量字节偏移" },
-        tasksLimit: { type: "integer", minimum: 1, maximum: 100, description: "可选：任务列表条数上限（默认 20）" },
+        tasksLimit: { type: "integer", minimum: 1, maximum: 100, description: "可选：任务列表条数上限（默认 50）" },
         maxEvents: { type: "integer", minimum: 1, maximum: 200, description: "可选：单次增量事件条数上限（默认 100）" },
       },
       additionalProperties: false,
@@ -234,6 +258,22 @@ const AGY_APP_TOOLS: ToolDefinition[] = [
       ui: { visibility: ["app"] },
     },
   },
+  {
+    name: "pi_worker_app_steer",
+    description: "供 Pi Worker MCP App 侧面板向运行中任务实时插话（同步入队立即返回，当前 turn 结束后注入）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "目标任务 UUID（必须处于 running 状态）" },
+        message: { type: "string", description: "插话内容" },
+      },
+      required: ["taskId", "message"],
+      additionalProperties: false,
+    },
+    _meta: {
+      ui: { visibility: ["app"] },
+    },
+  },
 ];
 
 const ACTIVE_TOOLS: ToolDefinition[] = agyMode ? [...BASE_TOOLS, ...AGY_APP_TOOLS] : BASE_TOOLS;
@@ -242,6 +282,7 @@ const TOOL_NAME_SET = new Set(ACTIVE_TOOLS.map((t) => t.name));
 const BASE_INSTRUCTIONS = [
   "磁盘证据核验（跨 Harness 通用，严禁只信自述）：任务返回中的 summary 与 verifiedCommands 仅为 Pi 自述，不得直接当已验证事实转述。整合回复前必须对照机器提取的 executedCommands（真实命令、isError、startSeq/endSeq）、eventsPath（未截断 tool_start/tool_end 磁盘日志）、gitChanges/git diff 及引用 file:line 源码做交叉核验。",
   "当任务返回 status=needs_input 时，优先依据主会话已有上下文通过 pi_worker_reply 秒答续跑（命中前缀缓存），拍不了板再转问用户。",
+  "运行中任务需要主动纠偏或补充约束时，用 pi_worker_steer(taskId, message) 实时插话（同步入队立即返回，当前 turn 工具执行完、下一次 LLM 请求前注入）；仅限 running 任务，非运行态改用 pi_worker_reply 续跑。",
   "探索、验证与独立审查优先使用 readOnly=true（可同工作区并发）；读写任务运行期间主会话不得同时修改同一工作区文件；严禁在 Pi 会话内部自嵌套调用。",
 ];
 
@@ -250,6 +291,7 @@ const INSTRUCTIONS = (
     ? [
         ...BASE_INSTRUCTIONS,
         "当前运行于 Antigravity 原生后台模式：pi_worker_start 与 pi_worker_reply 由宿主作为后台任务异步执行并在本轮结束时自动唤醒主会话，无需循环轮询 pi_worker_status；凡落在主 Agent 职责边界之外的工作应在首轮直接派发 pi_worker_start，需要实时可视化观测进度时可调用 pi_worker_monitor 打开侧面板。",
+        "会话首次派发 pi_worker_start 时，同步顺带调用一次 pi_worker_monitor（同步快速返回）将当前会话侧面板绑定到本会话 parentSessionId；建议为 pi_worker_start 传入简短 title（未传时自动从 prompt 首行提取）。",
       ]
     : BASE_INSTRUCTIONS
 ).join("\n");
@@ -359,26 +401,89 @@ function makeProgressEmitter(progressToken: unknown): ((ev: FormattedStreamEvent
   };
 }
 
+// 会话标题懒补齐（仅 AGY 模式）：进程内内存缓存，任意失败静默 fail-open，绝不阻塞工具调用。
+// 注意：多会话共享同一 MCP server 进程，这里只缓存“会话 ID → 标题”映射，严禁引入进程级 lastScope 状态。
+const conversationTitleCache = new Map<string, string | null>();
+
+async function fetchConversationTitle(parentSessionId: string): Promise<string | null> {
+  if (!agyMode || !parentSessionId) return null;
+  const address = process.env.ANTIGRAVITY_LS_ADDRESS?.trim();
+  const csrfToken = process.env.ANTIGRAVITY_CSRF_TOKEN?.trim();
+  if (!address || !csrfToken) return null;
+  const cached = conversationTitleCache.get(parentSessionId);
+  if (cached !== undefined) return cached;
+  let title: string | null = null;
+  try {
+    const res = await fetch(`http://${address}/product.v1.ConversationService/GetConversation`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Connect-Protocol-Version": "1",
+        "x-antigravity-csrf-token": csrfToken,
+      },
+      body: JSON.stringify({ conversationId: parentSessionId }),
+      signal: AbortSignal.timeout(350),
+    });
+    if (res.ok) {
+      const data = await res.json() as {
+        annotations?: { title?: unknown };
+        state?: { summary?: unknown };
+      };
+      const raw = typeof data?.annotations?.title === "string" && data.annotations.title.trim()
+        ? data.annotations.title
+        : typeof data?.state?.summary === "string"
+          ? data.state.summary
+          : "";
+      const cleaned = raw.replace(/\s+/g, " ").trim();
+      if (cleaned) title = cleaned.length > 48 ? `${cleaned.slice(0, 48)}…` : cleaned;
+    }
+  } catch {
+    // 超时/网络/解析异常一律静默降级
+  }
+  conversationTitleCache.set(parentSessionId, title);
+  return title;
+}
+
+async function backfillSessionTitles(groups: TaskSessionGroup[]): Promise<void> {
+  if (!agyMode) return;
+  await Promise.all(groups.map(async (group) => {
+    if (!group.parentSessionId || group.parentSessionTitle) return;
+    const title = await fetchConversationTitle(group.parentSessionId);
+    if (!title) return;
+    group.parentSessionTitle = title;
+    for (const task of group.tasks) {
+      if (!task.parentSessionTitle) task.parentSessionTitle = title;
+    }
+  }));
+}
+
 async function buildMonitorPayload(opts: {
   taskId?: string;
   parentSessionId?: string;
+  parentSessionTitle?: string;
   cwd?: string;
   offset?: number;
   tasksLimit?: number;
   maxEvents?: number;
 }): Promise<{
-  scope: { parentSessionId: string | null; cwd: string | null };
+  scope: { parentSessionId: string | null; parentSessionTitle: string | null; cwd: string | null };
   tasks: ReturnType<PiWorkerRunner["list"]>;
   groups: TaskSessionGroup[];
   task: TaskRecord | null;
   stream: ReturnType<typeof readFormattedEventsDelta> | null;
 }> {
+  // 会话作用域优先：同时传入 parentSessionId 与 cwd 时仅按会话过滤，
+  // 避免漏掉同会话在 git worktree 等其他目录派发的任务。
   const tasks = runner.list({
-    ...(opts.parentSessionId ? { parentSessionId: opts.parentSessionId } : {}),
-    ...(opts.cwd ? { cwd: opts.cwd } : {}),
+    ...(opts.parentSessionId
+      ? { parentSessionId: opts.parentSessionId }
+      : opts.cwd
+        ? { cwd: opts.cwd }
+        : {}),
     limit: opts.tasksLimit ?? 50,
   });
   const groups = groupTasksByParentSession(tasks);
+  await backfillSessionTitles(groups);
   const targetId = opts.taskId
     ?? groups[0]?.tasks[0]?.taskId
     ?? tasks.find((t) => t.status === "running")?.taskId
@@ -394,9 +499,14 @@ async function buildMonitorPayload(opts: {
   const stream = task
     ? readFormattedEventsDelta(task.eventsPath, opts.offset ?? 0, { maxEvents: opts.maxEvents ?? 100 })
     : null;
+  const scopeTitle = opts.parentSessionTitle
+    ?? groups[0]?.parentSessionTitle
+    ?? (opts.parentSessionId ? await fetchConversationTitle(opts.parentSessionId) : null)
+    ?? null;
   return {
     scope: {
       parentSessionId: opts.parentSessionId ?? null,
+      parentSessionTitle: scopeTitle,
       cwd: opts.cwd ?? null,
     },
     tasks,
@@ -448,6 +558,8 @@ async function callTool(
           cwd,
           prompt,
           parentSessionId: optionalString(args.parentSessionId, "parentSessionId"),
+          title: optionalString(args.title, "title"),
+          parentSessionTitle: optionalString(args.parentSessionTitle, "parentSessionTitle"),
           tier: optionalTier(args.tier),
           readOnly: optionalBoolean(args.readOnly, "readOnly"),
           model: optionalString(args.model, "model"),
@@ -491,6 +603,23 @@ async function callTool(
       }
     }
 
+    if (name === "pi_worker_steer" || name === "pi_worker_app_steer") {
+      const taskId = optionalString(args.taskId, "taskId");
+      const message = optionalString(args.message, "message");
+      if (!taskId) throw new Error("缺少必填参数 taskId");
+      if (!message) throw new Error("缺少必填参数 message");
+      const result = await runner.steer({
+        taskId,
+        message,
+        source: name === "pi_worker_app_steer" ? "app" : "agent",
+      });
+      return textResult(
+        result,
+        false,
+        `Steer 已入队（steerId=${result.steerId}），将在当前 turn 工具执行完、下一次 LLM 请求前注入运行中的任务`,
+      );
+    }
+
     if (name === "pi_worker_status") {
       const taskId = optionalString(args.taskId, "taskId");
       if (!taskId) throw new Error("缺少必填参数 taskId");
@@ -520,14 +649,16 @@ async function callTool(
         limit: optionalNumber(args.limit, "limit"),
       });
       const groups = groupTasksByParentSession(tasks);
+      await backfillSessionTitles(groups);
       return textResult({ tasks, groups });
     }
 
     if (name === "pi_worker_monitor") {
       const taskId = optionalString(args.taskId, "taskId");
       const parentSessionId = optionalString(args.parentSessionId, "parentSessionId");
+      const parentSessionTitle = optionalString(args.parentSessionTitle, "parentSessionTitle");
       const cwd = optionalString(args.cwd, "cwd");
-      const payload = await buildMonitorPayload({ taskId, parentSessionId, cwd });
+      const payload = await buildMonitorPayload({ taskId, parentSessionId, parentSessionTitle, cwd });
       const summary = payload.task
         ? `Pi Worker 监控面板已就绪（共 ${payload.tasks.length} 个任务 / ${payload.groups.length} 组；当前聚焦 ${payload.task.taskId} [${payload.task.status}]）`
         : `Pi Worker 监控面板已就绪（当前作用域暂无任务）`;
@@ -537,11 +668,12 @@ async function callTool(
     if (name === "pi_worker_app_snapshot") {
       const taskId = optionalString(args.taskId, "taskId");
       const parentSessionId = optionalString(args.parentSessionId, "parentSessionId");
+      const parentSessionTitle = optionalString(args.parentSessionTitle, "parentSessionTitle");
       const cwd = optionalString(args.cwd, "cwd");
       const offset = optionalNumber(args.offset, "offset");
       const tasksLimit = optionalNumber(args.tasksLimit, "tasksLimit");
       const maxEvents = optionalNumber(args.maxEvents, "maxEvents");
-      const payload = await buildMonitorPayload({ taskId, parentSessionId, cwd, offset, tasksLimit, maxEvents });
+      const payload = await buildMonitorPayload({ taskId, parentSessionId, parentSessionTitle, cwd, offset, tasksLimit, maxEvents });
       return textResult(payload, false, "ok");
     }
 

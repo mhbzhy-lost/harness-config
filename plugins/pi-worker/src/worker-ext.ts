@@ -1,8 +1,9 @@
-import { extractTextFromContent, truncateTail, writeOutcomeFile } from "./protocol.ts";
+import { extractTextFromContent, readSteerEntries, truncateTail, writeOutcomeFile } from "./protocol.ts";
 import type { WorkerOutcome } from "./protocol.ts";
 
 export interface PiExtensionContextLike {
   abort?: () => void;
+  hasPendingMessages?: () => boolean;
 }
 
 export interface PiToolResultLike {
@@ -31,10 +32,18 @@ export interface PiExtensionApiLike {
     event: string,
     handler: (event: Record<string, unknown>, ctx?: PiExtensionContextLike) => Promise<void> | void,
   ): void;
+  sendUserMessage?: (
+    text: string,
+    options?: { deliverAs?: "steer" | "followUp" },
+  ) => Promise<void> | void;
 }
 
 export interface RegisterWorkerExtOptions {
   outcomeFile: string;
+  /** 运行态实时插话磁盘队列文件（PI_WORKER_STEER_FILE） */
+  steerFile?: string;
+  /** 队列轮询间隔（默认 250ms，测试可注入小值） */
+  steerPollMs?: number;
   setExitCode?: (code: number) => void;
 }
 
@@ -60,9 +69,46 @@ export function registerPiWorkerExtension(
 ): void {
   const { outcomeFile } = options;
   const setExitCode = options.setExitCode ?? ((code: number) => { process.exitCode = code; });
+  const steerFile = options.steerFile?.trim() || undefined;
   let terminalWritten = false;
   let abortOnTurnEnd = false;
   let forcedErrorExitCode = false;
+  let steerTimer: NodeJS.Timeout | null = null;
+  const consumedSteerIds = new Set<string>();
+
+  const clearSteerTimer = (): void => {
+    if (steerTimer) {
+      clearInterval(steerTimer);
+      steerTimer = null;
+    }
+  };
+
+  /**
+   * 消费未读 steer 队列条目：按 id 去重保证每条至多注入一次；
+   * 已写终态（worker_finish / worker_ask_parent / worker_report_blocked）后不再注入。
+   * 返回本次是否注入了新消息。
+   */
+  const consumeSteers = (): boolean => {
+    if (!steerFile || terminalWritten || !pi.sendUserMessage) return false;
+    let injected = false;
+    for (const entry of readSteerEntries(steerFile)) {
+      if (consumedSteerIds.has(entry.id)) continue;
+      // 先标记后注入：即使注入异常也保证至多消费一次
+      consumedSteerIds.add(entry.id);
+      try {
+        Promise.resolve(pi.sendUserMessage(entry.message, { deliverAs: "steer" })).catch(() => { /* 注入失败忽略 */ });
+        injected = true;
+      } catch {
+        // 同步注入异常忽略
+      }
+    }
+    return injected;
+  };
+
+  const hasUnconsumedSteers = (): boolean => {
+    if (!steerFile || terminalWritten) return false;
+    return readSteerEntries(steerFile).some((entry) => !consumedSteerIds.has(entry.id));
+  };
 
   const clearForcedErrorExitCode = (): void => {
     if (forcedErrorExitCode) {
@@ -75,6 +121,7 @@ export function registerPiWorkerExtension(
     writeOutcomeFile(outcomeFile, outcome);
     terminalWritten = true;
     abortOnTurnEnd = true;
+    clearSteerTimer();
     clearForcedErrorExitCode();
   };
 
@@ -213,15 +260,37 @@ export function registerPiWorkerExtension(
     },
   });
 
+  // 运行态 steer 消费：轻量 unref 定时器轮询 + 安全时机事件触发，
+  // 通过 Pi 原生 deliverAs: "steer" 在当前 turn 工具执行完、下一次 LLM 请求前送达模型。
+  if (steerFile) {
+    steerTimer = setInterval(consumeSteers, options.steerPollMs ?? 250);
+    steerTimer.unref?.();
+    pi.on("tool_execution_end", () => {
+      consumeSteers();
+    });
+    pi.on("agent_before_settle", () => {
+      consumeSteers();
+    });
+    pi.on("agent_settled", () => {
+      clearSteerTimer();
+    });
+  }
+
   pi.on("turn_end", (_event, ctx) => {
+    consumeSteers();
     if (abortOnTurnEnd) {
       abortOnTurnEnd = false;
       ctx?.abort?.();
     }
   });
 
-  pi.on("agent_end", (event) => {
+  pi.on("agent_end", (event, ctx) => {
     if (terminalWritten) return;
+
+    // 存在未消费/待处理 steer 时禁止提前写死终态：
+    // Pi 会在 agent_end 后继续 drain steering 队列并再次触发 agent_end。
+    const injected = consumeSteers();
+    if (injected || hasUnconsumedSteers() || ctx?.hasPendingMessages?.() === true) return;
 
     const lastAssistant = findLastAssistantMessage(event.messages);
     const stopReason = typeof lastAssistant?.stopReason === "string" ? lastAssistant.stopReason : null;
@@ -261,5 +330,8 @@ export function registerPiWorkerExtension(
 export default function piWorkerExtension(pi: PiExtensionApiLike): void {
   const outcomeFile = process.env.PI_WORKER_OUTCOME_FILE?.trim();
   if (!outcomeFile) return;
-  registerPiWorkerExtension(pi, { outcomeFile });
+  registerPiWorkerExtension(pi, {
+    outcomeFile,
+    steerFile: process.env.PI_WORKER_STEER_FILE?.trim() || undefined,
+  });
 }

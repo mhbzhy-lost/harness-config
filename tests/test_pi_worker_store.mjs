@@ -23,6 +23,7 @@ function makeRecord(store, overrides = {}) {
     logPath: paths.logPath,
     eventsPath: paths.eventsPath,
     outcomePath: paths.outcomePath,
+    steerPath: paths.steerPath,
     status: "running",
     pid: 12345,
     excludeTools: ["ask_question", "ask_user_question", "bash_async", "bash_async_status"],
@@ -54,7 +55,7 @@ test("test_save_and_load_enforces_private_permissions_and_dirs", () => {
     const record = makeRecord(store, { status: "done", pid: null, summary: "all green" });
     store.save(record);
 
-    for (const sub of ["", "tasks", "sessions", "logs", "locks", "outcomes"]) {
+    for (const sub of ["", "tasks", "sessions", "logs", "locks", "outcomes", "steers"]) {
       const target = sub ? join(dir, sub) : dir;
       assert.equal(statSync(target).mode & 0o777, 0o700, `dir ${target} must be 0700`);
     }
@@ -65,11 +66,13 @@ test("test_save_and_load_enforces_private_permissions_and_dirs", () => {
     assert.equal(outcomePath, join(dir, "outcomes", `${record.taskId}.json`));
     assert.deepEqual(store.load(record.taskId), record);
 
-    // 兼容历史磁盘记录：缺少 executedCommands 时加载补空数组
+    // 兼容历史磁盘记录：缺少 executedCommands 时加载补空数组；缺少 steerPath 时按状态目录回退兜底
     const legacy = { ...record };
     delete legacy.executedCommands;
+    delete legacy.steerPath;
     writeFileSync(taskFile, JSON.stringify(legacy), { mode: 0o600 });
     assert.deepEqual(store.load(record.taskId)?.executedCommands, []);
+    assert.equal(store.load(record.taskId)?.steerPath, join(dir, "steers", `${record.taskId}.jsonl`));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -384,6 +387,78 @@ test("test_parent_session_filter_and_group_tasks_by_parent_session", () => {
     assert.equal(groups[2].groupKey, "cwd:/repo/legacy");
     assert.equal(groups[2].parentSessionId, null);
     assert.deepEqual(groups[2].tasks.map((t) => t.taskId), [id4]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_title_and_parent_session_title_storage_summary_and_group_aggregation", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-store-title-"));
+  try {
+    const store = new TaskStore(dir, { isPidAlive: () => true });
+    const idOld = "21111111-1111-4111-8111-111111111111";
+    const idNew = "22222222-2222-4222-8222-222222222222";
+    const idNoTitle = "23333333-3333-4333-8333-333333333333";
+    const idLegacy = "24444444-4444-4444-8444-444444444444";
+
+    store.save(makeRecord(store, {
+      taskId: idOld,
+      parentSessionId: "sess-t",
+      title: "修复登录崩溃",
+      parentSessionTitle: "旧会话标题",
+      status: "done",
+      pid: null,
+      updatedAt: "2026-11-25T08:00:00.000Z",
+      lastActivityAt: "2026-11-25T08:00:00.000Z",
+    }));
+    store.save(makeRecord(store, {
+      taskId: idNew,
+      parentSessionId: "sess-t",
+      parentSessionTitle: "新会话标题",
+      status: "running",
+      pid: 12345,
+      updatedAt: "2026-11-25T09:00:00.000Z",
+      lastActivityAt: "2026-11-25T09:00:00.000Z",
+    }));
+    // 同会话更新的任务缺标题：不得覆盖已有的最新非空标题
+    store.save(makeRecord(store, {
+      taskId: idNoTitle,
+      parentSessionId: "sess-t",
+      status: "done",
+      pid: null,
+      updatedAt: "2026-11-25T10:00:00.000Z",
+      lastActivityAt: "2026-11-25T10:00:00.000Z",
+    }));
+    // 历史任务完全没有标题字段：分组标题保持 null（向后兼容）
+    store.save(makeRecord(store, {
+      taskId: idLegacy,
+      parentSessionId: "sess-legacy",
+      status: "done",
+      pid: null,
+      updatedAt: "2026-11-25T07:00:00.000Z",
+      lastActivityAt: "2026-11-25T07:00:00.000Z",
+    }));
+
+    // 落盘往返保留两个可选字段
+    const loaded = store.load(idOld);
+    assert.equal(loaded.title, "修复登录崩溃");
+    assert.equal(loaded.parentSessionTitle, "旧会话标题");
+
+    // list 摘要条件携带：有则带上，无则不出现字段
+    const summaries = store.list({ limit: 10 });
+    const byId = new Map(summaries.map((t) => [t.taskId, t]));
+    assert.equal(byId.get(idOld).title, "修复登录崩溃");
+    assert.equal(byId.get(idOld).parentSessionTitle, "旧会话标题");
+    assert.equal(byId.get(idNew).parentSessionTitle, "新会话标题");
+    assert.equal("title" in byId.get(idNew), false);
+    assert.equal("title" in byId.get(idLegacy), false);
+    assert.equal("parentSessionTitle" in byId.get(idLegacy), false);
+
+    // 分组聚合：取组内最新非空 parentSessionTitle；无标题历史组保持 null
+    const groups = groupTasksByParentSession(summaries);
+    const byKey = new Map(groups.map((g) => [g.groupKey, g]));
+    assert.equal(byKey.get("session:sess-t").parentSessionTitle, "新会话标题");
+    assert.equal(byKey.get("session:sess-legacy").parentSessionTitle, null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -16,6 +16,8 @@ const result = await build({
     "process.env.NODE_ENV": '"production"',
   },
   minify: true,
+  // 页面声明 utf-8：保留中文文案原样输出，便于静态校验与可读性
+  charset: "utf8",
   write: false,
 });
 

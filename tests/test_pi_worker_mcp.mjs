@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -59,6 +60,8 @@ function cleanEnv(overrides = {}) {
   delete env.PI_WORKER_DEFAULT_PROVIDER;
   delete env.PI_WORKER_DEFAULT_MODEL;
   delete env.PI_WORKER_DEFAULT_THINKING;
+  delete env.ANTIGRAVITY_LS_ADDRESS;
+  delete env.ANTIGRAVITY_CSRF_TOKEN;
   for (const key of Object.keys(env)) {
     if (key.startsWith("PI_WORKER_TIER_")) delete env[key];
   }
@@ -141,6 +144,7 @@ test("test_mcp_full_lifecycle_validation_and_graceful_shutdown", async () => {
       [
         "pi_worker_start",
         "pi_worker_reply",
+        "pi_worker_steer",
         "pi_worker_status",
         "pi_worker_cancel",
         "pi_worker_list",
@@ -275,6 +279,7 @@ test("test_mcp_hides_and_blocks_all_tools_in_nested_worker_env", async () => {
     for (const name of [
       "pi_worker_start",
       "pi_worker_reply",
+      "pi_worker_steer",
       "pi_worker_status",
       "pi_worker_cancel",
       "pi_worker_list",
@@ -476,6 +481,8 @@ test("test_mcp_progress_notifications_and_agy_app_endpoints", async () => {
     const stdTools = (await stdClient.request("tools/list")).result.tools.map((t) => t.name);
     assert.equal(stdTools.includes("pi_worker_monitor"), false);
     assert.equal(stdTools.includes("pi_worker_app_snapshot"), false);
+    assert.equal(stdTools.includes("pi_worker_app_steer"), false);
+    assert.equal(stdTools.includes("pi_worker_steer"), true);
 
     const stdStart = await stdClient.request("tools/call", {
       name: "pi_worker_start",
@@ -586,6 +593,284 @@ test("test_mcp_progress_notifications_and_agy_app_endpoints", async () => {
     if (stdClient) await stdClient.close().catch(() => {});
     if (agyClient) await agyClient.close().catch(() => {});
     if (nestedAgyClient) await nestedAgyClient.close().catch(() => {});
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_mcp_title_passthrough_session_scope_ignores_cwd_and_ls_title_backfill", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-mcp-title-"));
+  let agyClient;
+  let lsClient;
+  let lsServer;
+  try {
+    const mainDir = join(dir, "repo", "main");
+    const worktreeDir = join(dir, "repo", "worktree");
+    mkdirSync(mainDir, { recursive: true });
+    mkdirSync(worktreeDir, { recursive: true });
+    const fakePi = createFakePiForMcp(dir, join(dir, "rounds.txt"), join(dir, "sleep.pid"));
+
+    agyClient = startMcpClient({
+      PI_WORKER_BIN: fakePi,
+      PI_WORKER_STATE_DIR: join(dir, "state-title"),
+      PI_WORKER_AGY: "1",
+    });
+
+    // schema：start 增加 title/parentSessionTitle，monitor/app_snapshot 增加 parentSessionTitle，additionalProperties 保持 false
+    const tools = (await agyClient.request("tools/list")).result.tools;
+    const startSchema = tools.find((t) => t.name === "pi_worker_start").inputSchema;
+    assert.equal(startSchema.properties.title.type, "string");
+    assert.equal(startSchema.properties.parentSessionTitle.type, "string");
+    assert.equal(startSchema.additionalProperties, false);
+    const monitorSchema = tools.find((t) => t.name === "pi_worker_monitor").inputSchema;
+    assert.equal(monitorSchema.properties.parentSessionTitle.type, "string");
+    assert.equal(monitorSchema.additionalProperties, false);
+    const snapshotSchema = tools.find((t) => t.name === "pi_worker_app_snapshot").inputSchema;
+    assert.equal(snapshotSchema.properties.parentSessionTitle.type, "string");
+    // tasksLimit 描述与实现对齐（默认 50）
+    assert.match(snapshotSchema.properties.tasksLimit.description, /50/);
+
+    // start 透传 title / parentSessionTitle
+    const t1 = (await agyClient.request("tools/call", {
+      name: "pi_worker_start",
+      arguments: {
+        cwd: mainDir,
+        prompt: "# 任务目标：不应作为标题\n细节",
+        title: "任务A",
+        parentSessionId: "conv-scope",
+        parentSessionTitle: "会话标题甲",
+        waitSeconds: 5,
+      },
+    })).result.structuredContent;
+    assert.equal(t1.title, "任务A");
+    assert.equal(t1.parentSessionTitle, "会话标题甲");
+
+    // 同会话在另一目录（git worktree 场景）派发的任务
+    const t2 = (await agyClient.request("tools/call", {
+      name: "pi_worker_start",
+      arguments: { cwd: worktreeDir, prompt: "worktree 任务", parentSessionId: "conv-scope", waitSeconds: 5 },
+    })).result.structuredContent;
+    assert.equal(t2.title, "worktree 任务");
+
+    // 同时传 parentSessionId + cwd：仅按会话过滤，worktree 任务不得被 cwd 过滤漏掉
+    const mon = (await agyClient.request("tools/call", {
+      name: "pi_worker_monitor",
+      arguments: { parentSessionId: "conv-scope", cwd: mainDir },
+    })).result.structuredContent;
+    assert.deepEqual(mon.tasks.map((t) => t.taskId).sort(), [t1.taskId, t2.taskId].sort());
+    assert.equal(mon.groups.length, 1);
+    assert.equal(mon.scope.parentSessionId, "conv-scope");
+    assert.equal(mon.scope.parentSessionTitle, "会话标题甲");
+    assert.equal(mon.scope.cwd, mainDir);
+
+    // 显式 parentSessionTitle 优先于组内解析结果
+    const monExplicit = (await agyClient.request("tools/call", {
+      name: "pi_worker_monitor",
+      arguments: { parentSessionId: "conv-scope", parentSessionTitle: "显式标题" },
+    })).result.structuredContent;
+    assert.equal(monExplicit.scope.parentSessionTitle, "显式标题");
+
+    // 无 parentSessionId 时才按 cwd 过滤
+    const monCwd = (await agyClient.request("tools/call", {
+      name: "pi_worker_monitor",
+      arguments: { cwd: worktreeDir },
+    })).result.structuredContent;
+    assert.deepEqual(monCwd.tasks.map((t) => t.taskId), [t2.taskId]);
+    assert.equal(monCwd.scope.parentSessionId, null);
+    await agyClient.close();
+    agyClient = undefined;
+
+    // AGY 模式历史标题懒补齐：经 ConversationService GetConversation 读取 annotations.title（内存缓存，不重复请求）
+    const hits = [];
+    lsServer = createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        hits.push({ url: req.url, csrf: req.headers["x-antigravity-csrf-token"], body: JSON.parse(body || "{}") });
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ annotations: { title: "来自 LS 的标题" } }));
+      });
+    });
+    await new Promise((r) => lsServer.listen(0, "127.0.0.1", r));
+    lsClient = startMcpClient({
+      PI_WORKER_BIN: fakePi,
+      PI_WORKER_STATE_DIR: join(dir, "state-ls"),
+      PI_WORKER_AGY: "1",
+      ANTIGRAVITY_LS_ADDRESS: `127.0.0.1:${lsServer.address().port}`,
+      ANTIGRAVITY_CSRF_TOKEN: "test-csrf-token",
+    });
+    const t3 = (await lsClient.request("tools/call", {
+      name: "pi_worker_start",
+      arguments: { cwd: mainDir, prompt: "LS 标题任务", parentSessionId: "conv-ls", waitSeconds: 5 },
+    })).result.structuredContent;
+    assert.equal(t3.parentSessionTitle, undefined);
+
+    const lsMon = (await lsClient.request("tools/call", {
+      name: "pi_worker_monitor",
+      arguments: { parentSessionId: "conv-ls" },
+    })).result.structuredContent;
+    assert.equal(lsMon.scope.parentSessionTitle, "来自 LS 的标题");
+    assert.equal(lsMon.groups[0].parentSessionTitle, "来自 LS 的标题");
+    assert.equal(lsMon.tasks[0].parentSessionTitle, "来自 LS 的标题");
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].url, "/product.v1.ConversationService/GetConversation");
+    assert.equal(hits[0].csrf, "test-csrf-token");
+    assert.equal(hits[0].body.conversationId, "conv-ls");
+
+    // 再次 monitor：命中内存缓存，不重复请求 LS
+    const lsMon2 = (await lsClient.request("tools/call", {
+      name: "pi_worker_monitor",
+      arguments: { parentSessionId: "conv-ls" },
+    })).result.structuredContent;
+    assert.equal(lsMon2.scope.parentSessionTitle, "来自 LS 的标题");
+    assert.equal(hits.length, 1);
+  } finally {
+    if (agyClient) await agyClient.close().catch(() => {});
+    if (lsClient) await lsClient.close().catch(() => {});
+    if (lsServer) await new Promise((r) => lsServer.close(r));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_mcp_steer_tool_standard_and_agy_app_only_with_eager_config", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-mcp-steer-"));
+  let stdClient;
+  let agyClient;
+  try {
+    // mcp_config.json 静态断言：pi_worker_steer 必须 eager 且非 background
+    const mcpConfig = JSON.parse(readFileSync(join(ROOT, "plugins", "pi-worker", "mcp_config.json"), "utf8"));
+    const steerCfg = mcpConfig.mcpServers["pi-worker"].tools.pi_worker_steer;
+    assert.deepEqual(steerCfg, { eager: true });
+    assert.equal("background" in steerCfg, false);
+
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const pidFile = join(dir, "sleep.pid");
+    const fakePi = createFakePiForMcp(dir, join(dir, "rounds.txt"), pidFile);
+
+    // 1. 标准模式：pi_worker_steer 可见、app_steer 不可见；运行中任务入队立即返回不阻塞
+    stdClient = startMcpClient({
+      PI_WORKER_BIN: fakePi,
+      PI_WORKER_STATE_DIR: join(dir, "state-std"),
+      FAKE_MCP_MODE: "sleep",
+    });
+    const stdTools = (await stdClient.request("tools/list")).result.tools;
+    const steerTool = stdTools.find((t) => t.name === "pi_worker_steer");
+    assert.ok(steerTool);
+    assert.deepEqual(steerTool.inputSchema.required, ["taskId", "message"]);
+    assert.equal(steerTool._meta, undefined);
+    assert.equal(stdTools.some((t) => t.name === "pi_worker_app_steer"), false);
+
+    const started = await stdClient.request("tools/call", {
+      name: "pi_worker_start",
+      arguments: { cwd: workDir, prompt: "long job", waitSeconds: 0 },
+    });
+    const tid = started.result.structuredContent.taskId;
+    assert.equal(started.result.structuredContent.status, "running");
+
+    const steerRes = await stdClient.request("tools/call", {
+      name: "pi_worker_steer",
+      arguments: { taskId: tid, message: "改用方案 B" },
+    });
+    assert.equal(steerRes.result.isError, undefined);
+    const sc = steerRes.result.structuredContent;
+    assert.equal(sc.queued, true);
+    assert.equal(sc.status, "running");
+    assert.equal(sc.source, "agent");
+    assert.equal(sc.message, "改用方案 B");
+    assert.ok(sc.steerId);
+    assert.match(steerRes.result.content[0].text, /Steer 已入队/);
+
+    // 磁盘证据：steer 队列与 eventsPath 中的 steer 事件
+    const steerFile = join(dir, "state-std", "steers", `${tid}.jsonl`);
+    const entries = readFileSync(steerFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].id, sc.steerId);
+    const eventsFile = join(dir, "state-std", "logs", `${tid}.events.jsonl`);
+    const evLines = readFileSync(eventsFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const steerEv = evLines.find((ev) => ev.kind === "steer");
+    assert.ok(steerEv);
+    assert.equal(steerEv.detail, "改用方案 B");
+    assert.match(steerEv.title, /主代理/);
+
+    // 参数校验与非运行态拒绝
+    const badRes = await stdClient.request("tools/call", {
+      name: "pi_worker_steer",
+      arguments: { taskId: tid, message: "   " },
+    });
+    assert.equal(badRes.result.isError, true);
+    await stdClient.request("tools/call", { name: "pi_worker_cancel", arguments: { taskId: tid } });
+    const nonRunning = await stdClient.request("tools/call", {
+      name: "pi_worker_steer",
+      arguments: { taskId: tid, message: "迟到插话" },
+    });
+    assert.equal(nonRunning.result.isError, true);
+    assert.match(nonRunning.result.content[0].text, /pi_worker_reply/);
+    await stdClient.close();
+    stdClient = undefined;
+
+    // 2. AGY 模式：pi_worker_app_steer 仅 app 可见，source 标记为 app
+    const agyPidFile = join(dir, "sleep-agy.pid");
+    const agyFakePi = createFakePiForMcp(dir, join(dir, "rounds-agy.txt"), agyPidFile);
+    agyClient = startMcpClient({
+      PI_WORKER_BIN: agyFakePi,
+      PI_WORKER_STATE_DIR: join(dir, "state-agy"),
+      PI_WORKER_AGY: "1",
+      FAKE_MCP_MODE: "sleep",
+    });
+    const agyTools = (await agyClient.request("tools/list")).result.tools;
+    const appSteerTool = agyTools.find((t) => t.name === "pi_worker_app_steer");
+    assert.ok(appSteerTool);
+    assert.deepEqual(appSteerTool._meta.ui.visibility, ["app"]);
+    assert.ok(agyTools.some((t) => t.name === "pi_worker_steer"));
+
+    // AGY 模式下 start 会阻塞至本轮结束，故直接向 state-agy 写入一个运行中的任务快照
+    // （模拟另一进程 detached 运行），验证跨进程 app-only steer 入队。
+    const { TaskStore } = await import("../plugins/pi-worker/src/store.ts");
+    const store = new TaskStore(join(dir, "state-agy"));
+    const paths = store.allocateTaskPaths("agy-detached-task");
+    store.save({
+      taskId: "agy-detached-task",
+      cwd: workDir,
+      sessionDir: paths.sessionDir,
+      logPath: paths.logPath,
+      eventsPath: paths.eventsPath,
+      outcomePath: paths.outcomePath,
+      steerPath: paths.steerPath,
+      status: "running",
+      pid: process.pid, // 借用当前存活 pid 模拟运行中的 detached 任务
+      excludeTools: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+      turnCount: 0,
+      roundCount: 1,
+      lastTool: null,
+      recentEvents: [],
+      summary: "",
+      question: null,
+      options: [],
+      verifiedCommands: [],
+      executedCommands: [],
+      stopReason: null,
+      exitCode: null,
+      error: null,
+      gitChanges: [],
+    });
+    const appRes = await agyClient.request("tools/call", {
+      name: "pi_worker_app_steer",
+      arguments: { taskId: "agy-detached-task", message: "面板实时纠偏" },
+    });
+    assert.equal(appRes.result.isError, undefined);
+    assert.equal(appRes.result.structuredContent.source, "app");
+    assert.equal(appRes.result.structuredContent.queued, true);
+    const agyEntries = readFileSync(paths.steerPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(agyEntries[0].message, "面板实时纠偏");
+    assert.equal(agyEntries[0].source, "app");
+    await agyClient.close();
+    agyClient = undefined;
+  } finally {
+    if (stdClient) await stdClient.close().catch(() => {});
+    if (agyClient) await agyClient.close().catch(() => {});
     rmSync(dir, { recursive: true, force: true });
   }
 });

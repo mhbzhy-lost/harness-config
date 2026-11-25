@@ -7,7 +7,7 @@
  * 4. CLI 出口：node plugins/pi-worker/src/stream.ts <taskId> [--follow] [--json]
  */
 
-import { closeSync, fstatSync, openSync, readSync } from "node:fs";
+import { appendFileSync, closeSync, fstatSync, openSync, readSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { extractTextFromContent } from "./protocol.ts";
@@ -24,6 +24,7 @@ export type FormattedEventKind =
   | "compact"
   | "retry_failed"
   | "aborted"
+  | "steer"
   | "status";
 
 export interface FormattedStreamEvent {
@@ -467,6 +468,10 @@ export function formatTerminalLine(ev: FormattedStreamEvent): string {
     return `${prefix} 💬 ${ev.detail ? truncateHead(ev.detail.replace(/\s+/g, " "), 120) : ev.title}`;
   }
   if (ev.kind === "compact") return `${prefix} 🗜 ${ev.title}`;
+  if (ev.kind === "steer") {
+    const preview = ev.detail ? `: ${truncateHead(ev.detail.replace(/\s+/g, " "), 120)}` : "";
+    return `${prefix} 🧭 ${ev.title}${preview}`;
+  }
   if (ev.kind === "retry_failed") return `${prefix} ⚠ ${ev.title}${ev.detail ? `: ${truncateHead(ev.detail.replace(/\s+/g, " "), 160)}` : ""}`;
   if (ev.kind === "status") return `${prefix} ● ${ev.title}${ev.detail ? ` — ${truncateHead(ev.detail.replace(/\s+/g, " "), 160)}` : ""}`;
   if (ev.kind === "turn_end") return `${prefix} ─ ${ev.title}`;
@@ -485,6 +490,72 @@ function findNextNewlineOffset(fd: number, startOffset: number, fileSize: number
     pos += n;
   }
   return null;
+}
+
+/** 构造统一的 steer 插话事件（runner 入队时写入 eventsPath，监控面板/CLI 共享展示） */
+export function createSteerEvent(input: {
+  seq: number;
+  round?: number;
+  message: string;
+  source?: "agent" | "app";
+  timestamp?: string;
+}): FormattedStreamEvent {
+  const sourceLabel = input.source === "app" ? "面板" : "主代理";
+  return {
+    seq: input.seq,
+    ...(input.round !== undefined ? { round: input.round } : {}),
+    kind: "steer",
+    title: `Steer 插话（${sourceLabel}）`,
+    detail: input.message,
+    timestamp: input.timestamp ?? new Date().toISOString(),
+  };
+}
+
+/** 从 events 文件尾部探测最后一条完整事件的 seq（文件不存在/损坏时回退 0） */
+function readLastEventSeq(eventsPath: string): number {
+  let fd: number;
+  try {
+    fd = openSync(eventsPath, "r");
+  } catch {
+    return 0;
+  }
+  try {
+    const fileSize = fstatSync(fd).size;
+    if (fileSize <= 0) return 0;
+    const toRead = Math.min(SKIP_SCAN_CHUNK_BYTES, fileSize);
+    const buf = Buffer.allocUnsafe(toRead);
+    const n = readSync(fd, buf, 0, toRead, fileSize - toRead);
+    if (n <= 0) return 0;
+    let text = buf.subarray(0, n).toString("utf8");
+    // 末尾半行（未写完）不参与探测
+    if (!text.endsWith("\n")) {
+      const lastNl = text.lastIndexOf("\n");
+      if (lastNl < 0) return 0;
+      text = text.slice(0, lastNl);
+    }
+    const lines = text.split("\n");
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const ev = parseFormattedEventLine(lines[i]);
+      if (ev && typeof ev.seq === "number" && Number.isFinite(ev.seq)) return ev.seq;
+    }
+    return 0;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * 向 eventsPath 追加一条 steer 事件（O_APPEND 单行写入，与运行中的 eventsStream 共存）。
+ * 注：seq 取磁盘末条 +1，与进程内 formatter 计数器可能偶发重号；
+ * 时间线 key 含索引兜底，不影响展示与增量读取。
+ */
+export function appendSteerEvent(
+  eventsPath: string,
+  input: { round?: number; message: string; source?: "agent" | "app"; timestamp?: string },
+): FormattedStreamEvent {
+  const ev = createSteerEvent({ seq: readLastEventSeq(eventsPath) + 1, ...input });
+  appendFileSync(eventsPath, `${JSON.stringify(ev)}\n`, { encoding: "utf8", mode: 0o600, flag: "a" });
+  return ev;
 }
 
 function parseFormattedEventLine(lineStr: string): FormattedStreamEvent | null {

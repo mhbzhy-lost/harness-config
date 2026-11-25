@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
@@ -210,6 +210,58 @@ export function parsePiJsonLine(line: string): StreamEventSummary | null {
   }
 
   return { kind: "other", timestamp };
+}
+
+/** 运行态实时插话队列条目（磁盘队列 steers/<taskId>.jsonl，每行一条 JSON） */
+export interface SteerQueueEntry {
+  id: string;
+  message: string;
+  createdAt: string;
+  source?: "agent" | "app";
+}
+
+/**
+ * 安全追加一条 steer 队列条目：目录 0o700、文件 0o600。
+ * 追加为单行 JSON + \n，跨进程 O_APPEND 写入天然原子（单行远小于 PIPE_BUF）。
+ */
+export function appendSteerEntry(steerPath: string, entry: SteerQueueEntry): void {
+  const dir = dirname(steerPath);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  appendFileSync(steerPath, `${JSON.stringify(entry)}\n`, { encoding: "utf8", mode: 0o600, flag: "a" });
+  chmodSync(steerPath, 0o600);
+}
+
+/** 读取 steer 队列全部合法条目；文件不存在返回空数组，损坏行逐行跳过容错。 */
+export function readSteerEntries(steerPath: string): SteerQueueEntry[] {
+  let raw: string;
+  try {
+    raw = readFileSync(steerPath, "utf8");
+  } catch {
+    return [];
+  }
+  const entries: SteerQueueEntry[] = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as Partial<SteerQueueEntry>;
+      if (
+        parsed && typeof parsed === "object"
+        && typeof parsed.id === "string" && parsed.id
+        && typeof parsed.message === "string" && parsed.message.trim()
+      ) {
+        entries.push({
+          id: parsed.id,
+          message: parsed.message,
+          createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : "",
+          ...(parsed.source === "agent" || parsed.source === "app" ? { source: parsed.source } : {}),
+        });
+      }
+    } catch {
+      // 跳过损坏行
+    }
+  }
+  return entries;
 }
 
 function normalizeStringArray(value: unknown): string[] {

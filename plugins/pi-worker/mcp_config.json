@@ -19,6 +19,9 @@
           "background": "always",
           "eager": true
         },
+        "pi_worker_steer": {
+          "eager": true
+        },
         "pi_worker_monitor": {
           "eager": true
         }

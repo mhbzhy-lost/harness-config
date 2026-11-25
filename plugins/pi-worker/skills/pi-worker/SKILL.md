@@ -26,16 +26,18 @@ description: Use when delegating routed subagent tasks (broad exploration, test/
 
 ## MCP 工具
 
-- `pi_worker_start(cwd, prompt, parentSessionId?, tier?, readOnly?, model?, provider?, thinking?, excludeTools?, waitSeconds?)`：在独立隔离 Session 启动任务（不设总墙钟超时）。
+- `pi_worker_start(cwd, prompt, parentSessionId?, title?, parentSessionTitle?, tier?, readOnly?, model?, provider?, thinking?, excludeTools?, waitSeconds?)`：在独立隔离 Session 启动任务（不设总墙钟超时）。
   - `parentSessionId`：父会话标识（如宿主的对话/会话 ID；缺省时回退 `PI_WORKER_PARENT_SESSION_ID` 环境变量），用于公有核心层的父会话分组与作用域过滤。凡宿主上下文提供会话 ID 时，派单与打开监控均应透传，避免多项目/多会话任务混杂。
+  - `title` / `parentSessionTitle`：任务与父会话的简短可读标题（清洗并截断到 48 字），供监控面板下拉与分组展示。建议派单时传入简短 `title`；未传时自动从 `prompt` 首条有意义文本行提取。AGY 下 `parentSessionTitle` 由 PreToolUse hook 自动注入（ConversationService 优先，降级取最近用户输入），显式传入则原样保留。
   - `tier`：抽象模型档位 `fast` / `default` / `heavy`（缺省为 `default`），按本机独立配置文件映射到实际模型。
   - `readOnly`：设为 `true` 时机械禁用 `write` / `edit` 工具并追加只读约束，且不占 `cwd` 写锁，允许同工作区多路只读任务并发；默认 `false`（同 `cwd` 独占写锁）。
   - 在 Antigravity 下自动作为后台任务执行并在本轮结束时唤醒主会话；其他 Harness 下立即返回 `taskId`。
 - `pi_worker_status(taskId, waitSeconds?)`：查看实时进度（`turnCount`/`lastTool`/`lastActivityAt`/`recentEvents`）、挂起问题或最终摘要与 `gitChanges`；非 Antigravity 环境下可传 `waitSeconds: 0–30` 短等。
 - `pi_worker_reply(taskId, reply, tier?, model?, provider?, thinking?, waitSeconds?)`：向非运行中的任务（`needs_input`/`done`/`blocked`/`failed`/`cancelled`）发送回复沿原隔离 Session 续跑，支持按需切换 `tier` 或覆盖模型与思考档位；在 Antigravity 下同样作为后台任务异步唤醒。
+- `pi_worker_steer(taskId, message)`：向**运行中**（`status: "running"`）的任务实时插话纠偏：同步入队立即返回（非阻塞），消息在当前 turn 工具执行完、下一次 LLM 请求前注入运行中的 worker，不打断当前工具执行；支持跨进程 steer 其他 MCP server 启动的 detached 任务。仅限运行中任务；非运行态请改用 `pi_worker_reply` 续跑。AGY 监控侧面板底部也提供运行态实时插话输入栏（Enter 发送 / Shift+Enter 换行），插话记录以 🧭 事件展示在时间线中。
 - `pi_worker_cancel(taskId)`：优雅取消运行中或挂起的任务。
 - `pi_worker_list(status?, cwd?, parentSessionId?, limit?)`：列出任务摘要及按父会话聚合的 `groups`（未标记 `parentSessionId` 的旧任务按 `cwd` 回退归组）。
-- `pi_worker_monitor(taskId?, parentSessionId?, cwd?)`（仅 AGY 模式）：打开右侧实时进度监控面板，传入 `parentSessionId`/`cwd` 时默认锁定到对应父会话/项目作用域。
+- `pi_worker_monitor(taskId?, parentSessionId?, parentSessionTitle?, cwd?)`（仅 AGY 模式）：打开右侧实时进度监控面板，传入 `parentSessionId` 时严格锁定到本会话（仅按会话过滤，不叠加 `cwd`，同会话跨 worktree 任务不会漏掉）；仅传 `cwd` 时按项目过滤。AGY 会话首次派发 `pi_worker_start` 时，应同步顺带调用一次本工具（<10ms 同步返回）将当前会话侧面板绑定到本会话 `parentSessionId`。
 
 ## 抽象档位与本机模型映射配置（per-machine，不入库）
 

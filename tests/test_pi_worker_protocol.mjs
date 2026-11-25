@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import {
   PROTOCOL_APPEND_PROMPT,
+  appendSteerEntry,
   createLineSplitter,
   extractAssistantMessage,
   parsePiJsonLine,
   readOutcomeFile,
+  readSteerEntries,
   truncateTail,
   writeOutcomeFile,
 } from "../plugins/pi-worker/src/protocol.ts";
@@ -139,4 +141,32 @@ test("test_parse_pi_json_line_and_extract_assistant_message", () => {
   const truncated = truncateTail("a".repeat(50), 20);
   assert.ok(truncated.startsWith("...(truncated)\n"));
   assert.ok(truncated.endsWith("a".repeat(20)));
+});
+
+test("test_steer_queue_append_and_read_with_private_perms_and_corrupt_line_tolerance", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-proto-steer-"));
+  try {
+    const steerPath = join(dir, "steers", "task-1.jsonl");
+    // 文件不存在时安全返回空队列
+    assert.deepEqual(readSteerEntries(steerPath), []);
+
+    appendSteerEntry(steerPath, { id: "s1", message: "改用方案 B", createdAt: "2026-11-25T10:00:00.000Z", source: "agent" });
+    appendSteerEntry(steerPath, { id: "s2", message: "面板纠偏", createdAt: "2026-11-25T10:00:01.000Z", source: "app" });
+    assert.equal(statSync(dirname(steerPath)).mode & 0o777, 0o700);
+    assert.equal(statSync(steerPath).mode & 0o777, 0o600);
+
+    // 损坏行 / 非法条目容错跳过，合法条目保留
+    appendFileSync(steerPath, "{not-json\n", "utf8");
+    appendFileSync(steerPath, JSON.stringify({ id: "", message: "缺 id" }) + "\n", "utf8");
+    appendFileSync(steerPath, JSON.stringify({ id: "s3", message: "  " }) + "\n", "utf8");
+    appendFileSync(steerPath, JSON.stringify({ id: "s4", message: "无 createdAt 与 source" }) + "\n", "utf8");
+    const entries = readSteerEntries(steerPath);
+    assert.deepEqual(entries.map((e) => e.id), ["s1", "s2", "s4"]);
+    assert.equal(entries[0].source, "agent");
+    assert.equal(entries[1].source, "app");
+    assert.equal(entries[2].createdAt, "");
+    assert.equal(entries[2].source, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

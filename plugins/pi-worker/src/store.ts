@@ -33,10 +33,16 @@ export interface TaskRecord {
   taskId: string;
   cwd: string;
   parentSessionId?: string;
+  /** 任务简短可读标题（未显式传入时由 runner 从 prompt 首行提取） */
+  title?: string;
+  /** 父会话可读标题（由宿主注入或 ConversationService 补齐） */
+  parentSessionTitle?: string;
   sessionDir: string;
   logPath: string;
   eventsPath: string;
   outcomePath: string;
+  /** 运行态实时插话队列文件（steers/<taskId>.jsonl） */
+  steerPath: string;
   status: TaskStatus;
   pid: number | null;
   tier?: WorkerTier;
@@ -68,6 +74,8 @@ export type TaskSummary = Pick<
   | "taskId"
   | "cwd"
   | "parentSessionId"
+  | "title"
+  | "parentSessionTitle"
   | "status"
   | "roundCount"
   | "turnCount"
@@ -82,6 +90,8 @@ export type TaskSummary = Pick<
 export interface TaskSessionGroup {
   groupKey: string;
   parentSessionId: string | null;
+  /** 组内最新非空父会话标题；历史任务无该字段时为 null */
+  parentSessionTitle: string | null;
   cwd: string;
   runningCount: number;
   latestActivityAt: string;
@@ -94,6 +104,7 @@ export interface TaskPaths {
   logPath: string;
   eventsPath: string;
   outcomePath: string;
+  steerPath: string;
 }
 
 export interface CwdLockOwner {
@@ -386,6 +397,8 @@ function toSummary(record: TaskRecord): TaskSummary {
     taskId: record.taskId,
     cwd: record.cwd,
     ...(record.parentSessionId ? { parentSessionId: record.parentSessionId } : {}),
+    ...(record.title ? { title: record.title } : {}),
+    ...(record.parentSessionTitle ? { parentSessionTitle: record.parentSessionTitle } : {}),
     status: record.status,
     roundCount: record.roundCount,
     turnCount: record.turnCount,
@@ -406,6 +419,8 @@ function toSummary(record: TaskRecord): TaskSummary {
  */
 export function groupTasksByParentSession(tasks: readonly TaskSummary[]): TaskSessionGroup[] {
   const byKey = new Map<string, TaskSessionGroup>();
+  // 记录每组当前采用标题对应的活跃时间，用于挑选“最新非空标题”
+  const titleActivityByKey = new Map<string, string>();
 
   for (const task of tasks) {
     const parentSessionId = task.parentSessionId?.trim() || null;
@@ -416,12 +431,18 @@ export function groupTasksByParentSession(tasks: readonly TaskSummary[]): TaskSe
       group = {
         groupKey,
         parentSessionId,
+        parentSessionTitle: null,
         cwd: task.cwd,
         runningCount: 0,
         latestActivityAt: activity,
         tasks: [],
       };
       byKey.set(groupKey, group);
+    }
+    const sessionTitle = task.parentSessionTitle?.trim();
+    if (sessionTitle && activity.localeCompare(titleActivityByKey.get(groupKey) ?? "") >= 0) {
+      group.parentSessionTitle = sessionTitle;
+      titleActivityByKey.set(groupKey, activity);
     }
     group.tasks.push(task);
     if (task.status === "running") group.runningCount += 1;
@@ -476,6 +497,7 @@ export class TaskStore {
       join(this.stateDir, "logs"),
       join(this.stateDir, "locks"),
       join(this.stateDir, "outcomes"),
+      join(this.stateDir, "steers"),
     ]) {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       chmodSync(dir, 0o700);
@@ -491,6 +513,7 @@ export class TaskStore {
       logPath: join(this.stateDir, "logs", `${validId}.jsonl`),
       eventsPath: join(this.stateDir, "logs", `${validId}.events.jsonl`),
       outcomePath: join(this.stateDir, "outcomes", `${validId}.json`),
+      steerPath: join(this.stateDir, "steers", `${validId}.jsonl`),
     };
   }
 
@@ -611,6 +634,10 @@ export class TaskStore {
       if (!parsed || typeof parsed !== "object" || parsed.taskId !== validId) return null;
       if (typeof parsed.eventsPath !== "string" || !parsed.eventsPath) {
         parsed.eventsPath = join(this.stateDir, "logs", `${validId}.events.jsonl`);
+      }
+      if (typeof parsed.steerPath !== "string" || !parsed.steerPath) {
+        // 旧任务记录无 steerPath 字段时按当前状态目录回退兜底
+        parsed.steerPath = join(this.stateDir, "steers", `${validId}.jsonl`);
       }
       if (!Array.isArray(parsed.executedCommands)) {
         parsed.executedCommands = [];

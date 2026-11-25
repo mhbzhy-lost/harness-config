@@ -16,6 +16,7 @@ import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   PROTOCOL_APPEND_PROMPT,
+  appendSteerEntry,
   createLineSplitter,
   extractAssistantMessage,
   parsePiJsonLine,
@@ -31,7 +32,7 @@ import type {
   TaskSummary,
   WorkerTier,
 } from "./store.ts";
-import { createEventFormatter } from "./stream.ts";
+import { appendSteerEvent, createEventFormatter } from "./stream.ts";
 import type { FormattedStreamEvent } from "./stream.ts";
 
 export const MAX_WAIT_SECONDS = 30;
@@ -47,6 +48,41 @@ const READONLY_APPEND_PROMPT =
 
 export const WORKER_EXTENSION_PATH = join(dirname(fileURLToPath(import.meta.url)), "worker-ext.ts");
 
+/** 任务/会话标题统一截断长度 */
+export const MAX_TITLE_CHARS = 48;
+
+/** 清洗标题：去首尾空白、合并换行/连续空白、截断到 MAX_TITLE_CHARS */
+export function sanitizeTaskTitle(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const cleaned = value.replace(/\s+/g, " ").trim();
+  if (!cleaned) return undefined;
+  return cleaned.length > MAX_TITLE_CHARS ? `${cleaned.slice(0, MAX_TITLE_CHARS)}…` : cleaned;
+}
+
+/** 从 prompt 提取首条有意义文本行作为默认标题（去除 Markdown/列表/常见任务前缀后截断） */
+export function extractTitleFromPrompt(prompt: string): string | undefined {
+  if (typeof prompt !== "string") return undefined;
+  for (const rawLine of prompt.split(/\r?\n/)) {
+    let line = rawLine.trim();
+    // 反复剥离常见前缀：Markdown 标题/列表/引用/编号，以及“任务目标：”等标签
+    let prev = "";
+    while (line && line !== prev) {
+      prev = line;
+      line = line
+        .replace(/^#{1,6}\s+/, "")
+        .replace(/^[-*+]\s+/, "")
+        .replace(/^\d+[.)、]\s*/, "")
+        .replace(/^>\s*/, "")
+        .replace(/^(任务目标|任务说明|任务|目标|只读调研|调研|背景|需求)[:：]\s*/, "")
+        .trim();
+    }
+    // 跳过纯分隔线/代码围栏等无意义行
+    if (!line || /^[-=*_`~]{3,}$/.test(line)) continue;
+    return sanitizeTaskTitle(line);
+  }
+  return undefined;
+}
+
 const MAX_RECENT_EVENTS = 10;
 const MAX_EXECUTED_COMMANDS = 50;
 const MAX_EXECUTED_COMMAND_PREVIEW_CHARS = 300;
@@ -59,6 +95,8 @@ export interface StartTaskInput {
   cwd: string;
   prompt: string;
   parentSessionId?: string;
+  title?: string;
+  parentSessionTitle?: string;
   tier?: WorkerTier;
   readOnly?: boolean;
   model?: string;
@@ -93,6 +131,22 @@ export interface CancelTaskInput {
   taskId: string;
 }
 
+export interface SteerTaskInput {
+  taskId: string;
+  message: string;
+  source?: "agent" | "app";
+}
+
+export interface SteerTaskResult {
+  taskId: string;
+  steerId: string;
+  queued: true;
+  status: "running";
+  message: string;
+  queuedAt: string;
+  source: "agent" | "app";
+}
+
 export interface ListTasksInput {
   status?: TaskStatus;
   cwd?: string;
@@ -115,6 +169,7 @@ interface ActiveExecution {
   killTimer: NodeJS.Timeout | null;
   settled: Promise<TaskRecord>;
   waiters: Set<(record: TaskRecord) => void>;
+  onProgress?: (event: FormattedStreamEvent) => void;
 }
 
 export function isNestedWorkerEnv(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -324,6 +379,7 @@ export class PiWorkerRunner {
       PI_SUBAGENT_CHILD: "1",
       PI_WORKER_DEPTH: String(nextDepth),
       PI_WORKER_OUTCOME_FILE: record.outcomePath,
+      PI_WORKER_STEER_FILE: record.steerPath,
     };
     delete childEnv.PI_SESSION_OWNER_ID;
     delete childEnv.PI_WORKER_AGY;
@@ -355,6 +411,8 @@ export class PiWorkerRunner {
 
     // 获锁后再清理上一轮残留 outcome 文件，避免并发冲突时误删原结果
     try { unlinkSync(record.outcomePath); } catch { /* 文件不存在忽略 */ }
+    // 清理上一轮已失效/残留的 steer 队列，防止旧 steer 误触发新一轮
+    try { unlinkSync(record.steerPath); } catch { /* 文件不存在忽略 */ }
 
     let child: ChildProcess;
     try {
@@ -389,6 +447,7 @@ export class PiWorkerRunner {
       killTimer: null,
       settled,
       waiters: new Set(),
+      ...(onProgress ? { onProgress } : {}),
     };
     this.active.set(record.taskId, execState);
 
@@ -646,6 +705,8 @@ export class PiWorkerRunner {
     const parentSessionId = typeof rawParentSession === "string" && rawParentSession.trim()
       ? rawParentSession.trim()
       : undefined;
+    const title = sanitizeTaskTitle(input.title) ?? extractTitleFromPrompt(input.prompt);
+    const parentSessionTitle = sanitizeTaskTitle(input.parentSessionTitle);
     const profile = this.store.resolveModelProfile(tier, this.baseEnv);
     const resolvedModel = input.model ?? profile.model;
     const resolvedProvider = input.model !== undefined ? input.provider : profile.provider;
@@ -661,10 +722,13 @@ export class PiWorkerRunner {
       taskId,
       cwd: canonicalCwd,
       ...(parentSessionId ? { parentSessionId } : {}),
+      ...(title ? { title } : {}),
+      ...(parentSessionTitle ? { parentSessionTitle } : {}),
       sessionDir: paths.sessionDir,
       logPath: paths.logPath,
       eventsPath: paths.eventsPath,
       outcomePath: paths.outcomePath,
+      steerPath: paths.steerPath,
       status: "running",
       pid: null,
       ...(tier ? { tier } : {}),
@@ -764,6 +828,49 @@ export class PiWorkerRunner {
   async status(input: StatusTaskInput): Promise<TaskRecord> {
     const waitSeconds = validateWaitSeconds(input.waitSeconds);
     return this.waitForState(input.taskId, waitSeconds);
+  }
+
+  /**
+   * 向运行中任务实时插话（非阻塞）：写入磁盘 steer 队列由 worker 扩展在当前 turn
+   * 工具执行完、下一次 LLM 请求前注入；同时追加统一 steer 事件供监控面板展示。
+   * 兼容本进程 active 与跨进程运行中的 detached 任务；非运行态拒绝并引导 pi_worker_reply。
+   */
+  async steer(input: SteerTaskInput): Promise<SteerTaskResult> {
+    this.assertNotNested();
+    if (typeof input.taskId !== "string" || !input.taskId.trim()) {
+      throw new Error("taskId 不能为空");
+    }
+    const message = typeof input.message === "string" ? input.message.trim() : "";
+    if (!message) {
+      throw new Error("message 不能为空");
+    }
+    const source = input.source === "app" ? "app" : "agent";
+    const snapshot = this.getSnapshot(input.taskId.trim());
+    if (snapshot.status !== "running") {
+      throw new Error(
+        `任务 ${snapshot.taskId} 当前状态为 ${snapshot.status}，非运行中无法实时插话；请改用 pi_worker_reply 沿原 Session 续跑`,
+      );
+    }
+
+    const steerId = randomUUID();
+    const queuedAt = new Date().toISOString();
+    appendSteerEntry(snapshot.steerPath, { id: steerId, message, createdAt: queuedAt, source });
+    const ev = appendSteerEvent(snapshot.eventsPath, {
+      round: snapshot.roundCount,
+      message,
+      source,
+      timestamp: queuedAt,
+    });
+
+    const active = this.active.get(snapshot.taskId);
+    if (active) {
+      active.record.lastActivityAt = queuedAt;
+      active.record.updatedAt = queuedAt;
+      this.store.save(active.record);
+      try { active.onProgress?.(ev); } catch { /* 进度通知异常不阻塞入队 */ }
+    }
+
+    return { taskId: snapshot.taskId, steerId, queued: true, status: "running", message, queuedAt, source };
   }
 
   async cancel(input: CancelTaskInput): Promise<{ task: TaskRecord; wasRunning: boolean }> {

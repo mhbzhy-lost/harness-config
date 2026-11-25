@@ -3,15 +3,17 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { readOutcomeFile } from "../plugins/pi-worker/src/protocol.ts";
+import { readOutcomeFile, appendSteerEntry } from "../plugins/pi-worker/src/protocol.ts";
 import piWorkerExtension, { registerPiWorkerExtension } from "../plugins/pi-worker/src/worker-ext.ts";
 
-function createMockPi() {
+function createMockPi({ withSendUserMessage = false } = {}) {
   const tools = new Map();
   const handlers = new Map();
-  return {
+  const sentMessages = [];
+  const pi = {
     tools,
     handlers,
+    sentMessages,
     registerTool(def) {
       tools.set(def.name, def);
     },
@@ -26,6 +28,12 @@ function createMockPi() {
       }
     },
   };
+  if (withSendUserMessage) {
+    pi.sendUserMessage = (text, options) => {
+      sentMessages.push({ text, options });
+    };
+  }
+  return pi;
 }
 
 test("test_extension_is_noop_when_outcome_env_absent", () => {
@@ -149,6 +157,142 @@ test("test_worker_report_blocked_and_worker_finish_write_structured_outcomes", a
       stopReason: null,
       error: null,
     });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_steer_queue_consumed_once_dedup_by_id_and_ignored_after_terminal", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-ext-steer-"));
+  try {
+    const outcomeFile = join(dir, "outcome.json");
+    const steerFile = join(dir, "steer.jsonl");
+    const mockPi = createMockPi({ withSendUserMessage: true });
+    registerPiWorkerExtension(mockPi, {
+      outcomeFile,
+      steerFile,
+      steerPollMs: 60_000, // 单测中关闭定时器噪声，仅验证事件驱动消费
+      setExitCode: () => {},
+    });
+    const ctx = { abort: () => {} };
+
+    appendSteerEntry(steerFile, { id: "s1", message: "改用方案 B", createdAt: "t1", source: "agent" });
+    appendSteerEntry(steerFile, { id: "s2", message: "注意兼容旧接口", createdAt: "t2", source: "app" });
+
+    // tool_execution_end 边界消费全部未读 steer，且 deliverAs 为 steer
+    await mockPi.emit("tool_execution_end", { type: "tool_execution_end" }, ctx);
+    assert.deepEqual(mockPi.sentMessages, [
+      { text: "改用方案 B", options: { deliverAs: "steer" } },
+      { text: "注意兼容旧接口", options: { deliverAs: "steer" } },
+    ]);
+
+    // turn_end / agent_before_settle 重复触发不得重复注入（按 id 去重）
+    await mockPi.emit("turn_end", { type: "turn_end" }, ctx);
+    await mockPi.emit("agent_before_settle", { type: "agent_before_settle" }, ctx);
+    assert.equal(mockPi.sentMessages.length, 2);
+
+    // 追加新条目 + 重复旧 id：只注入新条目
+    appendSteerEntry(steerFile, { id: "s1", message: "改用方案 B", createdAt: "t1", source: "agent" });
+    appendSteerEntry(steerFile, { id: "s3", message: "补充验收命令", createdAt: "t3" });
+    await mockPi.emit("turn_end", { type: "turn_end" }, ctx);
+    assert.equal(mockPi.sentMessages.length, 3);
+    assert.equal(mockPi.sentMessages[2].text, "补充验收命令");
+
+    // terminalWritten（worker_finish）后不再注入任何 steer
+    await mockPi.tools.get("worker_finish").execute("tc_s", { summary: "已完成" }, undefined, undefined, ctx);
+    appendSteerEntry(steerFile, { id: "s4", message: "迟到的插话", createdAt: "t4" });
+    await mockPi.emit("tool_execution_end", { type: "tool_execution_end" }, ctx);
+    await mockPi.emit("turn_end", { type: "turn_end" }, ctx);
+    await mockPi.emit("agent_before_settle", { type: "agent_before_settle" }, ctx);
+    assert.equal(mockPi.sentMessages.length, 3);
+    assert.equal(readOutcomeFile(outcomeFile)?.status, "done");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_agent_end_does_not_write_terminal_outcome_when_steer_unconsumed_or_pending", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-ext-steer-guard-"));
+  try {
+    // 1. 存在未消费 steer：agent_end 消费注入后不得写终态，让续跑完成
+    const f1 = join(dir, "o1.json");
+    const s1 = join(dir, "s1.jsonl");
+    const pi1 = createMockPi({ withSendUserMessage: true });
+    let exit1 = null;
+    registerPiWorkerExtension(pi1, { outcomeFile: f1, steerFile: s1, steerPollMs: 60_000, setExitCode: (c) => { exit1 = c; } });
+    appendSteerEntry(s1, { id: "a1", message: "追加要求", createdAt: "t" });
+    await pi1.emit("agent_end", {
+      type: "agent_end",
+      messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "第一阶段完成" }] }],
+    }, {});
+    assert.equal(pi1.sentMessages.length, 1);
+    assert.equal(readOutcomeFile(f1), null);
+    assert.equal(exit1, null);
+    // 队列排空后的下一次 agent_end 正常写 done（无 steer 兜底行为完全兼容）
+    await pi1.emit("agent_end", {
+      type: "agent_end",
+      messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "含插话全部完成" }] }],
+    }, {});
+    assert.equal(readOutcomeFile(f1)?.status, "done");
+    assert.equal(readOutcomeFile(f1)?.summary, "含插话全部完成");
+    await pi1.emit("agent_settled", { type: "agent_settled" }, {});
+
+    // 2. ctx.hasPendingMessages() 为 true：即使无磁盘队列也不得提前写终态
+    const f2 = join(dir, "o2.json");
+    const pi2 = createMockPi({ withSendUserMessage: true });
+    registerPiWorkerExtension(pi2, { outcomeFile: f2, steerFile: join(dir, "s2.jsonl"), steerPollMs: 60_000, setExitCode: () => {} });
+    await pi2.emit("agent_end", {
+      type: "agent_end",
+      messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "部分完成" }] }],
+    }, { hasPendingMessages: () => true });
+    assert.equal(readOutcomeFile(f2), null);
+    await pi2.emit("agent_end", {
+      type: "agent_end",
+      messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "最终完成" }] }],
+    }, { hasPendingMessages: () => false });
+    assert.equal(readOutcomeFile(f2)?.status, "done");
+    await pi2.emit("agent_settled", { type: "agent_settled" }, {});
+
+    // 3. 有未消费 steer 但宿主不支持 sendUserMessage：同样禁止误写终态
+    const f3 = join(dir, "o3.json");
+    const s3 = join(dir, "s3.jsonl");
+    const pi3 = createMockPi();
+    registerPiWorkerExtension(pi3, { outcomeFile: f3, steerFile: s3, steerPollMs: 60_000, setExitCode: () => {} });
+    appendSteerEntry(s3, { id: "a3", message: "无法注入的插话", createdAt: "t" });
+    await pi3.emit("agent_end", {
+      type: "agent_end",
+      messages: [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "完成" }] }],
+    }, {});
+    assert.equal(readOutcomeFile(f3), null);
+    await pi3.emit("agent_settled", { type: "agent_settled" }, {});
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_steer_timer_polls_queue_without_events_and_settled_clears_timer", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-ext-steer-timer-"));
+  try {
+    const outcomeFile = join(dir, "outcome.json");
+    const steerFile = join(dir, "steer.jsonl");
+    const mockPi = createMockPi({ withSendUserMessage: true });
+    registerPiWorkerExtension(mockPi, { outcomeFile, steerFile, steerPollMs: 20, setExitCode: () => {} });
+
+    // 不触发任何事件，仅靠轻量定时器在工具执行期间消费入队 steer
+    appendSteerEntry(steerFile, { id: "t1", message: "定时器注入", createdAt: "t" });
+    let injected = false;
+    for (let i = 0; i < 100; i += 1) {
+      if (mockPi.sentMessages.length >= 1) { injected = true; break; }
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.equal(injected, true, "steer timer must consume queue without explicit events");
+    assert.deepEqual(mockPi.sentMessages[0], { text: "定时器注入", options: { deliverAs: "steer" } });
+
+    // agent_settled 后清理定时器：后续追加不再被消费
+    await mockPi.emit("agent_settled", { type: "agent_settled" }, {});
+    appendSteerEntry(steerFile, { id: "t2", message: "结束后迟到", createdAt: "t" });
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(mockPi.sentMessages.length, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
