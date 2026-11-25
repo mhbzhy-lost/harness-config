@@ -51,10 +51,17 @@ if (process.env.FAKE_MCP_MODE === "sleep") {
   return scriptPath;
 }
 
+function cleanEnv(overrides = {}) {
+  const env = { ...process.env };
+  delete env.PI_SUBAGENT_CHILD;
+  delete env.PI_WORKER_DEPTH;
+  return { ...env, ...overrides };
+}
+
 function startMcpClient(env) {
   const child = spawn(process.execPath, [SERVER_PATH], {
     cwd: ROOT,
-    env: { ...process.env, ...env },
+    env: cleanEnv(env),
     stdio: ["pipe", "pipe", "pipe"],
   });
 
@@ -99,6 +106,8 @@ function startMcpClient(env) {
 
 test("test_mcp_full_lifecycle_validation_and_graceful_shutdown", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-worker-mcp-"));
+  let client;
+  let sleepClient;
   try {
     const workDir = join(dir, "repo");
     mkdirSync(workDir, { recursive: true });
@@ -107,7 +116,7 @@ test("test_mcp_full_lifecycle_validation_and_graceful_shutdown", async () => {
     const pidFile = join(dir, "sleep.pid");
     const fakePi = createFakePiForMcp(dir, countFile, pidFile);
 
-    const client = startMcpClient({
+    client = startMcpClient({
       PI_WORKER_BIN: fakePi,
       PI_WORKER_STATE_DIR: stateDir,
     });
@@ -173,10 +182,11 @@ test("test_mcp_full_lifecycle_validation_and_graceful_shutdown", async () => {
     }
 
     const exitCode = await client.close();
+    client = undefined;
     assert.equal(exitCode, 0);
 
     // 5. stdin 关闭时清理仍在运行的子进程
-    const sleepClient = startMcpClient({
+    sleepClient = startMcpClient({
       PI_WORKER_BIN: fakePi,
       PI_WORKER_STATE_DIR: join(dir, "state-sleep"),
       FAKE_MCP_MODE: "sleep",
@@ -198,6 +208,7 @@ test("test_mcp_full_lifecycle_validation_and_graceful_shutdown", async () => {
     assert.ok(childPid > 0);
 
     await sleepClient.close();
+    sleepClient = undefined;
 
     // 验证子进程已被清理
     let alive = true;
@@ -212,14 +223,17 @@ test("test_mcp_full_lifecycle_validation_and_graceful_shutdown", async () => {
     }
     assert.equal(alive, false, "MCP server shutdown must terminate active worker child");
   } finally {
+    if (client) await client.close().catch(() => {});
+    if (sleepClient) await sleepClient.close().catch(() => {});
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test("test_mcp_hides_and_blocks_all_tools_in_nested_worker_env", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-worker-mcp-nest-"));
+  let client;
   try {
-    const client = startMcpClient({
+    client = startMcpClient({
       PI_WORKER_DEPTH: "1",
       PI_WORKER_STATE_DIR: join(dir, "state"),
     });
@@ -239,16 +253,19 @@ test("test_mcp_hides_and_blocks_all_tools_in_nested_worker_env", async () => {
     }
 
     const exitCode = await client.close();
+    client = undefined;
     assert.equal(exitCode, 0);
   } finally {
+    if (client) await client.close().catch(() => {});
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test("test_mcp_handles_null_array_and_malformed_json_without_crashing", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-worker-mcp-invalid-"));
+  let client;
   try {
-    const client = startMcpClient({
+    client = startMcpClient({
       PI_WORKER_STATE_DIR: join(dir, "state"),
     });
 
@@ -290,8 +307,10 @@ test("test_mcp_handles_null_array_and_malformed_json_without_crashing", async ()
     assert.deepEqual(pingRes.result, {});
 
     const exitCode = await client.close();
+    client = undefined;
     assert.equal(exitCode, 0);
   } finally {
+    if (client) await client.close().catch(() => {});
     rmSync(dir, { recursive: true, force: true });
   }
 });

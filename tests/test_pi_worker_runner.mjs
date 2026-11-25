@@ -12,6 +12,13 @@ import {
 } from "../plugins/pi-worker/src/runner.ts";
 import { TaskStore } from "../plugins/pi-worker/src/store.ts";
 
+function cleanEnv(overrides = {}) {
+  const env = { ...process.env };
+  delete env.PI_SUBAGENT_CHILD;
+  delete env.PI_WORKER_DEPTH;
+  return { ...env, ...overrides };
+}
+
 function createFakePi(dir, recordFile) {
   const scriptPath = join(dir, "fake-pi.mjs");
   const script = `#!/usr/bin/env node
@@ -138,7 +145,7 @@ test("test_start_needs_input_then_reply_resumes_same_session_via_stdin", async (
     const runner = new PiWorkerRunner({
       store,
       piBinary: fakePi,
-      env: { ...process.env, PI_SESSION_OWNER_ID: "should-be-stripped", FAKE_PI_SCENARIO: "two-round" },
+      env: cleanEnv({ PI_SESSION_OWNER_ID: "should-be-stripped", FAKE_PI_SCENARIO: "two-round" }),
     });
 
     const first = await runner.start({
@@ -204,7 +211,7 @@ test("test_fallback_when_outcome_file_missing_catches_error_stop_reason_on_exit_
     const runner = new PiWorkerRunner({
       store: new TaskStore(join(dir, "state")),
       piBinary: fakePi,
-      env: { ...process.env, FAKE_PI_SCENARIO: "error-exit-zero" },
+      env: cleanEnv({ FAKE_PI_SCENARIO: "error-exit-zero" }),
     });
 
     const rec = await runner.start({ cwd: workDir, prompt: "do work", waitSeconds: 5 });
@@ -226,7 +233,7 @@ test("test_rejects_provider_without_model_and_recursive_env", async () => {
     const normalRunner = new PiWorkerRunner({
       store: new TaskStore(join(dir, "state")),
       piBinary: fakePi,
-      env: { ...process.env },
+      env: cleanEnv(),
     });
     await assert.rejects(
       () => normalRunner.start({ cwd: workDir, prompt: "hi", provider: "openai" }),
@@ -236,7 +243,7 @@ test("test_rejects_provider_without_model_and_recursive_env", async () => {
     const depthRunner = new PiWorkerRunner({
       store: new TaskStore(join(dir, "state-depth")),
       piBinary: fakePi,
-      env: { ...process.env, PI_WORKER_DEPTH: "1" },
+      env: cleanEnv({ PI_WORKER_DEPTH: "1" }),
     });
     await assert.rejects(
       () => depthRunner.start({ cwd: workDir, prompt: "hi" }),
@@ -246,7 +253,7 @@ test("test_rejects_provider_without_model_and_recursive_env", async () => {
     const childRunner = new PiWorkerRunner({
       store: new TaskStore(join(dir, "state-child")),
       piBinary: fakePi,
-      env: { ...process.env, PI_SUBAGENT_CHILD: "1" },
+      env: cleanEnv({ PI_SUBAGENT_CHILD: "1" }),
     });
     await assert.rejects(
       () => childRunner.start({ cwd: workDir, prompt: "hi" }),
@@ -269,7 +276,7 @@ test("test_concurrent_cwd_lock_cancel_semantics_and_no_finalizing_orphan_race", 
     const runner = new PiWorkerRunner({
       store: new TaskStore(join(dir, "state")),
       piBinary: fakePi,
-      env: { ...process.env, FAKE_PI_SCENARIO: "sleep" },
+      env: cleanEnv({ FAKE_PI_SCENARIO: "sleep" }),
     });
 
     const running = await runner.start({ cwd: workDir, prompt: "long job", waitSeconds: 0 });
@@ -294,7 +301,7 @@ test("test_concurrent_cwd_lock_cancel_semantics_and_no_finalizing_orphan_race", 
     const fastRunner = new PiWorkerRunner({
       store: new TaskStore(join(dir, "state")),
       piBinary: fakePi,
-      env: { ...process.env, FAKE_PI_SCENARIO: "two-round" },
+      env: cleanEnv({ FAKE_PI_SCENARIO: "two-round" }),
     });
     const quick = await fastRunner.start({ cwd: workDir, prompt: "quick", waitSeconds: 0 });
     const finalStatus = await fastRunner.status({ taskId: quick.taskId, waitSeconds: 5 });
@@ -319,7 +326,7 @@ test("test_cancel_terminates_detached_process_group", async () => {
     const runner = new PiWorkerRunner({
       store: new TaskStore(join(dir, "state")),
       piBinary: fakePi,
-      env: { ...process.env, FAKE_PI_SCENARIO: "sleep" },
+      env: cleanEnv({ FAKE_PI_SCENARIO: "sleep" }),
     });
 
     const started = await runner.start({ cwd: workDir, prompt: "hang", waitSeconds: 0 });
@@ -376,7 +383,7 @@ test("test_cross_process_cancel_waits_for_detached_pid_exit_before_releasing_loc
     const runner1 = new PiWorkerRunner({
       store: new TaskStore(stateDir),
       piBinary: fakePi,
-      env: { ...process.env, FAKE_PI_SCENARIO: "sleep" },
+      env: cleanEnv({ FAKE_PI_SCENARIO: "sleep" }),
     });
     const started = await runner1.start({ cwd: workDir, prompt: "sleep", waitSeconds: 0 });
     assert.equal(started.status, "running");
@@ -386,7 +393,7 @@ test("test_cross_process_cancel_waits_for_detached_pid_exit_before_releasing_loc
     const runner2 = new PiWorkerRunner({
       store: new TaskStore(stateDir),
       piBinary: fakePi,
-      env: { ...process.env, FAKE_PI_SCENARIO: "sleep" },
+      env: cleanEnv({ FAKE_PI_SCENARIO: "sleep" }),
     });
     const res = await runner2.cancel({ taskId: started.taskId });
     assert.equal(res.wasRunning, true);
@@ -417,7 +424,7 @@ test("test_cancel_during_finalizing_does_not_overwrite_completed_task", async ()
     const runner = new PiWorkerRunner({
       store: new TaskStore(join(dir, "state")),
       piBinary: fakePi,
-      env: { ...process.env, FAKE_PI_SCENARIO: "two-round" },
+      env: cleanEnv({ FAKE_PI_SCENARIO: "two-round" }),
       collectGitChanges: async () => {
         enteredGitStatus();
         await gitStatusGate;
@@ -453,7 +460,7 @@ test("test_reply_overrides_model_thinking_and_resumes_failed_and_cancelled_tasks
     const failRunner = new PiWorkerRunner({
       store: new TaskStore(join(dir, "state-fail")),
       piBinary: fakePi,
-      env: { ...process.env, FAKE_PI_SCENARIO: "fail-then-succeed" },
+      env: cleanEnv({ FAKE_PI_SCENARIO: "fail-then-succeed" }),
     });
     const failed = await failRunner.start({ cwd: workDir, prompt: "first try", waitSeconds: 5 });
     assert.equal(failed.status, "failed");
@@ -491,7 +498,7 @@ test("test_reply_overrides_model_thinking_and_resumes_failed_and_cancelled_tasks
     const cancelRunner = new PiWorkerRunner({
       store: new TaskStore(join(dir, "state-cancel")),
       piBinary: cancelFakePi,
-      env: { ...process.env, FAKE_PI_SCENARIO: "sleep-then-resume" },
+      env: cleanEnv({ FAKE_PI_SCENARIO: "sleep-then-resume" }),
     });
     const started = await cancelRunner.start({ cwd: workDir, prompt: "sleep first", waitSeconds: 0 });
     const cancelled = await cancelRunner.cancel({ taskId: started.taskId });
@@ -524,7 +531,7 @@ test("test_wait_until_settled_blocks_until_round_finishes", async () => {
     const runner = new PiWorkerRunner({
       store: new TaskStore(join(dir, "state")),
       piBinary: fakePi,
-      env: { ...process.env, FAKE_PI_SCENARIO: "two-round" },
+      env: cleanEnv({ FAKE_PI_SCENARIO: "two-round" }),
     });
 
     const first = await runner.start({ cwd: workDir, prompt: "go", waitUntilSettled: true });

@@ -140,9 +140,12 @@ test("test_monitor_html_is_self_contained_csp_safe_and_served_by_mcp", async () 
   assert.doesNotMatch(html, /tool_start"\?"▶"/);
 
   const dir = mkdtempSync(join(tmpdir(), "pi-worker-ui-mcp-"));
+  const childEnv = { ...process.env, PI_WORKER_AGY: "1", PI_WORKER_STATE_DIR: join(dir, "state") };
+  delete childEnv.PI_SUBAGENT_CHILD;
+  delete childEnv.PI_WORKER_DEPTH;
   const child = spawn(process.execPath, [SERVER_PATH], {
     cwd: ROOT,
-    env: { ...process.env, PI_WORKER_AGY: "1", PI_WORKER_STATE_DIR: join(dir, "state") },
+    env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
   });
   try {
