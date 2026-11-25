@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""AGY PreToolUse hook: 为内置 subagent（research / review-agent）兜底模型档位。
+"""AGY PreToolUse hook: 为内置 subagent（当前为 research）兜底模型档位。
 
 自定义 subagent 通过 agy/agents/*.md 的 frontmatter `model:` 静态绑定；
 内置 subagent 无静态配置文件，由本 hook 在 invoke_subagent 执行前兜底：
 - TypeName == "research" 且未传 Model 或 Model == "inherit" → overwrite Model 为 "flash"
-- TypeName == "review-agent" 且未传 Model 或 Model == "inherit" → overwrite Model 为 "pro"
 - 显式指定了其他档位（如 "pro" / "flash_lite" / "flash"）或其他 TypeName → 原样放行
 - 任何输入解析异常均 fail-open 返回 {"decision": "allow"}，不阻塞会话
 """
@@ -14,7 +13,6 @@ import sys
 
 BUILTIN_DEFAULT_MODELS = {
     "research": "flash",
-    "review-agent": "pro",
 }
 
 

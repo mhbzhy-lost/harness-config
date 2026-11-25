@@ -26,7 +26,7 @@ trigger: always_on
    - **无明确计划（未走 `writing-plans`）**：超出上述小范围的跨多文件实现、大文件重构、批量迁移或预计多轮改测闭环的编码任务，一律默认交由 `pi-worker`（`tier: "default"`）执行，不得因已拿到 `file:line` 锚点就由主 Agent 包揽全部写入。
    - **有明确计划（走 `writing-plans`）**：计划评审完成后，必须由用户在 **执行者（`pi-worker` vs `Native`）× 模式（`串行` vs `并发`）** 中选择；主 Agent 仅在用户选 `Native` 时直接实施（选 `pi-worker` 时转为答疑拍板、worktree 编排与验收角色）。
 4. **调度、接球与证据核验**：向 `pi-worker` 派单、秒答 `needs_input`、管理并发 worktree 合并清理，以及核验 `pi-worker` 返回的磁盘证据（`executedCommands`、`eventsPath`、`gitChanges`/diff 与引用 `file:line` 源码）。
-5. **用户显式指定的原生能力**：用户点名使用原生 subagent（如 `browser`、`research`、`test-runner`、`reviewer`/`review-agent`、`self`）或明确要求直接执行指定命令时优先按用户指定执行。
+5. **用户显式指定的原生能力**：用户点名使用原生 subagent（如 `browser`、`research`、`test-runner`、`self`）或明确要求直接执行指定命令时优先按用户指定执行。
 
 ### 其余工作一律默认交给 `pi-worker`
 
