@@ -6,6 +6,7 @@
 #   4. agy/rules/*.md 逐文件软链接进 ~/.gemini/config/rules/（全局规则）
 #   5. agy/agents/*.md 逐文件软链接进 ~/.gemini/config/agents/（自定义 subagent）
 #   6. 注入内置 subagent 模型档位兜底 hook 到 ~/.gemini/config/hooks.json（按名幂等管理）
+#   7. agy/shell.zsh 注册 source 进 ~/.zshrc（标记块，幂等；提供 agyui / agyide 代理启动器）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,6 +16,7 @@ SKILLS_SRC="$SCRIPT_DIR/skills"
 RULES_SRC="$SCRIPT_DIR/agy/rules"
 AGENTS_SRC="$SCRIPT_DIR/agy/agents"
 HOOK_SCRIPT="$SCRIPT_DIR/agy/hooks/subagent-model-router.py"
+SHELL_SNIPPET="$SCRIPT_DIR/agy/shell.zsh"
 
 SETTINGS_TARGET="${AGY_SETTINGS_PATH:-$HOME/.gemini/antigravity-cli/settings.json}"
 CONFIG_DIR="${AGY_CONFIG_DIR:-$HOME/.gemini/config}"
@@ -23,13 +25,14 @@ SKILLS_JSON="${AGY_SKILLS_JSON:-$CONFIG_DIR/skills.json}"
 RULES_DIR="${AGY_RULES_DIR:-$CONFIG_DIR/rules}"
 AGENTS_DIR="${AGY_AGENTS_DIR:-$CONFIG_DIR/agents}"
 HOOKS_JSON="${AGY_HOOKS_JSON:-$CONFIG_DIR/hooks.json}"
+SHELL_RC="${AGY_SHELL_RC:-$HOME/.zshrc}"
 DRY_RUN=0
 
 usage() {
   cat <<EOF
 用法: ./init-agy.sh [--dry-run]
 
-将仓库中的 AGY 设置模板、插件、独立 skills、全局规则、subagent 定义与生命周期 hooks 同步到本机。
+将仓库中的 AGY 设置模板、插件、独立 skills、全局规则、subagent 定义、生命周期 hooks 与 shell 包装同步到本机。
   --dry-run   只预览将发生的变更，不写入
   -h, --help  显示本帮助
 
@@ -41,6 +44,7 @@ usage() {
   AGY_RULES_DIR     覆盖全局规则链接目录（默认 \$AGY_CONFIG_DIR/rules）
   AGY_AGENTS_DIR    覆盖 subagent 定义链接目录（默认 \$AGY_CONFIG_DIR/agents）
   AGY_HOOKS_JSON    覆盖 hooks.json 路径（默认 \$AGY_CONFIG_DIR/hooks.json）
+  AGY_SHELL_RC      覆盖 shell 注册目标（默认 ~/.zshrc）
 EOF
 }
 
@@ -58,6 +62,7 @@ done
 command -v python3 >/dev/null 2>&1 || die "需要 python3"
 [[ -f "$SETTINGS_TEMPLATE" ]] || die "找不到 AGY 设置模板: $SETTINGS_TEMPLATE"
 [[ -f "$HOOK_SCRIPT" ]] || die "找不到 AGY hook 脚本: $HOOK_SCRIPT"
+[[ -f "$SHELL_SNIPPET" ]] || die "找不到 AGY shell 片段: $SHELL_SNIPPET"
 
 # --- 1. 深度合并 agy/settings.json ---
 AGY_SYNC_DRY_RUN="$DRY_RUN" python3 - "$SETTINGS_TEMPLATE" "$SETTINGS_TARGET" <<'PY'
@@ -328,8 +333,66 @@ if backup_path:
     print(f"已备份: {backup_path}")
 PY
 
+# --- 7. 注册 agy/shell.zsh 进 ~/.zshrc ---
+AGY_SYNC_DRY_RUN="$DRY_RUN" python3 - "$SHELL_RC" "$SHELL_SNIPPET" <<'PY'
+import os, re, sys, tempfile
+from datetime import datetime
+
+rc_path, snippet_path = sys.argv[1:3]
+dry_run = os.environ.get("AGY_SYNC_DRY_RUN") == "1"
+
+start_marker = "# >>> harness-config agy >>>"
+end_marker = "# <<< harness-config agy <<<"
+line = f"[[ -f '{snippet_path}' ]] && source '{snippet_path}'"
+block = f"{start_marker}\n{line}\n{end_marker}"
+
+existing = ""
+if os.path.exists(rc_path):
+    with open(rc_path, encoding="utf-8") as f:
+        existing = f.read()
+
+pattern = re.compile(re.escape(start_marker) + r".*?" + re.escape(end_marker), re.DOTALL)
+if pattern.search(existing):
+    updated = pattern.sub(lambda m: block, existing, count=1)
+else:
+    sep = "" if (not existing or existing.endswith("\n")) else "\n"
+    updated = existing + sep + "\n" + block + "\n"
+
+if updated == existing:
+    print(f"AGY shell 注册已是最新，无需写入: {rc_path}")
+    sys.exit(0)
+
+if dry_run:
+    print(f"[dry-run] AGY shell 注册目标: {rc_path}")
+    print(f"[dry-run] 将写入/更新标记块，source: {snippet_path}")
+    sys.exit(0)
+
+backup_path = None
+if os.path.exists(rc_path):
+    backup_path = f"{rc_path}.bak.{datetime.now():%Y%m%d-%H%M%S}"
+    with open(rc_path, "rb") as src, open(backup_path, "wb") as dst:
+        dst.write(src.read())
+
+rc_dir = os.path.dirname(rc_path) or "."
+os.makedirs(rc_dir, exist_ok=True)
+fd, tmp_path = tempfile.mkstemp(dir=rc_dir, prefix=".zshrc-", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(updated)
+    if os.path.exists(rc_path):
+        os.chmod(tmp_path, os.stat(rc_path).st_mode & 0o777)
+    os.replace(tmp_path, rc_path)
+except BaseException:
+    os.unlink(tmp_path)
+    raise
+
+print(f"AGY shell 注册已写入: {rc_path}")
+if backup_path:
+    print(f"已备份: {backup_path}")
+PY
+
 if [[ "$DRY_RUN" == 1 ]]; then
   echo "预览完成，未做任何写入。"
 else
-  echo "完成。重启 agy 新开会话使设置、插件、skills、全局规则、subagent 与 hooks 生效。"
+  echo "完成。新开终端（或 source ${SHELL_RC}）使 AGY shell 包装生效；重启 agy 新开会话使设置、插件、skills、全局规则、subagent 与 hooks 生效。"
 fi

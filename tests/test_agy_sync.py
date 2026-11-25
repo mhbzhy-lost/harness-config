@@ -218,13 +218,29 @@ class AgySyncTest(unittest.TestCase):
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
         self.assertEqual(settings.get("altScreenMode"), "always")
 
+    def test_agy_shell_snippet_has_valid_zsh_syntax(self) -> None:
+        snippet = ROOT / "agy/shell.zsh"
+        self.assertTrue(snippet.exists())
+        res = subprocess.run(
+            ["zsh", "-n", str(snippet)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(res.returncode, 0, msg=res.stderr)
+        text = snippet.read_text(encoding="utf-8")
+        for fn in ("_agy_launch_with_proxy()", "agyui()", "agyide()"):
+            self.assertIn(fn, text)
+
     def test_init_agy_dry_run_makes_no_writes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp) / "agy-config"
             settings_path = Path(tmp) / "antigravity-cli" / "settings.json"
+            shell_rc = Path(tmp) / ".zshrc"
             env = os.environ.copy()
             env["AGY_CONFIG_DIR"] = str(config_dir)
             env["AGY_SETTINGS_PATH"] = str(settings_path)
+            env["AGY_SHELL_RC"] = str(shell_rc)
 
             result = subprocess.run(
                 ["bash", str(ROOT / "init-agy.sh"), "--dry-run"],
@@ -241,6 +257,7 @@ class AgySyncTest(unittest.TestCase):
             )
             self.assertFalse(config_dir.exists())
             self.assertFalse(settings_path.exists())
+            self.assertFalse(shell_rc.exists())
 
     def test_init_agy_sync_preserves_existing_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -265,9 +282,13 @@ class AgySyncTest(unittest.TestCase):
             existing_hooks = {"my-custom-hook": {"PostToolUse": []}}
             hooks_json.write_text(json.dumps(existing_hooks), encoding="utf-8")
 
+            shell_rc = Path(tmp) / ".zshrc"
+            shell_rc.write_text("# user zshrc\nexport FOO=bar\n", encoding="utf-8")
+
             env = os.environ.copy()
             env["AGY_CONFIG_DIR"] = str(config_dir)
             env["AGY_SETTINGS_PATH"] = str(settings_path)
+            env["AGY_SHELL_RC"] = str(shell_rc)
 
             first = subprocess.run(
                 ["bash", str(ROOT / "init-agy.sh")],
@@ -334,6 +355,14 @@ class AgySyncTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(hooks_json.stat().st_mode), 0o600)
             self.assertEqual(len(list(config_dir.glob("hooks.json.bak.*"))), 1)
 
+            # 5.5 shell 注册保留原 ~/.zshrc 内容并注入标记块
+            rc_after_first = shell_rc.read_text(encoding="utf-8")
+            self.assertIn("export FOO=bar", rc_after_first)
+            self.assertIn("# >>> harness-config agy >>>", rc_after_first)
+            self.assertIn(f"source '{ROOT / 'agy/shell.zsh'}'", rc_after_first)
+            self.assertIn("# <<< harness-config agy <<<", rc_after_first)
+            self.assertEqual(len(list(shell_rc.parent.glob(".zshrc.bak.*"))), 1)
+
             # 6. 二次运行完全幂等
             second = subprocess.run(
                 ["bash", str(ROOT / "init-agy.sh")],
@@ -362,11 +391,14 @@ class AgySyncTest(unittest.TestCase):
                 json.loads(hooks_json.read_text(encoding="utf-8")), merged_hooks
             )
             self.assertEqual(len(list(config_dir.glob("hooks.json.bak.*"))), 1)
+            self.assertEqual(shell_rc.read_text(encoding="utf-8"), rc_after_first)
+            self.assertEqual(len(list(shell_rc.parent.glob(".zshrc.bak.*"))), 1)
 
     def test_init_agy_skips_regular_rule_file_without_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp) / "agy-config"
             settings_path = Path(tmp) / "antigravity-cli" / "settings.json"
+            shell_rc = Path(tmp) / ".zshrc"
             rule_path = config_dir / "rules" / "harness-config.md"
             rule_path.parent.mkdir(parents=True)
             rule_path.write_text("# user custom rule\n", encoding="utf-8")
@@ -374,6 +406,7 @@ class AgySyncTest(unittest.TestCase):
             env = os.environ.copy()
             env["AGY_CONFIG_DIR"] = str(config_dir)
             env["AGY_SETTINGS_PATH"] = str(settings_path)
+            env["AGY_SHELL_RC"] = str(shell_rc)
 
             result = subprocess.run(
                 ["bash", str(ROOT / "init-agy.sh")],
