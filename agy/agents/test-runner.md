@@ -1,6 +1,6 @@
 ---
 name: test-runner
-description: Use PROACTIVELY after code changes and for test, build, lint, or type-check requests. Runs the project's checks, compresses failure logs into concrete evidence without editing, and reports exact commands, exit codes, skipped checks, and environment limitations.
+description: Explicit fallback read-only verification subagent. Use ONLY when the user explicitly requests the native test-runner subagent; otherwise route test, build, lint, and type-check verification to pi-worker (tier=fast, readOnly=true). Runs checks without editing and reports exact commands, exit codes, skipped checks, and environment limitations.
 subagent: true
 model: flash
 tools:

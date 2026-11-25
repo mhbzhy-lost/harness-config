@@ -56,8 +56,20 @@ class AgySyncTest(unittest.TestCase):
             "always",
         )
         self.assertEqual(
+            pi_agy.get("tools", {}).get("pi_worker_start", {}).get("eager"),
+            True,
+        )
+        self.assertEqual(
             pi_agy.get("tools", {}).get("pi_worker_reply", {}).get("background"),
             "always",
+        )
+        self.assertEqual(
+            pi_agy.get("tools", {}).get("pi_worker_reply", {}).get("eager"),
+            True,
+        )
+        self.assertEqual(
+            pi_agy.get("tools", {}).get("pi_worker_monitor", {}).get("eager"),
+            True,
         )
 
         hc_agy = json.loads(
@@ -115,6 +127,7 @@ class AgySyncTest(unittest.TestCase):
         self.assertIn("`default`", text)
         self.assertIn("`heavy`", text)
         self.assertIn("`readOnly: true`", text)
+        self.assertIn("parentSessionId", text)
         self.assertIn("~/.pi/agent/pi-worker/config.json", text)
         self.assertIn("Git 历史考古", text)
         self.assertIn("基于最终 Diff 生成 PR/文档初稿", text)
@@ -130,6 +143,7 @@ class AgySyncTest(unittest.TestCase):
         self.assertIn("\nname: test-runner\n", frontmatter)
         self.assertIn("\nsubagent: true\n", frontmatter)
         self.assertIn("\nmodel: flash\n", frontmatter)
+        self.assertNotIn("Use PROACTIVELY", frontmatter)
 
         tools = []
         in_tools = False
@@ -215,6 +229,114 @@ class AgySyncTest(unittest.TestCase):
         )
         # 5. 非法输入 → fail-open 放行
         self.assertEqual(run_hook("not-json"), {"decision": "allow"})
+
+    def test_pi_worker_session_injector_hook_behavior(self) -> None:
+        hook_path = ROOT / "agy/hooks/pi-worker-session-injector.py"
+        self.assertTrue(hook_path.exists())
+
+        def run_hook(stdin_text: str) -> dict:
+            res = subprocess.run(
+                ["python3", str(hook_path)],
+                input=stdin_text,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            return json.loads(res.stdout)
+
+        # 1. Eager pi_worker_start 缺省 parentSessionId → 自动补全 conversationId
+        self.assertEqual(
+            run_hook(
+                json.dumps(
+                    {
+                        "conversationId": "conv-123",
+                        "cwd": "/repo/app",
+                        "toolCall": {
+                            "name": "mcp_pi-worker_pi-worker_pi_worker_start",
+                            "args": {"cwd": "/repo/app", "prompt": "explore"},
+                        },
+                    }
+                )
+            ),
+            {"decision": "allow", "overwrite": {"parentSessionId": "conv-123"}},
+        )
+        # 2. Eager pi_worker_monitor 缺省 parentSessionId & cwd → 同时补全
+        self.assertEqual(
+            run_hook(
+                json.dumps(
+                    {
+                        "conversationId": "conv-123",
+                        "workspacePaths": ["/repo/app"],
+                        "toolCall": {
+                            "name": "mcp_pi-worker_pi-worker_pi_worker_monitor",
+                            "args": {},
+                        },
+                    }
+                )
+            ),
+            {
+                "decision": "allow",
+                "overwrite": {"parentSessionId": "conv-123", "cwd": "/repo/app"},
+            },
+        )
+        # 3. 显式传入 parentSessionId 时不覆盖
+        self.assertEqual(
+            run_hook(
+                json.dumps(
+                    {
+                        "conversationId": "conv-123",
+                        "toolCall": {
+                            "name": "mcp_pi-worker_pi-worker_pi_worker_start",
+                            "args": {"cwd": "/repo/app", "prompt": "x", "parentSessionId": "custom"},
+                        },
+                    }
+                )
+            ),
+            {"decision": "allow"},
+        )
+        # 4. Lazy call_mcp_tool 路径自动补全 Arguments.parentSessionId
+        self.assertEqual(
+            run_hook(
+                json.dumps(
+                    {
+                        "conversationId": "conv-456",
+                        "cwd": "/repo/b",
+                        "toolCall": {
+                            "name": "call_mcp_tool",
+                            "args": {
+                                "ServerName": "pi-worker_pi-worker",
+                                "ToolName": "pi_worker_start",
+                                "Arguments": {"cwd": "/repo/b", "prompt": "check"},
+                            },
+                        },
+                    }
+                )
+            ),
+            {
+                "decision": "allow",
+                "overwrite": {
+                    "Arguments": {
+                        "cwd": "/repo/b",
+                        "prompt": "check",
+                        "parentSessionId": "conv-456",
+                    }
+                },
+            },
+        )
+        # 5. 非 pi-worker 工具与非法输入 → fail-open 放行
+        self.assertEqual(
+            run_hook(
+                json.dumps(
+                    {
+                        "conversationId": "conv-456",
+                        "toolCall": {"name": "read_file", "args": {"Path": "/a"}},
+                    }
+                )
+            ),
+            {"decision": "allow"},
+        )
+        self.assertEqual(run_hook("bad-json"), {"decision": "allow"})
 
     def test_agy_settings_enables_alt_screen(self) -> None:
         settings_path = ROOT / "agy/settings.json"
@@ -355,6 +477,15 @@ class AgySyncTest(unittest.TestCase):
             self.assertIn(
                 str(ROOT / "agy/hooks/subagent-model-router.py"),
                 router_hook["PreToolUse"][0]["hooks"][0]["command"],
+            )
+            pi_worker_hook = merged_hooks["harness-config-pi-worker-session-injector"]
+            self.assertIn(
+                "pi_worker_(start|monitor)",
+                pi_worker_hook["PreToolUse"][0]["matcher"],
+            )
+            self.assertIn(
+                str(ROOT / "agy/hooks/pi-worker-session-injector.py"),
+                pi_worker_hook["PreToolUse"][0]["hooks"][0]["command"],
             )
             self.assertEqual(stat.S_IMODE(hooks_json.stat().st_mode), 0o600)
             self.assertEqual(len(list(config_dir.glob("hooks.json.bak.*"))), 1)

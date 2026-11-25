@@ -16,6 +16,7 @@ SKILLS_SRC="$SCRIPT_DIR/skills"
 RULES_SRC="$SCRIPT_DIR/agy/rules"
 AGENTS_SRC="$SCRIPT_DIR/agy/agents"
 HOOK_SCRIPT="$SCRIPT_DIR/agy/hooks/subagent-model-router.py"
+PI_WORKER_HOOK_SCRIPT="$SCRIPT_DIR/agy/hooks/pi-worker-session-injector.py"
 SHELL_SNIPPET="$SCRIPT_DIR/agy/shell.zsh"
 
 SETTINGS_TARGET="${AGY_SETTINGS_PATH:-$HOME/.gemini/antigravity-cli/settings.json}"
@@ -62,6 +63,7 @@ done
 command -v python3 >/dev/null 2>&1 || die "需要 python3"
 [[ -f "$SETTINGS_TEMPLATE" ]] || die "找不到 AGY 设置模板: $SETTINGS_TEMPLATE"
 [[ -f "$HOOK_SCRIPT" ]] || die "找不到 AGY hook 脚本: $HOOK_SCRIPT"
+[[ -f "$PI_WORKER_HOOK_SCRIPT" ]] || die "找不到 AGY hook 脚本: $PI_WORKER_HOOK_SCRIPT"
 [[ -f "$SHELL_SNIPPET" ]] || die "找不到 AGY shell 片段: $SHELL_SNIPPET"
 
 # --- 1. 深度合并 agy/settings.json ---
@@ -261,14 +263,43 @@ else
   echo "（无 agy/agents/ 目录，跳过 AGY agent 链接）"
 fi
 
-# --- 6. 注入内置 subagent 模型档位兜底 hook 到 ~/.gemini/config/hooks.json ---
-AGY_SYNC_DRY_RUN="$DRY_RUN" python3 - "$HOOKS_JSON" "$HOOK_SCRIPT" <<'PY'
+# --- 6. 注入受管 AGY hooks 到 ~/.gemini/config/hooks.json ---
+AGY_SYNC_DRY_RUN="$DRY_RUN" python3 - "$HOOKS_JSON" "$HOOK_SCRIPT" "$PI_WORKER_HOOK_SCRIPT" <<'PY'
 import copy, json, os, sys, tempfile
 from datetime import datetime
 
-target_path, hook_script = sys.argv[1:3]
+target_path, router_hook_script, pi_worker_hook_script = sys.argv[1:4]
 dry_run = os.environ.get("AGY_SYNC_DRY_RUN") == "1"
-hook_name = "harness-config-subagent-model-router"
+managed_hooks = {
+    "harness-config-subagent-model-router": {
+        "PreToolUse": [
+            {
+                "matcher": "invoke_subagent",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f'python3 "{router_hook_script}"',
+                        "timeout": 5,
+                    }
+                ],
+            }
+        ]
+    },
+    "harness-config-pi-worker-session-injector": {
+        "PreToolUse": [
+            {
+                "matcher": "call_mcp_tool|.*pi_worker_(start|monitor)$",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f'python3 "{pi_worker_hook_script}"',
+                        "timeout": 5,
+                    }
+                ],
+            }
+        ]
+    },
+}
 
 existing = {}
 if os.path.exists(target_path):
@@ -283,28 +314,17 @@ if os.path.exists(target_path):
         sys.exit(f"错误: {target_path} 顶层不是 JSON 对象")
 
 merged = copy.deepcopy(existing)
-merged[hook_name] = {
-    "PreToolUse": [
-        {
-            "matcher": "invoke_subagent",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": f'python3 "{hook_script}"',
-                    "timeout": 5,
-                }
-            ],
-        }
-    ]
-}
+for name, spec in managed_hooks.items():
+    merged[name] = spec
 
 if merged == existing and os.path.exists(target_path):
-    print(f"hooks.json 已包含 {hook_name}，无需写入: {target_path}")
+    print(f"hooks.json 已包含全部受管 hooks，无需写入: {target_path}")
     sys.exit(0)
 
 if dry_run:
     print(f"[dry-run] hooks.json 目标: {target_path}")
-    print(f"[dry-run] 将注入/更新 hook {hook_name} → {hook_script}")
+    for name in managed_hooks:
+        print(f"[dry-run] 将注入/更新 hook {name}")
     sys.exit(0)
 
 target_dir = os.path.dirname(target_path) or "."

@@ -27,6 +27,7 @@ trigger: always_on
 | 规格明确的多步编码 / 其他独立任务 | `pi-worker` | `default` | 读写（同 `cwd` 独占锁） | 摘要、`verifiedCommands`、`gitChanges` |
 
 - 路由表只定义抽象档位（`fast` / `default` / `heavy`），不在规则中写死具体模型 ID；抽象档位到实际 `provider`/`model`/`thinking` 的映射由独立本机配置文件 `~/.pi/agent/pi-worker/config.json` 维护（未配置档位自动回退 `default`，详见 `pi-worker` skill）。
+- 调 `pi_worker_start` 与 `pi_worker_monitor` 时传入当前会话的 `Conversation ID` 作为 `parentSessionId`（打开监控面板时可同步传当前 `cwd`），使任务按父会话归组与隔离展示。
 - 在 AGY 下 `pi_worker_start` / `pi_worker_reply` 作为后台任务异步运行并在完成时自动唤醒主会话；不要轮询 `pi_worker_status`，等待期间继续非重叠工作或先向用户报告状态，不预测结果。
 - 独立只读任务（`readOnly: true`）机械禁用 `write`/`edit` 且不占写锁，可在同一 `cwd` 并行 2–4 路派发；不要重复进行中的搜索或检查。读写任务默认同一 `cwd` 串行独占，运行期间主会话不得同时修改同工作区文件。
 - 收到 `status: "needs_input"` 时二级接球：主会话已有明确答案直接 `pi_worker_reply` 秒答续跑，否则转问用户后再续跑。
