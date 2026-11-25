@@ -23,6 +23,7 @@ export type WorkerTier = (typeof WORKER_TIERS)[number];
 export interface TaskRecord {
   taskId: string;
   cwd: string;
+  parentSessionId?: string;
   sessionDir: string;
   logPath: string;
   eventsPath: string;
@@ -56,6 +57,7 @@ export type TaskSummary = Pick<
   TaskRecord,
   | "taskId"
   | "cwd"
+  | "parentSessionId"
   | "status"
   | "roundCount"
   | "turnCount"
@@ -66,6 +68,15 @@ export type TaskSummary = Pick<
   | "question"
   | "error"
 >;
+
+export interface TaskSessionGroup {
+  groupKey: string;
+  parentSessionId: string | null;
+  cwd: string;
+  runningCount: number;
+  latestActivityAt: string;
+  tasks: TaskSummary[];
+}
 
 export interface TaskPaths {
   taskFile: string;
@@ -95,6 +106,7 @@ export interface StoreReadOptions {
 export interface TaskListFilter {
   status?: TaskStatus;
   cwd?: string;
+  parentSessionId?: string;
   limit?: number;
 }
 
@@ -363,6 +375,7 @@ function toSummary(record: TaskRecord): TaskSummary {
   return {
     taskId: record.taskId,
     cwd: record.cwd,
+    ...(record.parentSessionId ? { parentSessionId: record.parentSessionId } : {}),
     status: record.status,
     roundCount: record.roundCount,
     turnCount: record.turnCount,
@@ -373,6 +386,55 @@ function toSummary(record: TaskRecord): TaskSummary {
     question: record.question,
     error: record.error,
   };
+}
+
+/**
+ * 跨 Harness 公有分组逻辑：
+ * - 有 parentSessionId 的任务按父会话聚合（groupKey = "session:<id>"）；
+ * - 未标记 parentSessionId 的旧/独立任务按工作区回退聚合（groupKey = "cwd:<cwd>"），避免跨项目混杂。
+ * 分组与组内任务均按“存在 running 优先，其次按最新活跃时间倒序”排列。
+ */
+export function groupTasksByParentSession(tasks: readonly TaskSummary[]): TaskSessionGroup[] {
+  const byKey = new Map<string, TaskSessionGroup>();
+
+  for (const task of tasks) {
+    const parentSessionId = task.parentSessionId?.trim() || null;
+    const groupKey = parentSessionId ? `session:${parentSessionId}` : `cwd:${task.cwd}`;
+    const activity = task.lastActivityAt || task.updatedAt;
+    let group = byKey.get(groupKey);
+    if (!group) {
+      group = {
+        groupKey,
+        parentSessionId,
+        cwd: task.cwd,
+        runningCount: 0,
+        latestActivityAt: activity,
+        tasks: [],
+      };
+      byKey.set(groupKey, group);
+    }
+    group.tasks.push(task);
+    if (task.status === "running") group.runningCount += 1;
+    if (activity.localeCompare(group.latestActivityAt) > 0) {
+      group.latestActivityAt = activity;
+      group.cwd = task.cwd;
+    }
+  }
+
+  const groups = [...byKey.values()];
+  for (const group of groups) {
+    group.tasks.sort((a, b) => {
+      if (a.status === "running" && b.status !== "running") return -1;
+      if (b.status === "running" && a.status !== "running") return 1;
+      return b.updatedAt.localeCompare(a.updatedAt);
+    });
+  }
+  groups.sort((a, b) => {
+    if (a.runningCount > 0 && b.runningCount === 0) return -1;
+    if (b.runningCount > 0 && a.runningCount === 0) return 1;
+    return b.latestActivityAt.localeCompare(a.latestActivityAt);
+  });
+  return groups;
 }
 
 export class TaskStore {
@@ -595,6 +657,7 @@ export class TaskStore {
       if (!loaded) continue;
       if (filter.status && loaded.status !== filter.status) continue;
       if (filter.cwd && loaded.cwd !== filter.cwd) continue;
+      if (filter.parentSessionId && loaded.parentSessionId !== filter.parentSessionId) continue;
       records.push(loaded);
     }
 

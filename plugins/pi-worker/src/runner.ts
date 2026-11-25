@@ -22,8 +22,8 @@ import {
   readOutcomeFile,
   truncateTail,
 } from "./protocol.ts";
-import { TaskStore, defaultIsPidAlive, validateWorkerTier } from "./store.ts";
-import type { TaskRecord, TaskStatus, TaskSummary, WorkerTier } from "./store.ts";
+import { TaskStore, defaultIsPidAlive, groupTasksByParentSession, validateWorkerTier } from "./store.ts";
+import type { TaskRecord, TaskSessionGroup, TaskStatus, TaskSummary, WorkerTier } from "./store.ts";
 import { createEventFormatter } from "./stream.ts";
 import type { FormattedStreamEvent } from "./stream.ts";
 
@@ -49,6 +49,7 @@ const MAX_GIT_STATUS_LINES = 50;
 export interface StartTaskInput {
   cwd: string;
   prompt: string;
+  parentSessionId?: string;
   tier?: WorkerTier;
   readOnly?: boolean;
   model?: string;
@@ -86,6 +87,7 @@ export interface CancelTaskInput {
 export interface ListTasksInput {
   status?: TaskStatus;
   cwd?: string;
+  parentSessionId?: string;
   limit?: number;
 }
 
@@ -601,6 +603,10 @@ export class PiWorkerRunner {
     }
     const tier = validateWorkerTier(input.tier);
     const readOnly = input.readOnly === true;
+    const rawParentSession = input.parentSessionId ?? this.baseEnv.PI_WORKER_PARENT_SESSION_ID;
+    const parentSessionId = typeof rawParentSession === "string" && rawParentSession.trim()
+      ? rawParentSession.trim()
+      : undefined;
     const profile = this.store.resolveModelProfile(tier, this.baseEnv);
     const resolvedModel = input.model ?? profile.model;
     const resolvedProvider = input.model !== undefined ? input.provider : profile.provider;
@@ -615,6 +621,7 @@ export class PiWorkerRunner {
     const record: TaskRecord = {
       taskId,
       cwd: canonicalCwd,
+      ...(parentSessionId ? { parentSessionId } : {}),
       sessionDir: paths.sessionDir,
       logPath: paths.logPath,
       eventsPath: paths.eventsPath,
@@ -787,15 +794,21 @@ export class PiWorkerRunner {
     if (input.cwd) {
       canonicalCwd = validateCwd(input.cwd);
     }
+    const parentSessionId = input.parentSessionId?.trim() || undefined;
     const limit = input.limit === undefined ? 20 : Math.min(100, Math.max(1, Math.trunc(input.limit)));
     return this.store.list(
       {
         ...(input.status ? { status: input.status } : {}),
         ...(canonicalCwd ? { cwd: canonicalCwd } : {}),
+        ...(parentSessionId ? { parentSessionId } : {}),
         limit,
       },
       { inFlightTaskIds: this.inFlight },
     );
+  }
+
+  listGroups(input: ListTasksInput = {}): TaskSessionGroup[] {
+    return groupTasksByParentSession(this.list(input));
   }
 
   shutdown(): Promise<void> {

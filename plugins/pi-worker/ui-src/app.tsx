@@ -19,6 +19,7 @@ import type { TimelineEventLike, TimelineItem } from "./timeline.ts";
 interface TaskSummary {
   taskId: string;
   cwd: string;
+  parentSessionId?: string;
   status: string;
   roundCount: number;
   turnCount: number;
@@ -27,7 +28,23 @@ interface TaskSummary {
   lastActivityAt: string;
 }
 
+interface TaskSessionGroup {
+  groupKey: string;
+  parentSessionId: string | null;
+  cwd: string;
+  runningCount: number;
+  latestActivityAt: string;
+  tasks: TaskSummary[];
+}
+
+interface MonitorScope {
+  parentSessionId: string | null;
+  cwd: string | null;
+}
+
 interface TaskRecord extends TaskSummary {
+  tier?: string;
+  readOnly?: boolean;
   model?: string;
   provider?: string;
   thinking?: string;
@@ -50,10 +67,14 @@ interface EventsDeltaResult {
 }
 
 interface MonitorPayload {
+  scope?: MonitorScope;
   tasks?: TaskSummary[];
+  groups?: TaskSessionGroup[];
   task?: TaskRecord | null;
   stream?: EventsDeltaResult | null;
 }
+
+type ScopeMode = "session" | "cwd" | "all";
 
 const ToggleAuxPaneResultSchema = z.object({
   isError: z.boolean().optional(),
@@ -71,6 +92,36 @@ const LINK_SAFETY = { enabled: false } as const;
 function shortDir(cwd: string): string {
   const parts = cwd.replace(/\/+$/, "").split("/");
   return parts[parts.length - 1] || cwd;
+}
+
+function formatGroupLabel(group: TaskSessionGroup): string {
+  const dir = shortDir(group.cwd);
+  const sess = group.parentSessionId
+    ? `会话 ${group.parentSessionId.slice(0, 8)}`
+    : "未标记会话";
+  const running = group.runningCount > 0 ? ` · ${group.runningCount} 运行中` : "";
+  return `${dir} · ${sess} (${group.tasks.length}${running})`;
+}
+
+function fallbackGroupTasks(list: TaskSummary[]): TaskSessionGroup[] {
+  const map = new Map<string, TaskSessionGroup>();
+  for (const t of list) {
+    const pid = t.parentSessionId?.trim() || null;
+    const key = pid ? `session:${pid}` : `cwd:${t.cwd}`;
+    const activity = t.lastActivityAt || t.updatedAt;
+    let grp = map.get(key);
+    if (!grp) {
+      grp = { groupKey: key, parentSessionId: pid, cwd: t.cwd, runningCount: 0, latestActivityAt: activity, tasks: [] };
+      map.set(key, grp);
+    }
+    grp.tasks.push(t);
+    if (t.status === "running") grp.runningCount += 1;
+    if (activity.localeCompare(grp.latestActivityAt) > 0) {
+      grp.latestActivityAt = activity;
+      grp.cwd = t.cwd;
+    }
+  }
+  return [...map.values()];
 }
 
 function fmtTime(iso?: string): string {
@@ -339,6 +390,10 @@ function GenericEventRow({
 
 function MonitorApp() {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
+  const [groups, setGroups] = useState<TaskSessionGroup[]>([]);
+  const [initialScope, setInitialScope] = useState<MonitorScope>({ parentSessionId: null, cwd: null });
+  const [scopeMode, setScopeMode] = useState<ScopeMode>("all");
+  const [selectedGroupKey, setSelectedGroupKey] = useState<string | null>(null);
   const [currentTask, setCurrentTask] = useState<TaskRecord | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [events, setEvents] = useState<TimelineEventLike[]>([]);
@@ -349,6 +404,8 @@ function MonitorApp() {
   const offsetRef = useRef(0);
   const selectedTaskIdRef = useRef<string | null>(null);
   const currentTaskIdRef = useRef<string | null>(null);
+  const initialScopeRef = useRef<MonitorScope>({ parentSessionId: null, cwd: null });
+  const scopeModeRef = useRef<ScopeMode>("all");
   const requestEpochRef = useRef(0);
   const pollTimerRef = useRef<number | null>(null);
 
@@ -364,7 +421,7 @@ function MonitorApp() {
     }
   }, []);
 
-  const applyPayloadRef = useRef<(payload: MonitorPayload, resetStream: boolean) => boolean>(() => false);
+  const applyPayloadRef = useRef<(payload: MonitorPayload, resetStream: boolean, fromToolResult?: boolean) => boolean>(() => false);
   const schedulePollRef = useRef<(hasMore: boolean, nextTask: TaskRecord | null, nextTasks: TaskSummary[]) => void>(() => {});
 
   const poller = useMemo(() => createCoalescingRunner(async ({ forceReset }) => {
@@ -373,11 +430,21 @@ function MonitorApp() {
     const myEpoch = requestEpochRef.current;
     const reqOffset = forceReset ? 0 : offsetRef.current;
     const targetId = selectedTaskIdRef.current;
+    const mode = scopeModeRef.current;
+    const scope = initialScopeRef.current;
+
+    const filterArgs: Record<string, unknown> = {};
+    if (mode === "session" && scope.parentSessionId) {
+      filterArgs.parentSessionId = scope.parentSessionId;
+    } else if (mode === "cwd" && scope.cwd) {
+      filterArgs.cwd = scope.cwd;
+    }
 
     try {
       const res = await mcpApp.callServerTool({
         name: "pi_worker_app_snapshot",
         arguments: {
+          ...filterArgs,
           ...(targetId ? { taskId: targetId } : {}),
           offset: reqOffset,
         },
@@ -385,7 +452,7 @@ function MonitorApp() {
       if (myEpoch !== requestEpochRef.current) return;
       const sc = (res as { structuredContent?: MonitorPayload } | undefined)?.structuredContent;
       if (sc) {
-        const hasMore = applyPayloadRef.current(sc, forceReset);
+        const hasMore = applyPayloadRef.current(sc, forceReset, false);
         schedulePollRef.current(hasMore, sc.task ?? null, Array.isArray(sc.tasks) ? sc.tasks : []);
       } else {
         setLoadingInitial(false);
@@ -423,10 +490,29 @@ function MonitorApp() {
     }
   };
 
-  applyPayloadRef.current = (payload: MonitorPayload, resetStream: boolean): boolean => {
+  applyPayloadRef.current = (payload: MonitorPayload, resetStream: boolean, fromToolResult = false): boolean => {
     setLoadingInitial(false);
-    if (Array.isArray(payload.tasks)) {
-      setTasks(payload.tasks);
+    if (fromToolResult && payload.scope) {
+      const nextScope: MonitorScope = {
+        parentSessionId: payload.scope.parentSessionId ?? null,
+        cwd: payload.scope.cwd ?? null,
+      };
+      initialScopeRef.current = nextScope;
+      setInitialScope(nextScope);
+      const nextMode: ScopeMode = nextScope.parentSessionId
+        ? "session"
+        : nextScope.cwd
+          ? "cwd"
+          : "all";
+      scopeModeRef.current = nextMode;
+      setScopeMode(nextMode);
+      setSelectedGroupKey(null);
+    }
+
+    const nextTasks = Array.isArray(payload.tasks) ? payload.tasks : null;
+    if (nextTasks) {
+      setTasks(nextTasks);
+      setGroups(Array.isArray(payload.groups) ? payload.groups : fallbackGroupTasks(nextTasks));
     }
 
     const incomingTask = payload.task ?? null;
@@ -439,6 +525,9 @@ function MonitorApp() {
     if (incomingTask) {
       selectedTaskIdRef.current = incomingTask.taskId;
       setSelectedTaskId(incomingTask.taskId);
+    } else if (shouldReset) {
+      selectedTaskIdRef.current = null;
+      setSelectedTaskId(null);
     }
 
     if (shouldReset) {
@@ -477,7 +566,7 @@ function MonitorApp() {
         const sc = (result as { structuredContent?: MonitorPayload } | undefined)?.structuredContent;
         if (!sc) return;
         requestEpochRef.current += 1;
-        const hasMore = applyPayloadRef.current(sc, true);
+        const hasMore = applyPayloadRef.current(sc, true, true);
         schedulePollRef.current(hasMore, sc.task ?? null, Array.isArray(sc.tasks) ? sc.tasks : []);
       };
     },
@@ -497,8 +586,7 @@ function MonitorApp() {
     return () => clearPoll();
   }, [isConnected, pollSnapshot, clearPoll]);
 
-  const handleSelectChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
-    const nextId = e.target.value || null;
+  const switchTask = useCallback((nextId: string | null) => {
     if (nextId === selectedTaskIdRef.current) return;
     selectedTaskIdRef.current = nextId;
     setSelectedTaskId(nextId);
@@ -508,6 +596,33 @@ function MonitorApp() {
     clearPoll();
     void pollSnapshot(true);
   }, [clearPoll, pollSnapshot]);
+
+  const handleSelectChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
+    switchTask(e.target.value || null);
+  }, [switchTask]);
+
+  const handleScopeModeChange = useCallback((nextMode: ScopeMode) => {
+    if (nextMode === scopeModeRef.current) return;
+    scopeModeRef.current = nextMode;
+    setScopeMode(nextMode);
+    setSelectedGroupKey(null);
+    selectedTaskIdRef.current = null;
+    setSelectedTaskId(null);
+    requestEpochRef.current += 1;
+    offsetRef.current = 0;
+    setEvents([]);
+    clearPoll();
+    void pollSnapshot(true);
+  }, [clearPoll, pollSnapshot]);
+
+  const handleGroupPillClick = useCallback((groupKey: string | null) => {
+    setSelectedGroupKey(groupKey);
+    if (!groupKey) return;
+    const grp = groups.find((g) => g.groupKey === groupKey);
+    if (grp && grp.tasks.length > 0 && !grp.tasks.some((t) => t.taskId === selectedTaskIdRef.current)) {
+      switchTask(grp.tasks[0].taskId);
+    }
+  }, [groups, switchTask]);
 
   const handleRefresh = useCallback(() => {
     void pollSnapshot(false);
@@ -554,13 +669,15 @@ function MonitorApp() {
     }
   }, []);
 
-  const sortedTasks = useMemo(() => {
-    return [...tasks].sort((a, b) => {
-      if (a.status === "running" && b.status !== "running") return -1;
-      if (b.status === "running" && a.status !== "running") return 1;
-      return b.updatedAt.localeCompare(a.updatedAt);
-    });
-  }, [tasks]);
+  const visibleGroups = useMemo(() => {
+    const base = groups.length > 0 ? groups : fallbackGroupTasks(tasks);
+    if (!selectedGroupKey) return base;
+    const filtered = base.filter((g) => g.groupKey === selectedGroupKey);
+    return filtered.length > 0 ? filtered : base;
+  }, [groups, tasks, selectedGroupKey]);
+
+  const hasInitialScope = Boolean(initialScope.parentSessionId || initialScope.cwd);
+  const showGroupBar = hasInitialScope || groups.length > 1;
 
   const isRunning = currentTask?.status === "running";
   const timelineItems = useMemo(
@@ -588,13 +705,17 @@ function MonitorApp() {
           value={selectedTaskId ?? ""}
           onChange={handleSelectChange}
         >
-          {sortedTasks.length === 0 ? (
+          {visibleGroups.length === 0 ? (
             <option value="">暂无任务</option>
           ) : (
-            sortedTasks.map((t) => (
-              <option key={t.taskId} value={t.taskId}>
-                [{t.status}] {shortDir(t.cwd)} · R{t.roundCount} T{t.turnCount} ({t.taskId.slice(0, 8)})
-              </option>
+            visibleGroups.map((grp) => (
+              <optgroup key={grp.groupKey} label={formatGroupLabel(grp)}>
+                {grp.tasks.map((t) => (
+                  <option key={t.taskId} value={t.taskId}>
+                    [{t.status}] {shortDir(t.cwd)} · R{t.roundCount} T{t.turnCount} ({t.taskId.slice(0, 8)})
+                  </option>
+                ))}
+              </optgroup>
             ))
           )}
         </select>
@@ -612,6 +733,63 @@ function MonitorApp() {
         </button>
       </header>
 
+      {showGroupBar && (
+        <div className="scopebar" role="toolbar" aria-label="父会话与项目分组">
+          {hasInitialScope ? (
+            <>
+              {initialScope.parentSessionId && (
+                <button
+                  type="button"
+                  className={`scope-pill${scopeMode === "session" ? " active" : ""}`}
+                  onClick={() => handleScopeModeChange("session")}
+                  title={initialScope.parentSessionId}
+                >
+                  当前会话 ({initialScope.parentSessionId.slice(0, 8)})
+                </button>
+              )}
+              {initialScope.cwd && (
+                <button
+                  type="button"
+                  className={`scope-pill${scopeMode === "cwd" ? " active" : ""}`}
+                  onClick={() => handleScopeModeChange("cwd")}
+                  title={initialScope.cwd}
+                >
+                  当前项目 ({shortDir(initialScope.cwd)})
+                </button>
+              )}
+              <button
+                type="button"
+                className={`scope-pill${scopeMode === "all" ? " active" : ""}`}
+                onClick={() => handleScopeModeChange("all")}
+              >
+                全部
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                className={`scope-pill${selectedGroupKey === null ? " active" : ""}`}
+                onClick={() => handleGroupPillClick(null)}
+              >
+                全部 ({tasks.length})
+              </button>
+              {groups.map((grp) => (
+                <button
+                  key={grp.groupKey}
+                  type="button"
+                  className={`scope-pill${selectedGroupKey === grp.groupKey ? " active" : ""}`}
+                  onClick={() => handleGroupPillClick(grp.groupKey)}
+                  title={grp.parentSessionId ? `${grp.cwd} · 会话 ${grp.parentSessionId}` : grp.cwd}
+                >
+                  {formatGroupLabel(grp)}
+                </button>
+              ))}
+            </>
+          )}
+        </div>
+      )}
+
       <div className="main-wrap">
         <main id="main" className="main" ref={scrollRef}>
           <div className="main-content" ref={contentRef}>
@@ -628,7 +806,7 @@ function MonitorApp() {
                   "正在加载 Pi Worker 监控数据..."
                 ) : (
                   <>
-                    当前没有可展示的 Pi Worker 任务。
+                    当前作用域没有可展示的 Pi Worker 任务。
                     <br />
                     发起 <code>pi_worker_start</code> 后将自动在此显示实时进度。
                   </>
@@ -642,6 +820,13 @@ function MonitorApp() {
                       {isRunning && <span className="dot-pulse" />}
                       {currentTask.status}
                     </span>
+                    {currentTask.tier && <span className="tag">tier:{currentTask.tier}</span>}
+                    {currentTask.readOnly && <span className="tag">read-only</span>}
+                    {currentTask.parentSessionId && (
+                      <span className="tag" title={currentTask.parentSessionId}>
+                        会话 {currentTask.parentSessionId.slice(0, 8)}
+                      </span>
+                    )}
                     <span>Round {currentTask.roundCount} · Turn {currentTask.turnCount}</span>
                     <span className="muted">{modelLabel}{thinkingLabel}</span>
                   </div>

@@ -145,8 +145,11 @@ test("test_mcp_full_lifecycle_validation_and_graceful_shutdown", async () => {
     );
     const startSchema = listRes.result.tools.find((t) => t.name === "pi_worker_start").inputSchema;
     const replySchema = listRes.result.tools.find((t) => t.name === "pi_worker_reply").inputSchema;
+    const listSchema = listRes.result.tools.find((t) => t.name === "pi_worker_list").inputSchema;
     assert.equal("timeoutSeconds" in startSchema.properties, false);
     assert.equal("timeoutSeconds" in replySchema.properties, false);
+    assert.equal(startSchema.properties.parentSessionId.type, "string");
+    assert.equal(listSchema.properties.parentSessionId.type, "string");
     assert.deepEqual(startSchema.properties.tier.enum, ["fast", "default", "heavy"]);
     assert.equal(startSchema.properties.readOnly.type, "boolean");
     assert.deepEqual(replySchema.properties.tier.enum, ["fast", "default", "heavy"]);
@@ -171,13 +174,15 @@ test("test_mcp_full_lifecycle_validation_and_graceful_shutdown", async () => {
     assert.equal(task2.status, "done");
     assert.deepEqual(task2.verifiedCommands, ["node --test"]);
 
-    // 3. list
+    // 3. list（返回 tasks 与按父会话聚合的 groups，且支持 parentSessionId 过滤）
     const tasksRes = await client.request("tools/call", {
       name: "pi_worker_list",
       arguments: { cwd: workDir },
     });
     assert.equal(tasksRes.result.structuredContent.tasks.length, 1);
     assert.equal(tasksRes.result.structuredContent.tasks[0].taskId, task1.taskId);
+    assert.equal(tasksRes.result.structuredContent.groups.length, 1);
+    assert.equal(tasksRes.result.structuredContent.groups[0].groupKey, `cwd:${task1.cwd}`);
 
     // 4. 参数校验失败返回 isError: true 且进程不崩
     for (const badCall of [
@@ -508,25 +513,44 @@ test("test_mcp_progress_notifications_and_agy_app_endpoints", async () => {
     assert.deepEqual(emptyMon.result.structuredContent.tasks, []);
     assert.equal(emptyMon.result.structuredContent.task, null);
 
-    // 启动任务后，pi_worker_monitor 的 LLM content 紧凑（不含 events 数组），structuredContent 含 stream
+    // 启动任务后，pi_worker_monitor 的 LLM content 紧凑（不含 events 数组），structuredContent 含 stream 与 groups，且支持按 parentSessionId 隔离作用域
     const started = await agyClient.request("tools/call", {
       name: "pi_worker_start",
-      arguments: { cwd: workDir, prompt: "agy app task" },
+      arguments: { cwd: workDir, prompt: "agy app task", parentSessionId: "conv-harness" },
     });
     const tid = started.result.structuredContent.taskId;
-    const monRes = await agyClient.request("tools/call", { name: "pi_worker_monitor", arguments: { taskId: tid } });
+    assert.equal(started.result.structuredContent.parentSessionId, "conv-harness");
+
+    const monRes = await agyClient.request("tools/call", {
+      name: "pi_worker_monitor",
+      arguments: { taskId: tid, parentSessionId: "conv-harness" },
+    });
     assert.equal(monRes.result.isError, undefined);
+    assert.equal(monRes.result.structuredContent.scope.parentSessionId, "conv-harness");
     assert.equal(monRes.result.structuredContent.task.taskId, tid);
+    assert.equal(monRes.result.structuredContent.groups.length, 1);
+    assert.equal(monRes.result.structuredContent.groups[0].parentSessionId, "conv-harness");
     assert.ok(monRes.result.structuredContent.stream.events.length >= 1);
     assert.equal(monRes.result.content[0].text.includes('"events"'), false);
+
+    // 另一父会话作用域内不应串出 conv-harness 的任务
+    const otherSessionMon = await agyClient.request("tools/call", {
+      name: "pi_worker_monitor",
+      arguments: { parentSessionId: "conv-new-api" },
+    });
+    assert.equal(otherSessionMon.result.isError, undefined);
+    assert.deepEqual(otherSessionMon.result.structuredContent.tasks, []);
+    assert.deepEqual(otherSessionMon.result.structuredContent.groups, []);
+    assert.equal(otherSessionMon.result.structuredContent.task, null);
 
     // app-only snapshot 增量读取
     const snap = await agyClient.request("tools/call", {
       name: "pi_worker_app_snapshot",
-      arguments: { taskId: tid, offset: 0 },
+      arguments: { taskId: tid, parentSessionId: "conv-harness", offset: 0 },
     });
     assert.equal(snap.result.isError, undefined);
     assert.ok(snap.result.structuredContent.stream.events.length >= 1);
+    assert.equal(snap.result.structuredContent.groups.length, 1);
     await agyClient.close();
     agyClient = undefined;
 

@@ -11,8 +11,13 @@ import {
   PiWorkerRunner,
   isNestedWorkerEnv,
 } from "./runner.ts";
-import { TaskStore, resolveStateDir, validateWorkerTier } from "./store.ts";
-import type { TaskRecord, TaskStatus, WorkerTier } from "./store.ts";
+import {
+  TaskStore,
+  groupTasksByParentSession,
+  resolveStateDir,
+  validateWorkerTier,
+} from "./store.ts";
+import type { TaskRecord, TaskSessionGroup, TaskStatus, WorkerTier } from "./store.ts";
 import { formatTerminalLine, readFormattedEventsDelta } from "./stream.ts";
 import type { FormattedStreamEvent } from "./stream.ts";
 
@@ -50,6 +55,10 @@ const BASE_TOOLS: ToolDefinition[] = [
         prompt: {
           type: "string",
           description: "完整自包含任务说明（目标、文件锚点、约束红线与验收/返回证据要求，必填）",
+        },
+        parentSessionId: {
+          type: "string",
+          description: "可选：父会话标识（如宿主会话/对话 ID），用于跨 Harness 按父会话归组与隔离查询（缺省时回退 PI_WORKER_PARENT_SESSION_ID 环境变量）",
         },
         tier: {
           type: "string",
@@ -149,7 +158,7 @@ const BASE_TOOLS: ToolDefinition[] = [
   },
   {
     name: "pi_worker_list",
-    description: "列出当前状态目录中的任务精简摘要，可按 status 或 cwd 过滤。",
+    description: "列出当前状态目录中的任务精简摘要及按父会话归组结果，可按 status、cwd 或 parentSessionId 过滤。",
     inputSchema: {
       type: "object",
       properties: {
@@ -159,6 +168,7 @@ const BASE_TOOLS: ToolDefinition[] = [
           description: "可选：按状态过滤",
         },
         cwd: { type: "string", description: "可选：按工作区绝对路径过滤" },
+        parentSessionId: { type: "string", description: "可选：按父会话标识过滤" },
         limit: { type: "integer", minimum: 1, maximum: 100, description: "返回条数上限（默认 20，最大 100）" },
       },
       additionalProperties: false,
@@ -170,11 +180,13 @@ const AGY_APP_TOOLS: ToolDefinition[] = [
   {
     name: "pi_worker_monitor",
     description:
-      "在 Antigravity 侧面板打开 Pi Worker 实时进度监控面板，查看运行中与历史任务的流式思考、工具时间线、变更文件与一键取消。",
+      "在 Antigravity 侧面板打开 Pi Worker 实时进度监控面板，查看运行中与历史任务的流式思考、工具时间线、变更文件与一键取消；可传 parentSessionId/cwd 锁定默认作用域。",
     inputSchema: {
       type: "object",
       properties: {
-        taskId: { type: "string", description: "可选：默认聚焦的任务 UUID；省略时自动选中最新运行中或最近任务" },
+        taskId: { type: "string", description: "可选：默认聚焦的任务 UUID；省略时自动选中当前作用域内最新运行中或最近任务" },
+        parentSessionId: { type: "string", description: "可选：按父会话标识过滤默认作用域" },
+        cwd: { type: "string", description: "可选：按工作区绝对路径过滤默认作用域" },
       },
       additionalProperties: false,
     },
@@ -190,11 +202,13 @@ const AGY_APP_TOOLS: ToolDefinition[] = [
   },
   {
     name: "pi_worker_app_snapshot",
-    description: "供 Pi Worker MCP App 侧面板增量拉取任务列表、目标任务详情与格式化事件流。",
+    description: "供 Pi Worker MCP App 侧面板增量拉取按父会话分组的任务列表、目标任务详情与格式化事件流。",
     inputSchema: {
       type: "object",
       properties: {
         taskId: { type: "string", description: "可选：目标任务 UUID" },
+        parentSessionId: { type: "string", description: "可选：按父会话标识过滤" },
+        cwd: { type: "string", description: "可选：按工作区绝对路径过滤" },
         offset: { type: "integer", minimum: 0, description: "可选：events.jsonl 增量字节偏移" },
         tasksLimit: { type: "integer", minimum: 1, maximum: 100, description: "可选：任务列表条数上限（默认 20）" },
         maxEvents: { type: "integer", minimum: 1, maximum: 200, description: "可选：单次增量事件条数上限（默认 100）" },
@@ -316,16 +330,26 @@ function makeProgressEmitter(progressToken: unknown): ((ev: FormattedStreamEvent
 
 async function buildMonitorPayload(opts: {
   taskId?: string;
+  parentSessionId?: string;
+  cwd?: string;
   offset?: number;
   tasksLimit?: number;
   maxEvents?: number;
 }): Promise<{
+  scope: { parentSessionId: string | null; cwd: string | null };
   tasks: ReturnType<PiWorkerRunner["list"]>;
+  groups: TaskSessionGroup[];
   task: TaskRecord | null;
   stream: ReturnType<typeof readFormattedEventsDelta> | null;
 }> {
-  const tasks = runner.list({ limit: opts.tasksLimit ?? 20 });
+  const tasks = runner.list({
+    ...(opts.parentSessionId ? { parentSessionId: opts.parentSessionId } : {}),
+    ...(opts.cwd ? { cwd: opts.cwd } : {}),
+    limit: opts.tasksLimit ?? 50,
+  });
+  const groups = groupTasksByParentSession(tasks);
   const targetId = opts.taskId
+    ?? groups[0]?.tasks[0]?.taskId
     ?? tasks.find((t) => t.status === "running")?.taskId
     ?? tasks[0]?.taskId;
   let task: TaskRecord | null = null;
@@ -339,7 +363,16 @@ async function buildMonitorPayload(opts: {
   const stream = task
     ? readFormattedEventsDelta(task.eventsPath, opts.offset ?? 0, { maxEvents: opts.maxEvents ?? 100 })
     : null;
-  return { tasks, task, stream };
+  return {
+    scope: {
+      parentSessionId: opts.parentSessionId ?? null,
+      cwd: opts.cwd ?? null,
+    },
+    tasks,
+    groups,
+    task,
+    stream,
+  };
 }
 
 function readMonitorHtml(): string {
@@ -383,6 +416,7 @@ async function callTool(
         const record = await runner.start({
           cwd,
           prompt,
+          parentSessionId: optionalString(args.parentSessionId, "parentSessionId"),
           tier: optionalTier(args.tier),
           readOnly: optionalBoolean(args.readOnly, "readOnly"),
           model: optionalString(args.model, "model"),
@@ -451,26 +485,32 @@ async function callTool(
       const tasks = runner.list({
         ...(rawStatus ? { status: rawStatus as TaskStatus } : {}),
         cwd: optionalString(args.cwd, "cwd"),
+        parentSessionId: optionalString(args.parentSessionId, "parentSessionId"),
         limit: optionalNumber(args.limit, "limit"),
       });
-      return textResult({ tasks });
+      const groups = groupTasksByParentSession(tasks);
+      return textResult({ tasks, groups });
     }
 
     if (name === "pi_worker_monitor") {
       const taskId = optionalString(args.taskId, "taskId");
-      const payload = await buildMonitorPayload({ taskId });
+      const parentSessionId = optionalString(args.parentSessionId, "parentSessionId");
+      const cwd = optionalString(args.cwd, "cwd");
+      const payload = await buildMonitorPayload({ taskId, parentSessionId, cwd });
       const summary = payload.task
-        ? `Pi Worker 监控面板已就绪（共 ${payload.tasks.length} 个任务；当前聚焦 ${payload.task.taskId} [${payload.task.status}]）`
-        : `Pi Worker 监控面板已就绪（当前暂无任务）`;
+        ? `Pi Worker 监控面板已就绪（共 ${payload.tasks.length} 个任务 / ${payload.groups.length} 组；当前聚焦 ${payload.task.taskId} [${payload.task.status}]）`
+        : `Pi Worker 监控面板已就绪（当前作用域暂无任务）`;
       return textResult(payload, false, summary);
     }
 
     if (name === "pi_worker_app_snapshot") {
       const taskId = optionalString(args.taskId, "taskId");
+      const parentSessionId = optionalString(args.parentSessionId, "parentSessionId");
+      const cwd = optionalString(args.cwd, "cwd");
       const offset = optionalNumber(args.offset, "offset");
       const tasksLimit = optionalNumber(args.tasksLimit, "tasksLimit");
       const maxEvents = optionalNumber(args.maxEvents, "maxEvents");
-      const payload = await buildMonitorPayload({ taskId, offset, tasksLimit, maxEvents });
+      const payload = await buildMonitorPayload({ taskId, parentSessionId, cwd, offset, tasksLimit, maxEvents });
       return textResult(payload, false, "ok");
     }
 

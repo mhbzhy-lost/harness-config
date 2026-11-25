@@ -25,15 +25,16 @@ description: Use when delegating routed subagent tasks (broad exploration, test/
 
 ## MCP 工具
 
-- `pi_worker_start(cwd, prompt, tier?, readOnly?, model?, provider?, thinking?, excludeTools?, waitSeconds?)`：在独立隔离 Session 启动任务（不设总墙钟超时）。
+- `pi_worker_start(cwd, prompt, parentSessionId?, tier?, readOnly?, model?, provider?, thinking?, excludeTools?, waitSeconds?)`：在独立隔离 Session 启动任务（不设总墙钟超时）。
+  - `parentSessionId`：父会话标识（如宿主的对话/会话 ID；缺省时回退 `PI_WORKER_PARENT_SESSION_ID` 环境变量），用于公有核心层的父会话分组与作用域过滤。凡宿主上下文提供会话 ID 时，派单与打开监控均应透传，避免多项目/多会话任务混杂。
   - `tier`：抽象模型档位 `fast` / `default` / `heavy`（缺省为 `default`），按本机独立配置文件映射到实际模型。
   - `readOnly`：设为 `true` 时机械禁用 `write` / `edit` 工具并追加只读约束，且不占 `cwd` 写锁，允许同工作区多路只读任务并发；默认 `false`（同 `cwd` 独占写锁）。
   - 在 Antigravity 下自动作为后台任务执行并在本轮结束时唤醒主会话；其他 Harness 下立即返回 `taskId`。
 - `pi_worker_status(taskId, waitSeconds?)`：查看实时进度（`turnCount`/`lastTool`/`lastActivityAt`/`recentEvents`）、挂起问题或最终摘要与 `gitChanges`；非 Antigravity 环境下可传 `waitSeconds: 0–30` 短等。
 - `pi_worker_reply(taskId, reply, tier?, model?, provider?, thinking?, waitSeconds?)`：向非运行中的任务（`needs_input`/`done`/`blocked`/`failed`/`cancelled`）发送回复沿原隔离 Session 续跑，支持按需切换 `tier` 或覆盖模型与思考档位；在 Antigravity 下同样作为后台任务异步唤醒。
 - `pi_worker_cancel(taskId)`：优雅取消运行中或挂起的任务。
-- `pi_worker_list(status?, cwd?, limit?)`：列出任务摘要。
-- `pi_worker_monitor(taskId?)`（仅 AGY 模式）：打开右侧实时进度监控面板。
+- `pi_worker_list(status?, cwd?, parentSessionId?, limit?)`：列出任务摘要及按父会话聚合的 `groups`（未标记 `parentSessionId` 的旧任务按 `cwd` 回退归组）。
+- `pi_worker_monitor(taskId?, parentSessionId?, cwd?)`（仅 AGY 模式）：打开右侧实时进度监控面板，传入 `parentSessionId`/`cwd` 时默认锁定到对应父会话/项目作用域。
 
 ## 抽象档位与本机模型映射配置（per-machine，不入库）
 

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   TaskStore,
+  groupTasksByParentSession,
   loadWorkerConfig,
   loadWorkerDefaultConfig,
   resolveStateDir,
@@ -307,6 +308,75 @@ test("test_load_default_config_resolves_file_env_precedence_and_validates", () =
       model: "glm-5.4",
     });
     assert.throws(() => resolveWorkerTierProfile(dir, "invalid-tier", {}), /非法 tier/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_parent_session_filter_and_group_tasks_by_parent_session", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-group-"));
+  try {
+    const store = new TaskStore(dir, { isPidAlive: () => true });
+    const id1 = "11111111-1111-4111-8111-111111111111";
+    const id2 = "22222222-2222-4222-8222-222222222222";
+    const id3 = "33333333-3333-4333-8333-333333333333";
+    const id4 = "44444444-4444-4444-8444-444444444444";
+
+    store.save(makeRecord(store, {
+      taskId: id1,
+      cwd: "/repo/harness-config",
+      parentSessionId: "sess-a",
+      status: "done",
+      pid: null,
+      updatedAt: "2026-11-25T10:00:00.000Z",
+      lastActivityAt: "2026-11-25T10:00:00.000Z",
+    }));
+    store.save(makeRecord(store, {
+      taskId: id2,
+      cwd: "/repo/new-api-account-pool",
+      parentSessionId: "sess-b",
+      status: "running",
+      pid: 12345,
+      updatedAt: "2026-11-25T09:00:00.000Z",
+      lastActivityAt: "2026-11-25T09:00:00.000Z",
+    }));
+    store.save(makeRecord(store, {
+      taskId: id3,
+      cwd: "/repo/harness-config",
+      parentSessionId: "sess-a",
+      status: "done",
+      pid: null,
+      updatedAt: "2026-11-25T11:00:00.000Z",
+      lastActivityAt: "2026-11-25T11:00:00.000Z",
+    }));
+    // 未标记 parentSessionId 的历史任务按 cwd 回退归组
+    store.save(makeRecord(store, {
+      taskId: id4,
+      cwd: "/repo/legacy",
+      status: "done",
+      pid: null,
+      updatedAt: "2026-11-25T08:00:00.000Z",
+      lastActivityAt: "2026-11-25T08:00:00.000Z",
+    }));
+
+    assert.deepEqual(store.list({ parentSessionId: "sess-a" }).map((t) => t.taskId), [id3, id1]);
+    assert.deepEqual(store.list({ parentSessionId: "sess-b" }).map((t) => t.taskId), [id2]);
+
+    const groups = groupTasksByParentSession(store.list());
+    assert.equal(groups.length, 3);
+    // 有运行中任务的组排第一
+    assert.equal(groups[0].groupKey, "session:sess-b");
+    assert.equal(groups[0].parentSessionId, "sess-b");
+    assert.equal(groups[0].runningCount, 1);
+    assert.deepEqual(groups[0].tasks.map((t) => t.taskId), [id2]);
+
+    assert.equal(groups[1].groupKey, "session:sess-a");
+    assert.equal(groups[1].parentSessionId, "sess-a");
+    assert.deepEqual(groups[1].tasks.map((t) => t.taskId), [id3, id1]);
+
+    assert.equal(groups[2].groupKey, "cwd:/repo/legacy");
+    assert.equal(groups[2].parentSessionId, null);
+    assert.deepEqual(groups[2].tasks.map((t) => t.taskId), [id4]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

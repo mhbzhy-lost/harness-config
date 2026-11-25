@@ -12,10 +12,15 @@
       },
       "tools": {
         "pi_worker_start": {
-          "background": "always"
+          "background": "always",
+          "eager": true
         },
         "pi_worker_reply": {
-          "background": "always"
+          "background": "always",
+          "eager": true
+        },
+        "pi_worker_monitor": {
+          "eager": true
         }
       }
     }
