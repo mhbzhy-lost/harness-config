@@ -125,7 +125,10 @@ class AgySyncTest(unittest.TestCase):
         self.assertIn("pi_worker_start", text)
         self.assertIn("mcp_pi-worker_pi-worker_pi_worker_start", text)
         self.assertIn("主 Agent 职责边界", text)
-        self.assertIn("代码实现与文件写入", text)
+        self.assertIn("小范围定向读写与集成收口", text)
+        self.assertIn("无明确计划", text)
+        self.assertIn("有明确计划", text)
+        self.assertIn("git worktree", text)
         self.assertIn("writing-plans", text)
         self.assertIn("首轮强制委派", text)
         self.assertIn("executedCommands", text)
@@ -169,6 +172,35 @@ class AgySyncTest(unittest.TestCase):
         )
         self.assertIn("parent agent owns root-cause analysis", body)
 
+    def test_agy_reviewer_uses_pro_tier_and_has_no_file_write_tools(self) -> None:
+        agent_path = ROOT / "agy/agents/reviewer.md"
+        self.assertTrue(agent_path.exists())
+        text = agent_path.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("---\n"))
+        _, frontmatter, body = text.split("---", 2)
+        self.assertIn("\nname: reviewer\n", frontmatter)
+        self.assertIn("\nsubagent: true\n", frontmatter)
+        self.assertIn("\nmainAgent: false\n", frontmatter)
+        self.assertIn("\nmodel: pro\n", frontmatter)
+        self.assertIn("pi-worker (tier=heavy, readOnly=true)", frontmatter)
+        self.assertNotIn("Use PROACTIVELY", frontmatter)
+
+        tools = []
+        in_tools = False
+        for line in frontmatter.splitlines():
+            if line == "tools:":
+                in_tools = True
+                continue
+            if in_tools and line.startswith("  - "):
+                tools.append(line[4:].strip())
+            elif in_tools and line and not line.startswith(" "):
+                in_tools = False
+
+        self.assertEqual(set(tools), {"read_file", "run_command", "manage_task"})
+        self.assertNotIn("write_file", tools)
+        self.assertNotIn("edit_file", tools)
+        self.assertIn("Never modify repository files", body)
+
     def test_subagent_model_router_hook_behavior(self) -> None:
         hook_path = ROOT / "agy/hooks/subagent-model-router.py"
         self.assertTrue(hook_path.exists())
@@ -207,31 +239,60 @@ class AgySyncTest(unittest.TestCase):
             ),
             {"decision": "allow", "overwrite": {"Model": "flash"}},
         )
-        # 3. 显式指定 pro / flash_lite → 原样放行不覆盖
-        for explicit in ("pro", "flash_lite", "flash"):
+        # 3. 内置 review-agent 缺省或 inherit → 机械兜底 pro
+        self.assertEqual(
+            run_hook(
+                json.dumps(
+                    {
+                        "toolCall": {
+                            "name": "invoke_subagent",
+                            "args": {"TypeName": "review-agent"},
+                        }
+                    }
+                )
+            ),
+            {"decision": "allow", "overwrite": {"Model": "pro"}},
+        )
+        self.assertEqual(
+            run_hook(
+                json.dumps(
+                    {
+                        "toolCall": {
+                            "name": "invoke_subagent",
+                            "args": {"TypeName": "review-agent", "Model": "inherit"},
+                        }
+                    }
+                )
+            ),
+            {"decision": "allow", "overwrite": {"Model": "pro"}},
+        )
+        # 4. 显式指定 pro / flash_lite / flash → 原样放行不覆盖
+        for type_name in ("research", "review-agent"):
+            for explicit in ("pro", "flash_lite", "flash"):
+                self.assertEqual(
+                    run_hook(
+                        json.dumps(
+                            {
+                                "toolCall": {
+                                    "name": "invoke_subagent",
+                                    "args": {"TypeName": type_name, "Model": explicit},
+                                }
+                            }
+                        )
+                    ),
+                    {"decision": "allow"},
+                )
+        # 5. 其他 subagent（self / test-runner / reviewer）→ 原样放行
+        for passthrough in ("self", "test-runner", "reviewer"):
             self.assertEqual(
                 run_hook(
                     json.dumps(
-                        {
-                            "toolCall": {
-                                "name": "invoke_subagent",
-                                "args": {"TypeName": "research", "Model": explicit},
-                            }
-                        }
+                        {"toolCall": {"name": "invoke_subagent", "args": {"TypeName": passthrough}}}
                     )
                 ),
                 {"decision": "allow"},
             )
-        # 4. 其他 subagent（self / test-runner）→ 原样放行
-        self.assertEqual(
-            run_hook(
-                json.dumps(
-                    {"toolCall": {"name": "invoke_subagent", "args": {"TypeName": "self"}}}
-                )
-            ),
-            {"decision": "allow"},
-        )
-        # 5. 非法输入 → fail-open 放行
+        # 6. 非法输入 → fail-open 放行
         self.assertEqual(run_hook("not-json"), {"decision": "allow"})
 
     def test_pi_worker_session_injector_hook_behavior(self) -> None:
@@ -467,11 +528,12 @@ class AgySyncTest(unittest.TestCase):
             )
 
             # 4. AGY subagent 定义软链
-            agent_link = config_dir / "agents" / "test-runner.md"
-            self.assertTrue(agent_link.is_symlink())
-            self.assertEqual(
-                agent_link.resolve(), (ROOT / "agy/agents/test-runner.md").resolve()
-            )
+            for agent_name in ("test-runner.md", "reviewer.md"):
+                agent_link = config_dir / "agents" / agent_name
+                self.assertTrue(agent_link.is_symlink(), msg=f"缺少 agent 软链: {agent_link}")
+                self.assertEqual(
+                    agent_link.resolve(), (ROOT / "agy/agents" / agent_name).resolve()
+                )
 
             # 5. hooks.json 保留已有 hook 并注入内置子代理档位兜底 hook
             merged_hooks = json.loads(hooks_json.read_text(encoding="utf-8"))
