@@ -37,6 +37,7 @@ function makeRecord(store, overrides = {}) {
     question: null,
     options: [],
     verifiedCommands: [],
+    executedCommands: [],
     stopReason: null,
     exitCode: null,
     error: null,
@@ -63,6 +64,12 @@ test("test_save_and_load_enforces_private_permissions_and_dirs", () => {
     assert.equal(sessionDir, join(dir, "sessions"));
     assert.equal(outcomePath, join(dir, "outcomes", `${record.taskId}.json`));
     assert.deepEqual(store.load(record.taskId), record);
+
+    // 兼容历史磁盘记录：缺少 executedCommands 时加载补空数组
+    const legacy = { ...record };
+    delete legacy.executedCommands;
+    writeFileSync(taskFile, JSON.stringify(legacy), { mode: 0o600 });
+    assert.deepEqual(store.load(record.taskId)?.executedCommands, []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -13,7 +13,7 @@ description: Use when delegating routed subagent tasks (broad exploration, test/
   1. **只读子代理任务（`readOnly: true`，支持同 `cwd` 并发 2–4 路）**：
      - 跨目录广泛探索、调用链调查、仓库调研 → `tier: "fast"` + `readOnly: true`；
      - 常规测试、构建、lint、类型检查与报错日志压缩 → `tier: "fast"` + `readOnly: true`；
-     - 重噪声外部检索/长文档与大 JSON 抽取、Git 历史考古、基于最终 Diff 生成 PR/文档初稿 → `tier: "fast"` + `readOnly: true`；
+     - 多源网络调研/查外部技术文档、重噪声外部检索/长文档与大 JSON 抽取、Git 历史考古、基于最终 Diff 生成 PR/文档初稿 → `tier: "fast"` + `readOnly: true`；
      - 独立代码审查（只读审查） → `tier: "heavy"` + `readOnly: true`。
   2. **多步编码 / 长程任务（默认 `readOnly: false`，同 `cwd` 独占写锁）**：
      - 规格与红线清晰、具备可执行验收命令、预计多轮编辑与试错闭环 → `tier: "default"`（或按复杂度传 `heavy`）。
@@ -81,11 +81,25 @@ description: Use when delegating routed subagent tasks (broad exploration, test/
 3. **硬性约束与红线**：禁止破坏的契约、只读约束、代码风格或提交纪律；
 4. **验收命令 / 返回证据要求**：编码任务写明必跑验收命令；只读探索/验证/审查任务写明要求的证据格式（文件行号、真实退出码、失败栈帧等）。
 
+## 磁盘证据核验（跨 Harness 工具边界机制，禁止轻信 Pi 自述）
+
+`summary` 与 `verifiedCommands` 均由 Pi 通过 `worker_finish` 自述填报，存在遗漏失败、弱化 skip 或行号失真风险。该核验机制位于 `pi-worker` 工具边界（所有 Harness 共用，非某个宿主专属）：每次任务进入非运行态时，`pi_worker_start` / `pi_worker_reply` / `pi_worker_status` 均会返回防篡改磁盘证据并在回执中附带核验提醒，主代理向用户汇报结论前必须交叉核验：
+
+1. **机器记录的命令索引（`executedCommands`）**：
+   - `TaskRecord.executedCommands` 由 `runner.ts` 直接从 Pi 真实 `tool_execution_start`/`tool_execution_end` 机械提取（含 `{ round, startSeq, endSeq, command, isError, durationMs }`），Pi 无法篡改。先核对其中真实跑过的命令与 `isError`，再对比 `verifiedCommands`。
+2. **未截断原始执行轨迹（`eventsPath`）**：
+   - 路径在回执 `eventsPath` 中（`~/.pi/agent/pi-worker/logs/<taskId>.events.jsonl`），完整记录每条 `tool_start`（完整参数）与 `tool_end`（未截断完整 stdout/stderr、`isError`、耗时）。
+   - 需要查证某次命令真实输出、报错栈帧或探索过程时，直接读取 `eventsPath`（或结合 `executedCommands` 的 `endSeq` 定向检索 / 运行 `node plugins/pi-worker/src/stream.ts <taskId> --json` 抽取对应 `seq`）。
+3. **工作区真实文件与 Diff**：
+   - **编码任务**：对 `gitChanges` 执行 `git diff` 或直接读取改动文件，确认代码契约与测试真实落地；
+   - **验证任务**：以 `executedCommands` 及 `eventsPath` 对应 `tool_end` 的原始退出码与输出为准，不直接照抄 `summary`；
+   - **探索 / 代码审查任务**：对 Pi 汇报的核心结论与高风险 finding，按其引用的 `file:line` 直接读取对应源码核实后再向用户定论。
+
 ## Suspend-Resume 协作协议
 
 1. **读写期间冻结同工作区写入**：非 `readOnly` 任务运行期间，主会话严禁同时修改同一 `cwd` 的文件；`readOnly: true` 任务允许同 `cwd` 并行 2–4 路。
 2. **收到 `status: "needs_input"` 时二级接球**：
    - 先检查主会话上下文是否已有明确答案（如用户早前拍板的取舍）；**能自答就直接 `pi_worker_reply` 秒答续跑**（在几分钟内续跑可命中 Pi 的前缀缓存，省成本且不打扰用户）；
    - 若确实属于需要人类拍板的产品/架构歧义，向用户简明呈现 `question` 与 `options`，拿到答复后再 `pi_worker_reply` 续跑。
-3. **收到 `status: "done"` 后核验交付**：主会话核对 `summary`、`verifiedCommands` 与 `gitChanges`，必要时再以 `tier: "heavy"` + `readOnly: true` 对最终 diff 发起独立代码审查。
-4. **收到 `status: "blocked"` 或 `"failed"`**：先查看 `error`、`stopReason` 与最近事件，补充条件（或按需在 `pi_worker_reply` 切换 `tier`/模型）后续跑，或改由主会话接手处理。
+3. **收到 `status: "done"` 后核验交付**：主会话必须按上方“磁盘证据核验”核对 `executedCommands`、`eventsPath`、`gitChanges`/diff 与关键 `file:line`，必要时再以 `tier: "heavy"` + `readOnly: true` 对最终 diff 发起独立代码审查。
+4. **收到 `status: "blocked"` 或 `"failed"`**：先查看 `error`、`stopReason`、`executedCommands` 与 `eventsPath`，补充条件（或按需在 `pi_worker_reply` 切换 `tier`/模型）后续跑，或改由主会话接手处理。

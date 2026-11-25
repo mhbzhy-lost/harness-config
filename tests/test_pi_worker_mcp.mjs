@@ -131,6 +131,9 @@ test("test_mcp_full_lifecycle_validation_and_graceful_shutdown", async () => {
     const initRes = await client.request("initialize", { protocolVersion: "2025-06-18" });
     assert.equal(initRes.result.serverInfo.name, "pi-worker");
     assert.ok(initRes.result.capabilities.tools);
+    assert.match(initRes.result.instructions, /executedCommands/);
+    assert.match(initRes.result.instructions, /eventsPath/);
+    assert.doesNotMatch(initRes.result.instructions, /Antigravity/);
 
     const listRes = await client.request("tools/list");
     assert.deepEqual(
@@ -163,6 +166,13 @@ test("test_mcp_full_lifecycle_validation_and_graceful_shutdown", async () => {
     const task1 = startRes.result.structuredContent;
     assert.equal(task1.status, "needs_input");
     assert.equal(task1.question, "字段用 camelCase 还是 snake_case？");
+    assert.equal(task1.executedCommands.length, 1);
+    assert.equal(task1.executedCommands[0].command, "echo step");
+    assert.equal(task1.executedCommands[0].isError, false);
+    assert.equal(startRes.result.content.length, 2);
+    assert.equal(JSON.parse(startRes.result.content[0].text).taskId, task1.taskId);
+    assert.match(startRes.result.content[1].text, /磁盘证据核验提醒/);
+    assert.ok(startRes.result.content[1].text.includes(task1.eventsPath));
 
     // 2. reply -> done
     const replyRes = await client.request("tools/call", {
@@ -173,6 +183,11 @@ test("test_mcp_full_lifecycle_validation_and_graceful_shutdown", async () => {
     const task2 = replyRes.result.structuredContent;
     assert.equal(task2.status, "done");
     assert.deepEqual(task2.verifiedCommands, ["node --test"]);
+    assert.equal(task2.executedCommands.length, 1);
+    assert.equal(task2.executedCommands[0].round, 2);
+    assert.equal(task2.executedCommands[0].command, "echo step");
+    assert.equal(replyRes.result.content.length, 2);
+    assert.match(replyRes.result.content[1].text, /磁盘证据核验提醒/);
 
     // 3. list（返回 tasks 与按父会话聚合的 groups，且支持 parentSessionId 过滤）
     const tasksRes = await client.request("tools/call", {
@@ -211,6 +226,7 @@ test("test_mcp_full_lifecycle_validation_and_graceful_shutdown", async () => {
       arguments: { cwd: workDir, prompt: "sleep forever", waitSeconds: 0 },
     });
     assert.equal(sleepStart.result.structuredContent.status, "running");
+    assert.equal(sleepStart.result.content.length, 1, "running snapshot should not attach settled evidence notice");
 
     // 等待 fake-pi 写下 pidFile
     for (let i = 0; i < 40; i += 1) {

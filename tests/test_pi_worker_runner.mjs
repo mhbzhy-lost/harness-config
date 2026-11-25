@@ -101,8 +101,48 @@ if (mode === "sleep") {
   const round = lines.length;
   process.stdout.write("[antigravity] non-json startup noise\\n");
   process.stdout.write(JSON.stringify({ type: "session", id: argv[argv.indexOf("--session-id") + 1], cwd: process.cwd() }) + "\\n");
-  process.stdout.write(JSON.stringify({ type: "tool_execution_start", toolName: "bash" }) + "\\n");
-  process.stdout.write(JSON.stringify({ type: "tool_execution_end", toolName: "bash" }) + "\\n");
+  if (round === 1) {
+    process.stdout.write(JSON.stringify({
+      type: "tool_execution_start",
+      toolCallId: "b-r1-1",
+      toolName: "bash",
+      args: { command: "git status --short" },
+    }) + "\\n");
+    process.stdout.write(JSON.stringify({
+      type: "tool_execution_end",
+      toolCallId: "b-r1-1",
+      toolName: "bash",
+      isError: false,
+      result: { content: [{ type: "text", text: "M src/index.ts" }] },
+    }) + "\\n");
+  } else {
+    process.stdout.write(JSON.stringify({
+      type: "tool_execution_start",
+      toolCallId: "b-r2-1",
+      toolName: "bash",
+      args: { command: "node --test" },
+    }) + "\\n");
+    process.stdout.write(JSON.stringify({
+      type: "tool_execution_end",
+      toolCallId: "b-r2-1",
+      toolName: "bash",
+      isError: false,
+      result: { content: [{ type: "text", text: "ok 1" }] },
+    }) + "\\n");
+    process.stdout.write(JSON.stringify({
+      type: "tool_execution_start",
+      toolCallId: "b-r2-2",
+      toolName: "bash",
+      args: { command: "npm run lint" },
+    }) + "\\n");
+    process.stdout.write(JSON.stringify({
+      type: "tool_execution_end",
+      toolCallId: "b-r2-2",
+      toolName: "bash",
+      isError: true,
+      result: { content: [{ type: "text", text: "lint failed" }] },
+    }) + "\\n");
+  }
   process.stdout.write(JSON.stringify({ type: "turn_end" }) + "\\n");
   if (round === 1) {
     writeFileSync(process.env.PI_WORKER_OUTCOME_FILE, JSON.stringify({
@@ -172,6 +212,11 @@ test("test_start_needs_input_then_reply_resumes_same_session_via_stdin", async (
     assert.deepEqual(first.options, ["A", "B"]);
     assert.equal(first.roundCount, 1);
     assert.equal(first.turnCount, 1);
+    assert.equal(first.executedCommands.length, 1);
+    assert.equal(first.executedCommands[0].round, 1);
+    assert.equal(first.executedCommands[0].command, "git status --short");
+    assert.equal(first.executedCommands[0].isError, false);
+    assert.ok(first.executedCommands[0].startSeq < first.executedCommands[0].endSeq);
 
     const second = await runner.reply({
       taskId: first.taskId,
@@ -182,6 +227,16 @@ test("test_start_needs_input_then_reply_resumes_same_session_via_stdin", async (
     assert.equal(second.roundCount, 2);
     assert.equal(second.question, null);
     assert.deepEqual(second.verifiedCommands, ["node --test"]);
+    // executedCommands 独立于 worker_finish 自述，客观记录本轮全部真实 bash 命令（含失败项）且重置上一轮记录
+    assert.equal(second.executedCommands.length, 2);
+    assert.deepEqual(
+      second.executedCommands.map((c) => ({ round: c.round, command: c.command, isError: c.isError })),
+      [
+        { round: 2, command: "node --test", isError: false },
+        { round: 2, command: "npm run lint", isError: true },
+      ],
+    );
+    assert.ok(second.executedCommands.every((c) => c.startSeq < c.endSeq));
 
     const records = readFileSync(recordFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
     assert.equal(records.length, 2);

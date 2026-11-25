@@ -47,7 +47,7 @@ const BASE_TOOLS: ToolDefinition[] = [
   {
     name: "pi_worker_start",
     description:
-      "在独立隔离的 Pi Session 中启动子代理/长程执行任务。支持通过抽象档位 tier（fast/default/heavy，由本机 config.json 映射到实际模型）和 readOnly（禁用 write/edit 并允许同 cwd 多路并发只读）承接探索、测试验证、代码审查与多步编码任务；读写模式同一 cwd 同时只允许 1 个运行中任务，严禁在 Pi 会话内部自我嵌套调用。",
+      "在独立隔离的 Pi Session 中启动子代理/工作器任务：支持代码库探索与调研、测试/构建/lint 验证与日志压缩（tier=fast, readOnly=true，支持同 cwd 多路并发）、独立代码审查（tier=heavy, readOnly=true）及多步编码任务（tier=default）。返回机器提取的 executedCommands、eventsPath（未截断工具输入输出）与 gitChanges 供主代理核验；严禁在 Pi 会话内部自我嵌套调用。",
     inputSchema: {
       type: "object",
       properties: {
@@ -127,7 +127,7 @@ const BASE_TOOLS: ToolDefinition[] = [
   {
     name: "pi_worker_status",
     description:
-      "查询任务实时进度（turnCount/lastTool/recentEvents）、挂起提问（question/options）或最终摘要与 git 变更；可传 waitSeconds（0–30）短等状态变化。",
+      "查询任务实时进度（turnCount/lastTool/recentEvents）、挂起提问（question/options）或终态结果（summary、机器提取的 executedCommands、eventsPath 磁盘轨迹与 gitChanges）；可传 waitSeconds（0–30）短等状态变化。",
     inputSchema: {
       type: "object",
       properties: {
@@ -240,17 +240,16 @@ const ACTIVE_TOOLS: ToolDefinition[] = agyMode ? [...BASE_TOOLS, ...AGY_APP_TOOL
 const TOOL_NAME_SET = new Set(ACTIVE_TOOLS.map((t) => t.name));
 
 const BASE_INSTRUCTIONS = [
-  "通过 pi-worker 委派独立子代理与长程任务：广泛探索/测试日志压缩/重噪声抽取用 tier=fast + readOnly=true；独立代码审查用 tier=heavy + readOnly=true；多步编码长任务用默认 tier=default（读写模式）。",
-  "1–2 步定向读写由主会话直接完成；严禁在 Pi 会话内部自嵌套调用。",
+  "磁盘证据核验（跨 Harness 通用，严禁只信自述）：任务返回中的 summary 与 verifiedCommands 仅为 Pi 自述，不得直接当已验证事实转述。整合回复前必须对照机器提取的 executedCommands（真实命令、isError、startSeq/endSeq）、eventsPath（未截断 tool_start/tool_end 磁盘日志）、gitChanges/git diff 及引用 file:line 源码做交叉核验。",
   "当任务返回 status=needs_input 时，优先依据主会话已有上下文通过 pi_worker_reply 秒答续跑（命中前缀缓存），拍不了板再转问用户。",
-  "只读任务（readOnly=true）可同工作区并发；读写任务运行期间主会话不得同时修改同一工作区文件，done 后由主会话核验 gitChanges 与 diff。",
+  "探索、验证与独立审查优先使用 readOnly=true（可同工作区并发）；读写任务运行期间主会话不得同时修改同一工作区文件；严禁在 Pi 会话内部自嵌套调用。",
 ];
 
 const INSTRUCTIONS = (
   agyMode
     ? [
         ...BASE_INSTRUCTIONS,
-        "当前运行于 Antigravity 原生后台模式：pi_worker_start 与 pi_worker_reply 由宿主作为后台任务异步执行并在本轮结束时自动唤醒主会话，无需循环轮询 pi_worker_status；需要实时可视化观测进度时可调用 pi_worker_monitor 打开侧面板。",
+        "当前运行于 Antigravity 原生后台模式：pi_worker_start 与 pi_worker_reply 由宿主作为后台任务异步执行并在本轮结束时自动唤醒主会话，无需循环轮询 pi_worker_status；凡符合路由表的探索、验证、审查或长程编码任务应在首轮直接派发 pi_worker_start，需要实时可视化观测进度时可调用 pi_worker_monitor 打开侧面板。",
       ]
     : BASE_INSTRUCTIONS
 ).join("\n");
@@ -269,12 +268,44 @@ function textResult(
   data: unknown,
   isError = false,
   summaryText?: string,
+  extraNotes?: string[],
 ): { content: Array<{ type: string; text: string }>; structuredContent?: unknown; isError?: boolean } {
+  const content: Array<{ type: string; text: string }> = [
+    { type: "text", text: summaryText ?? JSON.stringify(data, null, 2) },
+  ];
+  for (const note of extraNotes ?? []) {
+    if (note.trim()) content.push({ type: "text", text: note });
+  }
   return {
-    content: [{ type: "text", text: summaryText ?? JSON.stringify(data, null, 2) }],
+    content,
     structuredContent: data,
     ...(isError ? { isError: true } : {}),
   };
+}
+
+function buildEvidenceNotice(record: TaskRecord): string | null {
+  if (record.status === "running") return null;
+  const cmds = record.executedCommands ?? [];
+  const failedCmds = cmds.filter((c) => c.isError);
+  const lines = [
+    "[磁盘证据核验提醒] summary 与 verifiedCommands 仅为 worker 自述，向用户定论前须交叉核验磁盘证据：",
+    `- 真实命令索引（executedCommands）：本轮共执行 ${cmds.length} 条 bash 命令，失败 ${failedCmds.length} 条${
+      failedCmds.length > 0
+        ? `（失败项：${failedCmds.slice(0, 5).map((c) => `seq=${c.endSeq} \`${c.command || "(empty)"}\``).join("；")}）`
+        : ""
+    }。`,
+    `- 未截断原始轨迹（eventsPath）：${record.eventsPath}（含完整 tool_start/tool_end 参数与输出，可直接读取或按 seq 抽查）。`,
+  ];
+  if (record.gitChanges.length > 0) {
+    lines.push(`- 工作区改动（gitChanges）：共 ${record.gitChanges.length} 项，请用 git diff 或直接读取改动文件核验。`);
+  }
+  lines.push("- 探索/审查结论涉及的关键 file:line 须直接读取对应源码核实后再向用户定论。");
+  return lines.join("\n");
+}
+
+function taskResult(record: TaskRecord) {
+  const notice = buildEvidenceNotice(record);
+  return textResult(record, false, undefined, notice ? [notice] : undefined);
 }
 
 function optionalString(value: unknown, field: string): string | undefined {
@@ -428,7 +459,7 @@ async function callTool(
           ...(reqKey ? { onTaskCreated: (taskId) => { inFlightRequests.set(reqKey, taskId); } } : {}),
           ...(onProgress ? { onProgress } : {}),
         });
-        return textResult(record);
+        return taskResult(record);
       } finally {
         rpcDone = true;
         if (reqKey) inFlightRequests.delete(reqKey);
@@ -453,7 +484,7 @@ async function callTool(
           ...(reqKey ? { onTaskCreated: (id) => { inFlightRequests.set(reqKey, id); } } : {}),
           ...(onProgress ? { onProgress } : {}),
         });
-        return textResult(record);
+        return taskResult(record);
       } finally {
         rpcDone = true;
         if (reqKey) inFlightRequests.delete(reqKey);
@@ -467,7 +498,7 @@ async function callTool(
         taskId,
         waitSeconds: optionalNumber(args.waitSeconds, "waitSeconds"),
       });
-      return textResult(record);
+      return taskResult(record);
     }
 
     if (name === "pi_worker_cancel" || name === "pi_worker_app_cancel") {

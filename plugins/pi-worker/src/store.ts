@@ -20,6 +20,15 @@ export type TaskStatus = "running" | "needs_input" | "done" | "blocked" | "faile
 export const WORKER_TIERS = ["fast", "default", "heavy"] as const;
 export type WorkerTier = (typeof WORKER_TIERS)[number];
 
+export interface ExecutedCommandEvidence {
+  round: number;
+  startSeq: number;
+  endSeq: number;
+  command: string;
+  isError: boolean;
+  durationMs?: number;
+}
+
 export interface TaskRecord {
   taskId: string;
   cwd: string;
@@ -47,6 +56,7 @@ export interface TaskRecord {
   question: string | null;
   options: string[];
   verifiedCommands: string[];
+  executedCommands: ExecutedCommandEvidence[];
   stopReason: string | null;
   exitCode: number | null;
   error: string | null;
@@ -601,6 +611,9 @@ export class TaskStore {
       if (!parsed || typeof parsed !== "object" || parsed.taskId !== validId) return null;
       if (typeof parsed.eventsPath !== "string" || !parsed.eventsPath) {
         parsed.eventsPath = join(this.stateDir, "logs", `${validId}.events.jsonl`);
+      }
+      if (!Array.isArray(parsed.executedCommands)) {
+        parsed.executedCommands = [];
       }
       return parsed;
     } catch {

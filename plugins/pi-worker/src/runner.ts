@@ -23,7 +23,14 @@ import {
   truncateTail,
 } from "./protocol.ts";
 import { TaskStore, defaultIsPidAlive, groupTasksByParentSession, validateWorkerTier } from "./store.ts";
-import type { TaskRecord, TaskSessionGroup, TaskStatus, TaskSummary, WorkerTier } from "./store.ts";
+import type {
+  ExecutedCommandEvidence,
+  TaskRecord,
+  TaskSessionGroup,
+  TaskStatus,
+  TaskSummary,
+  WorkerTier,
+} from "./store.ts";
 import { createEventFormatter } from "./stream.ts";
 import type { FormattedStreamEvent } from "./stream.ts";
 
@@ -41,6 +48,8 @@ const READONLY_APPEND_PROMPT =
 export const WORKER_EXTENSION_PATH = join(dirname(fileURLToPath(import.meta.url)), "worker-ext.ts");
 
 const MAX_RECENT_EVENTS = 10;
+const MAX_EXECUTED_COMMANDS = 50;
+const MAX_EXECUTED_COMMAND_PREVIEW_CHARS = 300;
 const MAX_STDERR_CHARS = 16 * 1024;
 const CANCEL_GRACE_MS = 3000;
 const GIT_STATUS_TIMEOUT_MS = 2000;
@@ -388,9 +397,38 @@ export class PiWorkerRunner {
     const eventsStream = createWriteStream(record.eventsPath, { flags: "a", mode: 0o600 });
     eventsStream.on("error", () => { /* 进度流写入失败不阻塞主流程 */ });
     const eventFormatter = createEventFormatter({ round: record.roundCount });
+    const pendingBashCommands = new Map<string, { command: string; startSeq: number }>();
+    const compactCommandPreview = (text: string): string => {
+      const cleaned = text.replace(/\s+/g, " ").trim();
+      if (cleaned.length <= MAX_EXECUTED_COMMAND_PREVIEW_CHARS) return cleaned;
+      return `${cleaned.slice(0, MAX_EXECUTED_COMMAND_PREVIEW_CHARS)}…`;
+    };
     const recordFormattedEvents = (formatted: FormattedStreamEvent[]): void => {
       for (const item of formatted) {
         eventsStream.write(`${JSON.stringify(item)}\n`);
+        if (item.kind === "tool_start" && item.toolName === "bash") {
+          const key = item.toolCallId ?? "bash";
+          pendingBashCommands.set(key, {
+            command: compactCommandPreview(item.detail ?? item.preview ?? ""),
+            startSeq: item.seq,
+          });
+        } else if (item.kind === "tool_end" && item.toolName === "bash") {
+          const key = item.toolCallId ?? "bash";
+          const started = pendingBashCommands.get(key);
+          if (started) pendingBashCommands.delete(key);
+          const entry: ExecutedCommandEvidence = {
+            round: item.round ?? record.roundCount,
+            startSeq: started?.startSeq ?? item.seq,
+            endSeq: item.seq,
+            command: started?.command ?? "",
+            isError: item.isError === true,
+            ...(item.durationMs !== undefined ? { durationMs: item.durationMs } : {}),
+          };
+          record.executedCommands.push(entry);
+          if (record.executedCommands.length > MAX_EXECUTED_COMMANDS) {
+            record.executedCommands.splice(0, record.executedCommands.length - MAX_EXECUTED_COMMANDS);
+          }
+        }
         try { onProgress?.(item); } catch { /* 进度通知异常不阻塞主流程 */ }
       }
     };
@@ -583,6 +621,7 @@ export class PiWorkerRunner {
         ...active.record,
         options: [...active.record.options],
         verifiedCommands: [...active.record.verifiedCommands],
+        executedCommands: active.record.executedCommands.map((c) => ({ ...c })),
         gitChanges: [...active.record.gitChanges],
         recentEvents: [...active.record.recentEvents],
       };
@@ -645,6 +684,7 @@ export class PiWorkerRunner {
       question: null,
       options: [],
       verifiedCommands: [],
+      executedCommands: [],
       stopReason: null,
       exitCode: null,
       error: null,
@@ -706,6 +746,7 @@ export class PiWorkerRunner {
       question: null,
       options: [],
       verifiedCommands: [],
+      executedCommands: [],
       stopReason: null,
       exitCode: null,
       error: null,

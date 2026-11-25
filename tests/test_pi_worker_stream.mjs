@@ -252,6 +252,7 @@ test("test_stream_cli_outputs_formatted_lines_and_json", () => {
       question: null,
       options: [],
       verifiedCommands: [],
+      executedCommands: [],
       stopReason: "stop",
       exitCode: 0,
       error: null,
