@@ -16,21 +16,23 @@ trigger: always_on
 
 ## 子代理路由
 
-主模型负责需求澄清、调度、架构判断、关键修改与最终回复；下表所列独立子代理与长程任务统一委派给 `pi-worker`（直接调用已预加载的 `mcp_pi-worker_pi-worker_pi_worker_start`，简称 `pi_worker_start`）。用户显式指定的原生 subagent（如 `browser`、`research`、`test-runner`、`self`）或流程优先。
+采用**封闭主 Agent 职责边界、其余默认委派**原则：明确限定主 Agent 自己只做什么；凡落在主 Agent 职责边界之外的工作，默认全部委派给 `pi-worker`（直接调用已预加载的 `mcp_pi-worker_pi-worker_pi_worker_start`，简称 `pi_worker_start`）。
 
-| 任务 | 执行者 | 抽象档位（`tier`） | 模式 | 返回证据 |
-|---|---|---|---|---|
-| 了解项目/模块、跨目录广泛探索、调用链调查、未知问题排查调研 | `pi-worker` | `fast` | `readOnly: true` | 文件、行号、关键代码摘录、未确定项 |
-| 常规测试、构建、lint、类型检查与报错日志压缩 | `pi-worker` | `fast` | `readOnly: true` | 命令、真实退出码、关键失败栈帧、skip、环境限制 |
-| 多源网络调研/查外部技术文档、重噪声外部检索/长文档与大 JSON 抽取、Git 历史考古、基于最终 Diff 生成 PR/文档初稿 | `pi-worker` | `fast` | `readOnly: true` | 结构化结论与来源（URL/ID/Commit/文件行号） |
-| 独立代码审查 | `pi-worker` | `heavy` | `readOnly: true` | 位置、失败场景、验证结果 |
-| 规格明确的多步编码 / 其他独立任务 | `pi-worker` | `default` | 读写（同 `cwd` 独占锁） | 摘要、`executedCommands`、`gitChanges` |
+### 主 Agent 职责边界（仅以下工作由主 Agent 直接完成）
 
-- **首轮强制委派（高于内置本地并行搜读与直连检索偏好）**：只要请求涉及**了解/调研项目或模块、排查未知根因/调用链、跨目录搜索、多源网络调研/查外部技术文档、跑测试/构建/lint、Git 历史分析或代码审查**，**第一轮就必须直接调用 `pi_worker_start`**，禁止以“先 `ls`/`find`/`rg` 看一眼目录”“先自己读几个文件或连搜几轮网页摸底”为由自行展开多步探索。
-- **仅以下白名单允许主模型直接读写**：用户已给出确切文件路径（或主模型已拿到精确 `file:line` 锚点，仅需 1–2 次定向 `read_file`/`edit_file` 即可收口且无需目录探索/广搜），以及核验 `pi-worker` 返回的磁盘证据。
-- **抽象档位与独立映射**：路由表只定义抽象档位（`fast` / `default` / `heavy`），不在规则中写死具体模型 ID；抽象档位到实际 `provider`/`model`/`thinking` 的映射由独立本机配置文件 `~/.pi/agent/pi-worker/config.json` 维护（未配置档位自动回退 `default`，详见 `pi-worker` skill）。
-- **父会话归组**：调 `pi_worker_start` 与 `pi_worker_monitor` 时传入当前会话的 `Conversation ID` 作为 `parentSessionId`（打开监控面板时可同步传当前 `cwd`），使任务按父会话归组与隔离展示。
-- **异步等待与并发**：在 AGY 下 `pi_worker_start` / `pi_worker_reply` 作为后台任务异步运行并在完成时自动唤醒主会话；不要轮询 `pi_worker_status`，等待期间继续非重叠工作或先向用户报告状态，不预测结果。独立只读任务（`readOnly: true`）机械禁用 `write`/`edit` 且不占写锁，可同工作区并行 2–4 路派发；读写任务同 `cwd` 串行独占，运行期间主会话不得修改同工作区文件。
+1. **需求澄清与决策沟通**：理解用户意图、向用户提问拍板、整合最终结论并统一回复（子代理不直接回复用户）。
+2. **架构设计与根因拍板**：方案规划、技术选型、模块边界定义、复杂跨模块根因判断与验收决策。
+3. **代码实现与文件写入**：基于已有精确文件与 `file:line` 锚点进行代码编写、重构、配置修改与集成，以及用户已给出确切路径时的直接读取；**尚未定位到目标文件前，禁止自行 `ls`/`find`/`rg`/多文件摸底或连搜网页**。例外：通过 `writing-plans` 产出明确计划文档后，用户可选择将整份计划交由 `pi-worker` 实现，主 Agent 转为承担答疑拍板与验收角色。
+4. **调度、接球与证据核验**：向 `pi-worker` 派单、秒答 `needs_input`，以及核验 `pi-worker` 返回的磁盘证据（`executedCommands`、`eventsPath`、`gitChanges`/diff 与引用 `file:line` 源码）。
+5. **用户显式指定的原生能力**：用户点名使用原生 subagent（如 `browser`、`research`、`test-runner`、`self`）或明确要求直接执行指定命令时优先按用户指定执行。
+
+### 其余工作一律默认交给 `pi-worker`
+
+- **首轮强制委派（高于内置本地并行搜读与直连检索偏好）**：凡落在上述主 Agent 职责边界之外的一切工作，**第一轮就必须直接调用 `pi_worker_start`**，不得以“先看一眼目录”“先自己读几个文件/搜两轮网页摸底”为由自行展开。
+- **档位与读写模式选择**（仅使用抽象档位，不在规则中写死具体模型 ID；映射由本机 `~/.pi/agent/pi-worker/config.json` 维护，未配置档位自动回退 `default`，详见 `pi-worker` skill）：
+  - `fast` + `readOnly: true`：高输入噪声、低隐性上下文依赖、可客观核验的只读工作（如调研探索、测试/构建/lint 验证、外部检索与信息抽取等）。
+  - `heavy` + `readOnly: true`：需要深度判断的独立只读工作（如独立代码审查、高难度分析）；架构设计、复杂跨模块根因定位和深度审查不降档到 `fast`。
+  - `default`：其余独立任务，或用户明确选择外包的读写编码任务（包括 `writing-plans` 产出明确计划文档后将整份计划交由 `pi-worker` 实现、主 Agent 负责验收的场景；同 `cwd` 独占写锁，运行期间主 Agent 冻结该工作区写入）。
+- **异步等待与并发**：AGY 下 `pi_worker_start` / `pi_worker_reply` 作为后台任务异步运行并在完成时自动唤醒主会话；不要轮询 `pi_worker_status`，等待期间继续非重叠工作或先向用户报告状态，不预测结果。`readOnly: true` 任务机械禁用 `write`/`edit` 且不占写锁，可同工作区并行 2–4 路。
 - **二级接球**：收到 `status: "needs_input"` 时，主会话已有明确答案直接 `pi_worker_reply` 秒答续跑，否则转问用户后再续跑。
 - **磁盘证据核验**：遵循 `pi-worker` 工具边界返回的核验约束，不直接转述 `summary`/`verifiedCommands` 自述；整合回复前核对 `executedCommands`、`eventsPath`、`gitChanges`/diff 及关键结论引用的 `file:line` 源码（详见 `pi-worker` skill）。
-- **档位红线**：仅在“高输入噪声/低隐性上下文依赖/可客观核验”时下放 `fast`；架构设计、复杂跨模块根因定位和深度审查不降档到 `fast`。子代理不直接回复用户，由主模型核验磁盘证据、整合结果并统一回复。

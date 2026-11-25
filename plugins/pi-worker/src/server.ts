@@ -249,7 +249,7 @@ const INSTRUCTIONS = (
   agyMode
     ? [
         ...BASE_INSTRUCTIONS,
-        "当前运行于 Antigravity 原生后台模式：pi_worker_start 与 pi_worker_reply 由宿主作为后台任务异步执行并在本轮结束时自动唤醒主会话，无需循环轮询 pi_worker_status；凡符合路由表的探索、验证、审查或长程编码任务应在首轮直接派发 pi_worker_start，需要实时可视化观测进度时可调用 pi_worker_monitor 打开侧面板。",
+        "当前运行于 Antigravity 原生后台模式：pi_worker_start 与 pi_worker_reply 由宿主作为后台任务异步执行并在本轮结束时自动唤醒主会话，无需循环轮询 pi_worker_status；凡落在主 Agent 职责边界之外的工作应在首轮直接派发 pi_worker_start，需要实时可视化观测进度时可调用 pi_worker_monitor 打开侧面板。",
       ]
     : BASE_INSTRUCTIONS
 ).join("\n");
