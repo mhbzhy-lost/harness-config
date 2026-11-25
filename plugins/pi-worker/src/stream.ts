@@ -16,6 +16,7 @@ import { TaskStore, resolveStateDir } from "./store.ts";
 export type FormattedEventKind =
   | "session"
   | "thinking"
+  | "text_delta"
   | "tool_start"
   | "tool_end"
   | "assistant"
@@ -27,9 +28,12 @@ export type FormattedEventKind =
 
 export interface FormattedStreamEvent {
   seq: number;
+  round?: number;
+  blockId?: number;
   kind: FormattedEventKind;
   title: string;
   detail?: string;
+  preview?: string;
   toolName?: string;
   toolCallId?: string;
   isError?: boolean;
@@ -48,19 +52,31 @@ export interface EventsDeltaResult {
 
 export interface EventFormatterOptions {
   thinkingThrottleMs?: number;
+  textThrottleMs?: number;
   now?: () => number;
   startSeq?: number;
+  round?: number;
 }
 
-const DEFAULT_THINKING_THROTTLE_MS = 1500;
-const MAX_ARG_SUMMARY_CHARS = 1200;
-const MAX_TOOL_OUTPUT_CHARS = 2400;
+const DEFAULT_THINKING_THROTTLE_MS = 500;
+const DEFAULT_TEXT_THROTTLE_MS = 250;
 const MAX_TERMINAL_ARG_CHARS = 160;
-const MAX_ASSISTANT_DETAIL_CHARS = 1200;
-const MAX_THINKING_PREVIEW_CHARS = 400;
 const DEFAULT_MAX_BYTES = 128 * 1024;
+const DEFAULT_MAX_SINGLE_LINE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_EVENTS = 100;
 const SKIP_SCAN_CHUNK_BYTES = 64 * 1024;
+const PRIMARY_ARG_KEYS = [
+  "command",
+  "CommandLine",
+  "path",
+  "Path",
+  "filePath",
+  "file_path",
+  "pattern",
+  "query",
+  "question",
+  "reason",
+] as const;
 
 function truncateHead(text: string, maxChars: number): string {
   const cleaned = text.trim();
@@ -68,35 +84,21 @@ function truncateHead(text: string, maxChars: number): string {
   return `${cleaned.slice(0, maxChars)}…`;
 }
 
-function truncateTailPreview(text: string, maxChars: number): string {
-  const cleaned = text.trim();
-  if (cleaned.length <= maxChars) return cleaned;
-  return `…${cleaned.slice(cleaned.length - maxChars)}`;
-}
-
-function truncateHeadTail(text: string, maxChars: number): string {
-  const cleaned = text.trim();
-  if (cleaned.length <= maxChars) return cleaned;
-  const side = Math.max(100, Math.floor((maxChars - 40) / 2));
-  const omitted = cleaned.length - side * 2;
-  return `${cleaned.slice(0, side)}\n… (已省略 ${omitted} chars) …\n${cleaned.slice(cleaned.length - side)}`;
-}
-
 function summarizeToolOutput(result: unknown): string | undefined {
   if (typeof result === "string") {
     const trimmed = result.trim();
-    return trimmed ? truncateHeadTail(trimmed, MAX_TOOL_OUTPUT_CHARS) : undefined;
+    return trimmed || undefined;
   }
   if (!result || typeof result !== "object") return undefined;
   const obj = result as Record<string, unknown>;
   const contentText = extractTextFromContent(obj.content);
   if (contentText.trim()) {
-    return truncateHeadTail(contentText, MAX_TOOL_OUTPUT_CHARS);
+    return contentText.trim();
   }
   for (const key of ["output", "error", "message", "text"]) {
     const val = obj[key];
     if (typeof val === "string" && val.trim()) {
-      return truncateHeadTail(val, MAX_TOOL_OUTPUT_CHARS);
+      return val.trim();
     }
   }
   const fallback = obj.structuredContent ?? obj.details;
@@ -104,7 +106,7 @@ function summarizeToolOutput(result: unknown): string | undefined {
     try {
       const raw = JSON.stringify(fallback, null, 2);
       if (raw && raw !== "{}" && raw !== "[]") {
-        return truncateHeadTail(raw, MAX_TOOL_OUTPUT_CHARS);
+        return raw;
       }
     } catch {
       // 忽略序列化失败
@@ -113,22 +115,40 @@ function summarizeToolOutput(result: unknown): string | undefined {
   return undefined;
 }
 
-function summarizeToolArgs(args: unknown): string | undefined {
-  if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+function summarizeToolArgs(args: unknown): { detail?: string; preview?: string } {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return {};
   const obj = args as Record<string, unknown>;
-  for (const key of ["command", "CommandLine", "path", "Path", "filePath", "file_path", "pattern", "query", "question", "reason"]) {
+  const keys = Object.keys(obj);
+  if (keys.length === 0) return {};
+
+  let primaryVal: string | undefined;
+  let primaryKey: string | undefined;
+  for (const key of PRIMARY_ARG_KEYS) {
     const val = obj[key];
     if (typeof val === "string" && val.trim()) {
-      return truncateHead(val, MAX_ARG_SUMMARY_CHARS);
+      primaryVal = val.trim();
+      primaryKey = key;
+      break;
     }
   }
+
+  // 单主键（如 bash { command }）直接保留原文；多参数（如 edit { path, oldText, newText }）保留完整 JSON 供展开查看
+  if (primaryVal && keys.length === 1 && keys[0] === primaryKey) {
+    return { detail: primaryVal, preview: truncateHead(primaryVal.replace(/\s+/g, " "), MAX_TERMINAL_ARG_CHARS) };
+  }
+
   try {
-    const raw = JSON.stringify(obj);
-    if (raw && raw !== "{}") return truncateHead(raw, MAX_ARG_SUMMARY_CHARS);
+    const raw = JSON.stringify(obj, null, 2);
+    if (raw && raw !== "{}") {
+      const preview = primaryVal
+        ? truncateHead(primaryVal.replace(/\s+/g, " "), MAX_TERMINAL_ARG_CHARS)
+        : truncateHead(raw.replace(/\s+/g, " "), MAX_TERMINAL_ARG_CHARS);
+      return { detail: raw, preview };
+    }
   } catch {
     // 忽略序列化失败
   }
-  return undefined;
+  return primaryVal ? { detail: primaryVal, preview: truncateHead(primaryVal.replace(/\s+/g, " "), MAX_TERMINAL_ARG_CHARS) } : {};
 }
 
 function parseJsonLine(rawLine: string): Record<string, unknown> | null {
@@ -148,45 +168,84 @@ export function createEventFormatter(options: EventFormatterOptions = {}): {
   emitStatus(status: string, detail?: string): FormattedStreamEvent;
   flush(): FormattedStreamEvent[];
 } {
-  const throttleMs = options.thinkingThrottleMs ?? DEFAULT_THINKING_THROTTLE_MS;
+  const thinkingThrottleMs = options.thinkingThrottleMs ?? DEFAULT_THINKING_THROTTLE_MS;
+  const textThrottleMs = options.textThrottleMs ?? DEFAULT_TEXT_THROTTLE_MS;
   const nowFn = options.now ?? (() => Date.now());
+  const round = options.round;
   let seq = options.startSeq ?? 0;
+  let nextBlockId = 0;
 
-  let thinkingBuf = "";
+  let thinkingBlockId: number | null = null;
+  let pendingThinkingDelta = "";
   let thinkingChars = 0;
   let thinkingStartedAt: number | null = null;
   let lastThinkingEmittedAt: number | null = null;
-  let thinkingDirty = false;
+
+  let textBlockId: number | null = null;
+  let pendingTextDelta = "";
+  let textStartedAt: number | null = null;
+  let lastTextEmittedAt: number | null = null;
+
   const toolStartTimes = new Map<string, number>();
 
   const nextTimestamp = (): string => new Date(nowFn()).toISOString();
 
-  const emit = (partial: Omit<FormattedStreamEvent, "seq" | "timestamp">): FormattedStreamEvent => {
+  const emit = (partial: Omit<FormattedStreamEvent, "seq" | "timestamp" | "round">): FormattedStreamEvent => {
     seq += 1;
-    return { seq, ...partial, timestamp: nextTimestamp() };
+    return {
+      seq,
+      ...(round !== undefined ? { round } : {}),
+      ...partial,
+      timestamp: nextTimestamp(),
+    };
   };
 
   const flushThinking = (force: boolean): FormattedStreamEvent | null => {
-    if (!thinkingDirty || thinkingChars === 0) return null;
+    if (!pendingThinkingDelta || thinkingChars === 0) return null;
     const now = nowFn();
     const anchor = lastThinkingEmittedAt ?? thinkingStartedAt ?? now;
-    if (!force && now - anchor < throttleMs) return null;
+    if (!force && now - anchor < thinkingThrottleMs) return null;
     lastThinkingEmittedAt = now;
-    thinkingDirty = false;
+    const chunk = pendingThinkingDelta;
+    pendingThinkingDelta = "";
     return emit({
       kind: "thinking",
+      ...(thinkingBlockId !== null ? { blockId: thinkingBlockId } : {}),
       title: `思考中 (${thinkingChars} chars)`,
-      detail: truncateTailPreview(thinkingBuf, MAX_THINKING_PREVIEW_CHARS),
+      detail: chunk,
       thinkingChars,
     });
   };
 
   const resetThinking = (): void => {
-    thinkingBuf = "";
+    thinkingBlockId = null;
+    pendingThinkingDelta = "";
     thinkingChars = 0;
     thinkingStartedAt = null;
     lastThinkingEmittedAt = null;
-    thinkingDirty = false;
+  };
+
+  const flushText = (force: boolean): FormattedStreamEvent | null => {
+    if (!pendingTextDelta) return null;
+    const now = nowFn();
+    const anchor = lastTextEmittedAt ?? textStartedAt ?? now;
+    if (!force && now - anchor < textThrottleMs) return null;
+    lastTextEmittedAt = now;
+    const chunk = pendingTextDelta;
+    pendingTextDelta = "";
+    return emit({
+      kind: "text_delta",
+      ...(textBlockId !== null ? { blockId: textBlockId } : {}),
+      title: "助手输出",
+      detail: chunk,
+    });
+  };
+
+  const resetText = (): void => {
+    textBlockId = null;
+    pendingTextDelta = "";
+    textStartedAt = null;
+    lastTextEmittedAt = null;
   };
 
   return {
@@ -197,25 +256,54 @@ export function createEventFormatter(options: EventFormatterOptions = {}): {
       const type = typeof obj.type === "string" ? obj.type : "";
       if (type === "message_update") {
         const inner = obj.assistantMessageEvent as Record<string, unknown> | undefined;
-        if (inner && inner.type === "thinking_delta" && typeof inner.delta === "string" && inner.delta.length > 0) {
-          if (thinkingStartedAt === null) thinkingStartedAt = nowFn();
-          thinkingChars += inner.delta.length;
-          thinkingBuf += inner.delta;
-          if (thinkingBuf.length > MAX_THINKING_PREVIEW_CHARS * 2) {
-            thinkingBuf = thinkingBuf.slice(thinkingBuf.length - MAX_THINKING_PREVIEW_CHARS * 2);
+        if (!inner) return [];
+
+        if (inner.type === "thinking_delta" && typeof inner.delta === "string" && inner.delta.length > 0) {
+          const out: FormattedStreamEvent[] = [];
+          const pendingText = flushText(true);
+          if (pendingText) out.push(pendingText);
+          resetText();
+
+          if (thinkingBlockId === null) {
+            nextBlockId += 1;
+            thinkingBlockId = nextBlockId;
+            thinkingStartedAt = nowFn();
           }
-          thinkingDirty = true;
+          thinkingChars += inner.delta.length;
+          pendingThinkingDelta += inner.delta;
           const ev = flushThinking(false);
-          return ev ? [ev] : [];
+          if (ev) out.push(ev);
+          return out;
         }
+
+        if (inner.type === "text_delta" && typeof inner.delta === "string" && inner.delta.length > 0) {
+          const out: FormattedStreamEvent[] = [];
+          const pendingThinking = flushThinking(true);
+          if (pendingThinking) out.push(pendingThinking);
+          resetThinking();
+
+          if (textBlockId === null) {
+            nextBlockId += 1;
+            textBlockId = nextBlockId;
+            textStartedAt = nowFn();
+          }
+          pendingTextDelta += inner.delta;
+          const ev = flushText(false);
+          if (ev) out.push(ev);
+          return out;
+        }
+
         return [];
       }
 
       const out: FormattedStreamEvent[] = [];
-      const flushBeforeOther = (): void => {
-        const pending = flushThinking(true);
-        if (pending) out.push(pending);
+      const flushAllStreams = (): void => {
+        const pendingThinking = flushThinking(true);
+        if (pendingThinking) out.push(pendingThinking);
         resetThinking();
+        const pendingText = flushText(true);
+        if (pendingText) out.push(pendingText);
+        resetText();
       };
 
       if (type === "session") {
@@ -225,17 +313,18 @@ export function createEventFormatter(options: EventFormatterOptions = {}): {
       }
 
       if (type === "tool_execution_start") {
-        flushBeforeOther();
+        flushAllStreams();
         const toolName = typeof obj.toolName === "string" ? obj.toolName : "tool";
         const toolCallId = typeof obj.toolCallId === "string" ? obj.toolCallId : undefined;
         toolStartTimes.set(toolCallId ?? toolName, nowFn());
-        const detail = summarizeToolArgs(obj.args);
+        const { detail, preview } = summarizeToolArgs(obj.args);
         out.push(emit({
           kind: "tool_start",
           title: toolName,
           toolName,
           ...(toolCallId ? { toolCallId } : {}),
           ...(detail ? { detail } : {}),
+          ...(preview ? { preview } : {}),
         }));
         return out;
       }
@@ -264,17 +353,22 @@ export function createEventFormatter(options: EventFormatterOptions = {}): {
       if (type === "message_end" && obj.message && typeof obj.message === "object") {
         const msg = obj.message as Record<string, unknown>;
         if (msg.role === "assistant") {
-          flushBeforeOther();
-          const text = extractTextFromContent(msg.content);
-          const errText = typeof msg.errorMessage === "string" && msg.errorMessage ? msg.errorMessage : "";
-          const detail = text
-            ? truncateHead(text, MAX_ASSISTANT_DETAIL_CHARS)
-            : errText
-              ? truncateHead(errText, MAX_ASSISTANT_DETAIL_CHARS)
-              : undefined;
+          const pendingThinking = flushThinking(true);
+          if (pendingThinking) out.push(pendingThinking);
+          resetThinking();
+
+          const activeBlockId = textBlockId;
+          resetText();
+
+          const text = extractTextFromContent(msg.content).trim();
+          const errText = typeof msg.errorMessage === "string" && msg.errorMessage.trim()
+            ? msg.errorMessage.trim()
+            : "";
+          const detail = text || errText || undefined;
           if (detail) {
             out.push(emit({
               kind: "assistant",
+              ...(activeBlockId !== null ? { blockId: activeBlockId } : {}),
               title: msg.stopReason === "error" ? "模型报错" : "助手输出",
               detail,
               ...(msg.stopReason === "error" ? { isError: true } : {}),
@@ -285,19 +379,19 @@ export function createEventFormatter(options: EventFormatterOptions = {}): {
       }
 
       if (type === "turn_end") {
-        flushBeforeOther();
+        flushAllStreams();
         out.push(emit({ kind: "turn_end", title: "回合结束" }));
         return out;
       }
 
       if (type === "session_compact" || type === "compaction_end") {
-        flushBeforeOther();
+        flushAllStreams();
         out.push(emit({ kind: "compact", title: "上下文压缩完成" }));
         return out;
       }
 
       if (type === "auto_retry_end" && obj.success === false) {
-        flushBeforeOther();
+        flushAllStreams();
         const err = typeof obj.finalError === "string"
           ? obj.finalError
           : typeof obj.error === "string"
@@ -306,14 +400,14 @@ export function createEventFormatter(options: EventFormatterOptions = {}): {
         out.push(emit({
           kind: "retry_failed",
           title: "自动重试失败",
-          detail: truncateHead(err, MAX_ASSISTANT_DETAIL_CHARS),
+          detail: err.trim(),
           isError: true,
         }));
         return out;
       }
 
       if (type === "agent_settled" && obj.aborted === true) {
-        flushBeforeOther();
+        flushAllStreams();
         out.push(emit({ kind: "aborted", title: "执行中止" }));
         return out;
       }
@@ -322,18 +416,24 @@ export function createEventFormatter(options: EventFormatterOptions = {}): {
     },
 
     emitStatus(status: string, detail?: string): FormattedStreamEvent {
+      const cleaned = detail?.trim();
       return emit({
         kind: "status",
         title: `状态变更: ${status}`,
-        ...(detail ? { detail: truncateHead(detail, MAX_ASSISTANT_DETAIL_CHARS) } : {}),
+        ...(cleaned ? { detail: cleaned } : {}),
         ...(status === "failed" ? { isError: true } : {}),
       });
     },
 
     flush(): FormattedStreamEvent[] {
-      const pending = flushThinking(true);
+      const out: FormattedStreamEvent[] = [];
+      const pendingThinking = flushThinking(true);
+      if (pendingThinking) out.push(pendingThinking);
       resetThinking();
-      return pending ? [pending] : [];
+      const pendingText = flushText(true);
+      if (pendingText) out.push(pendingText);
+      resetText();
+      return out;
     },
   };
 }
@@ -352,7 +452,8 @@ export function formatTerminalLine(ev: FormattedStreamEvent): string {
     return `${prefix} 💭 ${ev.title}${preview}`;
   }
   if (ev.kind === "tool_start") {
-    const summary = ev.detail ? `: ${truncateHead(ev.detail.replace(/\s+/g, " "), MAX_TERMINAL_ARG_CHARS)}` : "";
+    const rawPreview = ev.preview ?? ev.detail;
+    const summary = rawPreview ? `: ${truncateHead(rawPreview.replace(/\s+/g, " "), MAX_TERMINAL_ARG_CHARS)}` : "";
     return `${prefix} ▶ ${ev.toolName ?? ev.title}${summary}`;
   }
   if (ev.kind === "tool_end") {
@@ -362,14 +463,14 @@ export function formatTerminalLine(ev: FormattedStreamEvent): string {
       : "";
     return `${prefix} ${mark} ${ev.toolName ?? ev.title}${formatDuration(ev.durationMs)}${errPreview}`;
   }
-  if (ev.kind === "assistant") {
+  if (ev.kind === "assistant" || ev.kind === "text_delta") {
     return `${prefix} 💬 ${ev.detail ? truncateHead(ev.detail.replace(/\s+/g, " "), 120) : ev.title}`;
   }
   if (ev.kind === "compact") return `${prefix} 🗜 ${ev.title}`;
-  if (ev.kind === "retry_failed") return `${prefix} ⚠ ${ev.title}${ev.detail ? `: ${ev.detail}` : ""}`;
-  if (ev.kind === "status") return `${prefix} ● ${ev.title}${ev.detail ? ` — ${ev.detail}` : ""}`;
+  if (ev.kind === "retry_failed") return `${prefix} ⚠ ${ev.title}${ev.detail ? `: ${truncateHead(ev.detail.replace(/\s+/g, " "), 160)}` : ""}`;
+  if (ev.kind === "status") return `${prefix} ● ${ev.title}${ev.detail ? ` — ${truncateHead(ev.detail.replace(/\s+/g, " "), 160)}` : ""}`;
   if (ev.kind === "turn_end") return `${prefix} ─ ${ev.title}`;
-  return `${prefix} · ${ev.title}${ev.detail ? `: ${ev.detail}` : ""}`;
+  return `${prefix} · ${ev.title}${ev.detail ? `: ${truncateHead(ev.detail.replace(/\s+/g, " "), 160)}` : ""}`;
 }
 
 function findNextNewlineOffset(fd: number, startOffset: number, fileSize: number): number | null {
@@ -386,13 +487,28 @@ function findNextNewlineOffset(fd: number, startOffset: number, fileSize: number
   return null;
 }
 
+function parseFormattedEventLine(lineStr: string): FormattedStreamEvent | null {
+  const trimmed = lineStr.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = JSON.parse(trimmed) as FormattedStreamEvent;
+    if (parsed && typeof parsed === "object" && typeof parsed.kind === "string") {
+      return parsed;
+    }
+  } catch {
+    // 跳过损坏行
+  }
+  return null;
+}
+
 export function readFormattedEventsDelta(
   eventsPath: string,
   offset = 0,
-  options: { maxBytes?: number; maxEvents?: number } = {},
+  options: { maxBytes?: number; maxEvents?: number; maxSingleLineBytes?: number } = {},
 ): EventsDeltaResult {
   const maxBytes = Math.max(64, Math.trunc(options.maxBytes ?? DEFAULT_MAX_BYTES));
   const maxEvents = Math.max(1, Math.trunc(options.maxEvents ?? DEFAULT_MAX_EVENTS));
+  const maxSingleLineBytes = Math.max(maxBytes, Math.trunc(options.maxSingleLineBytes ?? DEFAULT_MAX_SINGLE_LINE_BYTES));
   const requestedOffset = Number.isFinite(offset) && offset >= 0 ? Math.trunc(offset) : 0;
 
   let fd: number;
@@ -425,7 +541,7 @@ export function readFormattedEventsDelta(
     const firstNewline = slice.indexOf(0x0a);
     if (firstNewline < 0) {
       // 若窗口触及 EOF 说明末尾仍是未写完的半行：暂停等待下次补全；
-      // 若尚未到 EOF 说明单行超过 maxBytes：前向扫描到下一个换行并跳过，避免 livelock。
+      // 若尚未到 EOF 说明单行超过批量窗口 maxBytes：前向找到换行并完整读出（仅超硬上限 maxSingleLineBytes 才跳过防 OOM/livelock）。
       if (startOffset + bytesRead >= fileSize) {
         return { offset: startOffset, nextOffset: startOffset, truncated, hasMore: false, events: [] };
       }
@@ -433,12 +549,25 @@ export function readFormattedEventsDelta(
       if (nextAfterOversized === null) {
         return { offset: startOffset, nextOffset: startOffset, truncated, hasMore: false, events: [] };
       }
+      const fullLineBytes = nextAfterOversized - startOffset;
+      const events: FormattedStreamEvent[] = [];
+      if (fullLineBytes <= maxSingleLineBytes) {
+        const lineBuf = Buffer.allocUnsafe(fullLineBytes);
+        let filled = 0;
+        while (filled < fullLineBytes) {
+          const n = readSync(fd, lineBuf, filled, fullLineBytes - filled, startOffset + filled);
+          if (n <= 0) break;
+          filled += n;
+        }
+        const ev = parseFormattedEventLine(lineBuf.subarray(0, filled).toString("utf8"));
+        if (ev) events.push(ev);
+      }
       return {
         offset: startOffset,
         nextOffset: nextAfterOversized,
         truncated,
         hasMore: nextAfterOversized < fileSize,
-        events: [],
+        events,
       };
     }
 
@@ -451,16 +580,8 @@ export function readFormattedEventsDelta(
       const lineBuf = slice.subarray(cursor, nl);
       cursor = nl + 1;
       consumedBytes = cursor;
-      const lineStr = lineBuf.toString("utf8").trim();
-      if (!lineStr) continue;
-      try {
-        const parsed = JSON.parse(lineStr) as FormattedStreamEvent;
-        if (parsed && typeof parsed === "object" && typeof parsed.kind === "string") {
-          events.push(parsed);
-        }
-      } catch {
-        // 跳过损坏行
-      }
+      const ev = parseFormattedEventLine(lineBuf.toString("utf8"));
+      if (ev) events.push(ev);
     }
 
     const nextOffset = startOffset + consumedBytes;
@@ -508,6 +629,7 @@ async function runCli(): Promise<void> {
       const delta = readFormattedEventsDelta(initial.eventsPath, offset);
       offset = delta.nextOffset;
       for (const ev of delta.events) {
+        if (!jsonOut && ev.kind === "text_delta") continue;
         process.stdout.write(`${jsonOut ? JSON.stringify(ev) : formatTerminalLine(ev)}\n`);
       }
       if (!delta.hasMore) break;

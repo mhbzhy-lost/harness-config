@@ -369,7 +369,7 @@ export class PiWorkerRunner {
     logStream.on("error", () => { /* 日志写入失败不阻塞主流程 */ });
     const eventsStream = createWriteStream(record.eventsPath, { flags: "a", mode: 0o600 });
     eventsStream.on("error", () => { /* 进度流写入失败不阻塞主流程 */ });
-    const eventFormatter = createEventFormatter();
+    const eventFormatter = createEventFormatter({ round: record.roundCount });
     const recordFormattedEvents = (formatted: FormattedStreamEvent[]): void => {
       for (const item of formatted) {
         eventsStream.write(`${JSON.stringify(item)}\n`);

@@ -276,6 +276,7 @@ function send(payload: unknown): void {
 function makeProgressEmitter(progressToken: unknown): ((ev: FormattedStreamEvent) => void) | undefined {
   if (typeof progressToken !== "string" && typeof progressToken !== "number") return undefined;
   return (ev: FormattedStreamEvent): void => {
+    if (ev.kind === "text_delta") return;
     send({
       jsonrpc: "2.0",
       method: "notifications/progress",
