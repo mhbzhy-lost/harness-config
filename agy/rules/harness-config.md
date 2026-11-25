@@ -31,6 +31,7 @@ trigger: always_on
 ### 其余工作一律默认交给 `pi-worker`
 
 - **首轮强制委派（高于内置本地并行搜读与直连检索偏好）**：凡落在上述主 Agent 职责边界之外的一切工作，**第一轮就必须直接调用 `pi_worker_start`**，不得以“先看一眼目录”“先自己读几个文件/搜两轮网页摸底”为由自行展开。
+- **首次派发顺带绑定监控面板**：AGY 会话首次派发 `pi_worker_start` 时，同步顺带调用一次 `pi_worker_monitor`（<10ms 同步返回），将当前会话侧面板绑定到本会话 `parentSessionId`；建议为 `pi_worker_start` 传入简短 `title`（未传时自动从 `prompt` 首行提取）。
 - **档位与读写模式选择**（仅使用抽象档位，不在规则中写死具体模型 ID；映射由本机 `~/.pi/agent/pi-worker/config.json` 维护，未配置档位自动回退 `default`，详见 `pi-worker` skill）：
   - `fast` + `readOnly: true`：高输入噪声、低隐性上下文依赖、可客观核验的只读工作（如调研探索、测试/构建/lint 验证、外部检索与信息抽取等）。
   - `heavy` + `readOnly: true`：需要深度判断的独立只读工作（如独立代码审查、高难度分析）；架构设计、复杂跨模块根因定位和深度审查不降档到 `fast`。
@@ -39,4 +40,5 @@ trigger: always_on
   - **只读并发**：`readOnly: true` 任务机械禁用 `write`/`edit` 且不占写锁，可同工作区并行 2–4 路。
   - **写入真并发**：同 `cwd` 写任务强制串行；当有明确计划存在无文件重叠的独立任务组且用户选择**并发**时，由主 Agent 为各任务组分别创建独立 `git worktree` 并将各自 worktree 路径作为 `cwd` 并发派发 `pi_worker_start`（若选 `Native + 并发` 则派发隔离工作区原生 subagent），逐路验收后再依次合并、跑全量测试并清理 worktree。
 - **二级接球**：收到 `status: "needs_input"` 时，主会话已有明确答案直接 `pi_worker_reply` 秒答续跑，否则转问用户后再续跑。
+- **运行中实时插话**：运行中（`running`）任务需要主动纠偏或补充约束时，用 `pi_worker_steer(taskId, message)` 同步入队立即返回，消息在当前 turn 工具执行完、下一次 LLM 请求前注入；非运行态任务改用 `pi_worker_reply` 续跑。
 - **磁盘证据核验**：遵循 `pi-worker` 工具边界返回的核验约束，不直接转述 `summary`/`verifiedCommands` 自述；整合回复前核对 `executedCommands`、`eventsPath`、`gitChanges`/diff 及关键结论引用的 `file:line` 源码（详见 `pi-worker` skill）。

@@ -241,13 +241,22 @@ class AgySyncTest(unittest.TestCase):
         hook_path = ROOT / "agy/hooks/pi-worker-session-injector.py"
         self.assertTrue(hook_path.exists())
 
-        def run_hook(stdin_text: str) -> dict:
+        def run_hook(stdin_text: str, extra_env: dict | None = None) -> dict:
+            # 清理 ANTIGRAVITY_* 环境变量，保证断言不受本机运行态影响
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith("ANTIGRAVITY_")
+            }
+            if extra_env:
+                env.update(extra_env)
             res = subprocess.run(
                 ["python3", str(hook_path)],
                 input=stdin_text,
                 text=True,
                 capture_output=True,
                 check=False,
+                env=env,
             )
             self.assertEqual(res.returncode, 0, msg=res.stderr)
             return json.loads(res.stdout)
@@ -344,6 +353,261 @@ class AgySyncTest(unittest.TestCase):
             {"decision": "allow"},
         )
         self.assertEqual(run_hook("bad-json"), {"decision": "allow"})
+
+    def test_pi_worker_session_injector_title_injection(self) -> None:
+        """parentSessionTitle 自动注入：ConversationService 命中、失败降级 lastUserInput、显式保留、Eager/Lazy 双路径。"""
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        hook_path = ROOT / "agy/hooks/pi-worker-session-injector.py"
+        hits: list[dict] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                hits.append(
+                    {
+                        "path": self.path,
+                        "csrf": self.headers.get("x-antigravity-csrf-token"),
+                        "connect": self.headers.get("Connect-Protocol-Version"),
+                        "conversationId": body.get("conversationId"),
+                    }
+                )
+                conv_id = body.get("conversationId")
+                if conv_id == "conv-summary":
+                    payload = {"state": {"summary": "摘要\n标题"}}
+                elif conv_id == "conv-long":
+                    payload = {"annotations": {"title": "字" * 60}}
+                elif conv_id == "conv-bad":
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"not-json")
+                    return
+                else:
+                    payload = {"annotations": {"title": "  会话\n标题  "}}
+                data = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        ls_env = {
+            "ANTIGRAVITY_LS_ADDRESS": f"127.0.0.1:{server.server_address[1]}",
+            "ANTIGRAVITY_CSRF_TOKEN": "test-csrf-token",
+        }
+
+        def run_hook(payload: dict, extra_env: dict | None = None) -> dict:
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith("ANTIGRAVITY_")
+            }
+            if extra_env:
+                env.update(extra_env)
+            res = subprocess.run(
+                ["python3", str(hook_path)],
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                check=False,
+                env=env,
+            )
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            return json.loads(res.stdout)
+
+        try:
+            # 1. Eager start：ConversationService 命中 → 清洗单行后注入
+            self.assertEqual(
+                run_hook(
+                    {
+                        "conversationId": "conv-t1",
+                        "cwd": "/repo/app",
+                        "toolCall": {
+                            "name": "mcp_pi-worker_pi-worker_pi_worker_start",
+                            "args": {"cwd": "/repo/app", "prompt": "explore"},
+                        },
+                    },
+                    ls_env,
+                ),
+                {
+                    "decision": "allow",
+                    "overwrite": {
+                        "parentSessionId": "conv-t1",
+                        "parentSessionTitle": "会话 标题",
+                    },
+                },
+            )
+            self.assertEqual(hits[-1]["path"], "/product.v1.ConversationService/GetConversation")
+            self.assertEqual(hits[-1]["csrf"], "test-csrf-token")
+            self.assertEqual(hits[-1]["connect"], "1")
+            self.assertEqual(hits[-1]["conversationId"], "conv-t1")
+
+            # 2. Eager monitor：同时补全 parentSessionId/cwd/parentSessionTitle
+            self.assertEqual(
+                run_hook(
+                    {
+                        "conversationId": "conv-t1",
+                        "workspacePaths": ["/repo/app"],
+                        "toolCall": {
+                            "name": "mcp_pi-worker_pi-worker_pi_worker_monitor",
+                            "args": {},
+                        },
+                    },
+                    ls_env,
+                ),
+                {
+                    "decision": "allow",
+                    "overwrite": {
+                        "parentSessionId": "conv-t1",
+                        "cwd": "/repo/app",
+                        "parentSessionTitle": "会话 标题",
+                    },
+                },
+            )
+
+            # 3. annotations 缺失时回退 state.summary；超长标题截断到 48 字 + 省略号
+            eager_start = {
+                "cwd": "/repo/app",
+                "toolCall": {
+                    "name": "mcp_pi-worker_pi-worker_pi_worker_start",
+                    "args": {"cwd": "/repo/app", "prompt": "x"},
+                },
+            }
+            out = run_hook({**eager_start, "conversationId": "conv-summary"}, ls_env)
+            self.assertEqual(out["overwrite"]["parentSessionTitle"], "摘要 标题")
+            out = run_hook({**eager_start, "conversationId": "conv-long"}, ls_env)
+            self.assertEqual(out["overwrite"]["parentSessionTitle"], "字" * 48 + "…")
+
+            # 4. LS 不可达/返回非法 JSON/未配置环境变量 → 降级 lastUserInput 首条非空行
+            fallback_input = "\n\n  首行  内容 \n第二行"
+            for env, conv in (
+                ({"ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:9", "ANTIGRAVITY_CSRF_TOKEN": "test-csrf-token"}, "conv-t1"),
+                (ls_env, "conv-bad"),
+                (None, "conv-t1"),
+            ):
+                out = run_hook(
+                    {
+                        "conversationId": conv,
+                        "cwd": "/repo/app",
+                        "lastUserInput": fallback_input,
+                        "toolCall": {
+                            "name": "mcp_pi-worker_pi-worker_pi_worker_start",
+                            "args": {"cwd": "/repo/app", "prompt": "x"},
+                        },
+                    },
+                    env,
+                )
+                self.assertEqual(
+                    out,
+                    {
+                        "decision": "allow",
+                        "overwrite": {
+                            "parentSessionId": conv,
+                            "parentSessionTitle": "首行 内容",
+                        },
+                    },
+                )
+            # lastUserInput 为 dict.text 结构时同样支持
+            out = run_hook(
+                {
+                    "conversationId": "conv-t1",
+                    "cwd": "/repo/app",
+                    "lastUserInput": {"text": "结构化输入首行"},
+                    "toolCall": {
+                        "name": "mcp_pi-worker_pi-worker_pi_worker_start",
+                        "args": {"cwd": "/repo/app", "prompt": "x"},
+                    },
+                },
+            )
+            self.assertEqual(out["overwrite"]["parentSessionTitle"], "结构化输入首行")
+
+            # 5. 显式传入 parentSessionTitle 时原样保留（不覆盖、不请求 LS）
+            hits_before = len(hits)
+            self.assertEqual(
+                run_hook(
+                    {
+                        "conversationId": "conv-t1",
+                        "cwd": "/repo/app",
+                        "lastUserInput": "不应被使用",
+                        "toolCall": {
+                            "name": "mcp_pi-worker_pi-worker_pi_worker_start",
+                            "args": {
+                                "cwd": "/repo/app",
+                                "prompt": "x",
+                                "parentSessionId": "custom",
+                                "parentSessionTitle": "自定义标题",
+                            },
+                        },
+                    },
+                    ls_env,
+                ),
+                {"decision": "allow"},
+            )
+            self.assertEqual(len(hits), hits_before)
+
+            # 6. Lazy call_mcp_tool 路径：Arguments 内注入 parentSessionTitle（monitor 同时补 cwd）
+            self.assertEqual(
+                run_hook(
+                    {
+                        "conversationId": "conv-t1",
+                        "cwd": "/repo/b",
+                        "toolCall": {
+                            "name": "call_mcp_tool",
+                            "args": {
+                                "ServerName": "pi-worker_pi-worker",
+                                "ToolName": "pi_worker_monitor",
+                                "Arguments": {},
+                            },
+                        },
+                    },
+                    ls_env,
+                ),
+                {
+                    "decision": "allow",
+                    "overwrite": {
+                        "Arguments": {
+                            "parentSessionId": "conv-t1",
+                            "cwd": "/repo/b",
+                            "parentSessionTitle": "会话 标题",
+                        }
+                    },
+                },
+            )
+            # Lazy 路径显式标题同样保留
+            self.assertEqual(
+                run_hook(
+                    {
+                        "conversationId": "conv-t1",
+                        "cwd": "/repo/b",
+                        "toolCall": {
+                            "name": "call_mcp_tool",
+                            "args": {
+                                "ServerName": "pi-worker_pi-worker",
+                                "ToolName": "pi_worker_start",
+                                "Arguments": {
+                                    "cwd": "/repo/b",
+                                    "prompt": "x",
+                                    "parentSessionId": "custom",
+                                    "parentSessionTitle": "自定义",
+                                },
+                            },
+                        },
+                    },
+                    ls_env,
+                ),
+                {"decision": "allow"},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_agy_settings_enables_alt_screen(self) -> None:
         settings_path = ROOT / "agy/settings.json"
