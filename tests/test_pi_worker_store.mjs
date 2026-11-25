@@ -1,9 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { TaskStore, resolveStateDir } from "../plugins/pi-worker/src/store.ts";
+import {
+  TaskStore,
+  loadWorkerConfig,
+  loadWorkerDefaultConfig,
+  resolveStateDir,
+  resolveWorkerTierProfile,
+} from "../plugins/pi-worker/src/store.ts";
 
 function makeRecord(store, overrides = {}) {
   const taskId = overrides.taskId ?? "11111111-1111-4111-8111-111111111111";
@@ -208,6 +214,99 @@ test("test_load_skips_orphan_reconcile_when_cwd_lock_owner_is_still_alive", () =
     const reconciled = store.load(id);
     assert.equal(reconciled?.status, "failed");
     assert.equal(reconciled?.error, "orphan_process");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_load_default_config_resolves_file_env_precedence_and_validates", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-cfg-"));
+  try {
+    const store = new TaskStore(dir);
+    assert.deepEqual(store.loadDefaultConfig({}), {});
+
+    // 1. 从 <stateDir>/config.json 读取默认配置
+    writeFileSync(
+      store.configPath,
+      JSON.stringify({ provider: "zai-coding-cn", model: "glm-5.4", thinking: "medium" }),
+      "utf8",
+    );
+    assert.deepEqual(store.loadDefaultConfig({}), {
+      provider: "zai-coding-cn",
+      model: "glm-5.4",
+      thinking: "medium",
+    });
+
+    // 2. 环境变量覆盖：仅设 PI_WORKER_DEFAULT_MODEL 时不混用 config.json 中的旧 provider
+    assert.deepEqual(
+      loadWorkerDefaultConfig(dir, { PI_WORKER_DEFAULT_MODEL: "openai/gpt-4o", PI_WORKER_DEFAULT_THINKING: "low" }),
+      { model: "openai/gpt-4o", thinking: "low" },
+    );
+
+    // 3. 环境变量同时覆盖 provider 与 model
+    assert.deepEqual(
+      loadWorkerDefaultConfig(dir, { PI_WORKER_DEFAULT_PROVIDER: "qoder-pool", PI_WORKER_DEFAULT_MODEL: "GLM-5.3" }),
+      { provider: "qoder-pool", model: "GLM-5.3", thinking: "medium" },
+    );
+
+    // 4. 非法配置报错（缺 model、非法 thinking、非 JSON）
+    assert.throws(
+      () => loadWorkerDefaultConfig(dir, { PI_WORKER_DEFAULT_PROVIDER: "qoder-pool" }),
+      /PI_WORKER_DEFAULT_MODEL/,
+    );
+    assert.throws(
+      () => loadWorkerDefaultConfig(dir, { PI_WORKER_DEFAULT_THINKING: "ultra" }),
+      /thinking/,
+    );
+
+    writeFileSync(store.configPath, JSON.stringify({ provider: "only-provider" }), "utf8");
+    assert.throws(() => store.loadDefaultConfig({}), /缺少 model/);
+
+    // 5. 分层 tiers 配置与未配置档位自动回退 default
+    writeFileSync(
+      store.configPath,
+      JSON.stringify({
+        default: { provider: "zai-coding-cn", model: "glm-5.4", thinking: "medium" },
+        tiers: {
+          fast: { provider: "zai-coding-cn", model: "glm-5.3-flash", thinking: "low" },
+          heavy: { thinking: "high" },
+        },
+      }),
+      "utf8",
+    );
+    const loadedCfg = loadWorkerConfig(dir, {});
+    assert.equal(loadedCfg.default.model, "glm-5.4");
+    assert.equal(loadedCfg.tiers.fast?.model, "glm-5.3-flash");
+    assert.deepEqual(resolveWorkerTierProfile(dir, "fast", {}), {
+      provider: "zai-coding-cn",
+      model: "glm-5.3-flash",
+      thinking: "low",
+    });
+    // heavy 仅配置 thinking 时继承 default 的 provider/model
+    assert.deepEqual(resolveWorkerTierProfile(dir, "heavy", {}), {
+      provider: "zai-coding-cn",
+      model: "glm-5.4",
+      thinking: "high",
+    });
+    // 环境变量可覆盖单档位
+    assert.deepEqual(
+      resolveWorkerTierProfile(dir, "fast", {
+        PI_WORKER_TIER_FAST_PROVIDER: "qoder-pool",
+        PI_WORKER_TIER_FAST_MODEL: "GLM-5.3-Flash",
+      }),
+      { provider: "qoder-pool", model: "GLM-5.3-Flash", thinking: "low" },
+    );
+    // 档位完全未配置时回退 default，零报错
+    writeFileSync(
+      store.configPath,
+      JSON.stringify({ default: { provider: "zai-coding-cn", model: "glm-5.4" } }),
+      "utf8",
+    );
+    assert.deepEqual(resolveWorkerTierProfile(dir, "fast", {}), {
+      provider: "zai-coding-cn",
+      model: "glm-5.4",
+    });
+    assert.throws(() => resolveWorkerTierProfile(dir, "invalid-tier", {}), /非法 tier/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

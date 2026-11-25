@@ -22,8 +22,8 @@ import {
   readOutcomeFile,
   truncateTail,
 } from "./protocol.ts";
-import { TaskStore, defaultIsPidAlive } from "./store.ts";
-import type { TaskRecord, TaskStatus, TaskSummary } from "./store.ts";
+import { TaskStore, defaultIsPidAlive, validateWorkerTier } from "./store.ts";
+import type { TaskRecord, TaskStatus, TaskSummary, WorkerTier } from "./store.ts";
 import { createEventFormatter } from "./stream.ts";
 import type { FormattedStreamEvent } from "./stream.ts";
 
@@ -34,6 +34,9 @@ export const DEFAULT_EXCLUDE_TOOLS = [
   "bash_async",
   "bash_async_status",
 ] as const;
+export const READONLY_EXCLUDE_TOOLS = ["write", "edit"] as const;
+const READONLY_APPEND_PROMPT =
+  "6. 当前为只读模式（readOnly=true）：write 与 edit 工具已禁用，严禁通过 bash 创建、修改或删除项目源码/配置文件（测试或构建命令产生的正常临时产物除外）。";
 
 export const WORKER_EXTENSION_PATH = join(dirname(fileURLToPath(import.meta.url)), "worker-ext.ts");
 
@@ -46,6 +49,8 @@ const MAX_GIT_STATUS_LINES = 50;
 export interface StartTaskInput {
   cwd: string;
   prompt: string;
+  tier?: WorkerTier;
+  readOnly?: boolean;
   model?: string;
   provider?: string;
   thinking?: string;
@@ -59,6 +64,7 @@ export interface StartTaskInput {
 export interface ReplyTaskInput {
   taskId: string;
   reply: string;
+  tier?: WorkerTier;
   model?: string;
   provider?: string;
   thinking?: string;
@@ -184,8 +190,11 @@ function validateWaitSeconds(value: number | undefined): number {
   return value;
 }
 
-function mergeExcludeTools(extra?: string[]): string[] {
+function mergeExcludeTools(extra?: string[], readOnly = false): string[] {
   const merged = new Set<string>(DEFAULT_EXCLUDE_TOOLS);
+  if (readOnly) {
+    for (const tool of READONLY_EXCLUDE_TOOLS) merged.add(tool);
+  }
   if (Array.isArray(extra)) {
     for (const item of extra) {
       if (typeof item === "string" && item.trim()) merged.add(item.trim());
@@ -278,6 +287,9 @@ export class PiWorkerRunner {
   }
 
   private buildArgs(record: TaskRecord): string[] {
+    const appendPrompt = record.readOnly
+      ? `${PROTOCOL_APPEND_PROMPT}\n${READONLY_APPEND_PROMPT}`
+      : PROTOCOL_APPEND_PROMPT;
     const args: string[] = [
       "--mode", "json",
       "--print",
@@ -285,7 +297,7 @@ export class PiWorkerRunner {
       "--session-id", record.taskId,
       "-e", WORKER_EXTENSION_PATH,
       "--exclude-tools", record.excludeTools.join(","),
-      "--append-system-prompt", PROTOCOL_APPEND_PROMPT,
+      "--append-system-prompt", appendPrompt,
     ];
     if (record.provider) args.push("--provider", record.provider);
     if (record.model) args.push("--model", record.model);
@@ -303,6 +315,7 @@ export class PiWorkerRunner {
       PI_WORKER_OUTCOME_FILE: record.outcomePath,
     };
     delete childEnv.PI_SESSION_OWNER_ID;
+    delete childEnv.PI_WORKER_AGY;
     return childEnv;
   }
 
@@ -315,15 +328,18 @@ export class PiWorkerRunner {
     const args = this.buildArgs(record);
     const childEnv = this.buildChildEnv(record);
 
-    const lockResult = this.store.acquireCwdLock(
-      record.cwd,
-      { taskId: record.taskId, ownerPid: process.pid },
-      { inFlightTaskIds: this.inFlight },
-    );
-    if ("conflictTaskId" in lockResult) {
-      throw new Error(
-        `同一工作区 ${record.cwd} 已有运行中任务（taskId=${lockResult.conflictTaskId}），禁止并发写入`,
+    const holdsWriteLock = !record.readOnly;
+    if (holdsWriteLock) {
+      const lockResult = this.store.acquireCwdLock(
+        record.cwd,
+        { taskId: record.taskId, ownerPid: process.pid },
+        { inFlightTaskIds: this.inFlight },
       );
+      if ("conflictTaskId" in lockResult) {
+        throw new Error(
+          `同一工作区 ${record.cwd} 已有运行中任务（taskId=${lockResult.conflictTaskId}），禁止并发写入`,
+        );
+      }
     }
 
     // 获锁后再清理上一轮残留 outcome 文件，避免并发冲突时误删原结果
@@ -338,7 +354,7 @@ export class PiWorkerRunner {
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (err) {
-      this.store.releaseCwdLock(record.cwd, record.taskId);
+      if (holdsWriteLock) this.store.releaseCwdLock(record.cwd, record.taskId);
       throw err;
     }
 
@@ -515,7 +531,7 @@ export class PiWorkerRunner {
 
       // 终态一次性原子落盘后再释放锁与 inFlight 保护，消除 orphan_process 竞态
       this.store.save(record);
-      this.store.releaseCwdLock(record.cwd, record.taskId);
+      if (holdsWriteLock) this.store.releaseCwdLock(record.cwd, record.taskId);
       this.active.delete(record.taskId);
       this.inFlight.delete(record.taskId);
 
@@ -583,8 +599,14 @@ export class PiWorkerRunner {
     if (input.provider && !input.model) {
       throw new Error("指定 provider 时必须同时指定 model");
     }
+    const tier = validateWorkerTier(input.tier);
+    const readOnly = input.readOnly === true;
+    const profile = this.store.resolveModelProfile(tier, this.baseEnv);
+    const resolvedModel = input.model ?? profile.model;
+    const resolvedProvider = input.model !== undefined ? input.provider : profile.provider;
+    const resolvedThinking = input.thinking ?? profile.thinking;
     const waitSeconds = validateWaitSeconds(input.waitSeconds);
-    const excludeTools = mergeExcludeTools(input.excludeTools);
+    const excludeTools = mergeExcludeTools(input.excludeTools, readOnly);
 
     const taskId = randomUUID();
     const paths = this.store.allocateTaskPaths(taskId);
@@ -599,9 +621,11 @@ export class PiWorkerRunner {
       outcomePath: paths.outcomePath,
       status: "running",
       pid: null,
-      ...(input.model ? { model: input.model } : {}),
-      ...(input.provider ? { provider: input.provider } : {}),
-      ...(input.thinking ? { thinking: input.thinking } : {}),
+      ...(tier ? { tier } : {}),
+      ...(readOnly ? { readOnly: true } : {}),
+      ...(resolvedModel ? { model: resolvedModel } : {}),
+      ...(resolvedProvider ? { provider: resolvedProvider } : {}),
+      ...(resolvedThinking ? { thinking: resolvedThinking } : {}),
       excludeTools,
       createdAt: now,
       updatedAt: now,
@@ -641,16 +665,31 @@ export class PiWorkerRunner {
       throw new Error(`任务 ${existing.taskId} 正在运行中，无法立即回复`);
     }
 
-    const nextModel = input.model ?? existing.model;
-    const nextProvider = input.provider ?? existing.provider;
-    const nextThinking = input.thinking ?? existing.thinking;
+    const nextTier = validateWorkerTier(input.tier);
+    const tierProfile = nextTier ? this.store.resolveModelProfile(nextTier, this.baseEnv) : undefined;
+    const nextModel = input.model ?? tierProfile?.model ?? existing.model;
+    const nextProvider = input.model !== undefined
+      ? (input.provider ?? (input.model.includes("/") ? undefined : existing.provider))
+      : tierProfile
+        ? (input.provider ?? (tierProfile.model !== undefined ? tierProfile.provider : existing.provider))
+        : (input.provider ?? existing.provider);
+    const nextThinking = input.thinking ?? tierProfile?.thinking ?? existing.thinking;
     if (nextProvider && !nextModel) {
       throw new Error("指定 provider 时必须同时指定 model");
     }
 
     // 重置上一轮终态字段，避免新轮运行期间 status 读到旧问题/旧摘要
+    const {
+      model: _prevModel,
+      provider: _prevProvider,
+      thinking: _prevThinking,
+      tier: _prevTier,
+      ...baseExisting
+    } = existing;
+    const finalTier = nextTier ?? existing.tier;
     const nextRecord: TaskRecord = {
-      ...existing,
+      ...baseExisting,
+      ...(finalTier ? { tier: finalTier } : {}),
       ...(nextModel ? { model: nextModel } : {}),
       ...(nextProvider ? { provider: nextProvider } : {}),
       ...(nextThinking ? { thinking: nextThinking } : {}),

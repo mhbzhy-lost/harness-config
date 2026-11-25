@@ -1,44 +1,90 @@
 ---
 name: pi-worker
-description: Use when delegating a self-contained, multi-step long-running coding task (with clear spec and verifiable test/build commands) to an isolated local Pi worker that supports tail context compression and suspend-resume Q&A. Do NOT use inside a Pi session itself, for small localized edits, or for pure read-only research/log checks.
+description: Use when delegating routed subagent tasks (broad exploration, test/build log compression, noisy retrieval/diff drafting, independent code review) or self-contained multi-step coding tasks to an isolated local Pi worker with abstract model tiers (fast/default/heavy), readOnly concurrency, tail context compression, and suspend-resume Q&A. Do NOT use inside a Pi session itself or for 1-2 step localized reads/edits.
 ---
 
-# pi-worker：跨 Harness 独立长任务工作器
+# pi-worker：跨 Harness 子代理与独立长任务工作器
 
-通过 MCP 将本地自定义 Pi 封装为可异步执行、可挂起提问续跑（Suspend-Resume）的独立长任务执行器，既保留 Pi 的尾部 DCP 压缩与长程容错能力，又不污染主会话上下文。
+通过 MCP 将本地自定义 Pi 封装为可异步执行、支持抽象档位映射、只读并发、内部尾部 DCP 压缩与挂起提问续跑（Suspend-Resume）的独立执行器，统一承接路由表子代理任务与长程编码任务，不污染主会话上下文。
 
 ## 何时使用 vs 何时不要使用
 
-- **适用场景（须同时满足）**：
-  1. 规格、范围与约束红线已经明确（或已落盘为设计/计划文件）；
-  2. 具备可执行的硬验收命令（编译、单测、lint、类型检查等）；
-  3. 预计需要 15–50 轮编辑与试错闭环，放在主会话里会造成严重上下文膨胀。
+- **适用场景**：
+  1. **只读子代理任务（`readOnly: true`，支持同 `cwd` 并发 2–4 路）**：
+     - 跨目录广泛探索、调用链调查、仓库调研 → `tier: "fast"` + `readOnly: true`；
+     - 常规测试、构建、lint、类型检查与报错日志压缩 → `tier: "fast"` + `readOnly: true`；
+     - 重噪声外部检索/长文档与大 JSON 抽取、Git 历史考古、基于最终 Diff 生成 PR/文档初稿 → `tier: "fast"` + `readOnly: true`；
+     - 独立代码审查（只读审查） → `tier: "heavy"` + `readOnly: true`。
+  2. **多步编码 / 长程任务（默认 `readOnly: false`，同 `cwd` 独占写锁）**：
+     - 规格与红线清晰、具备可执行验收命令、预计多轮编辑与试错闭环 → `tier: "default"`（或按复杂度传 `heavy`）。
 - **不要使用**：
-  - 1–5 轮就能完成的小改动或明确文件读写 → 主会话直接做；
-  - 宽范围只读探索、单纯跑测试日志、Git 历史考古、写 Diff 文档 → 用更轻量的 `flash`/`fast` 只读或验证子代理；
-  - 需求模糊、需要和人类频繁边聊边改方向的探索开发 → 直接打开 Pi 交互式 TUI 窗口；
+  - 1–2 步就能直达的定向文件读写或极小改动 → 主会话直接完成；
+  - 需求高度模糊、需要和人类边聊边改方向的探索开发 → 直接打开 Pi 交互式 TUI 窗口；
+  - 用户显式指定其他原生 subagent（如 `browser`）时按用户指定执行；
   - **当前已经处在 Pi 会话内部 → 严禁自我委派嵌套**。
 
 ## MCP 工具
 
-- `pi_worker_start(cwd, prompt, model?, provider?, thinking?, excludeTools?, waitSeconds?)`：在独立隔离 Session 启动新长任务（同一 `cwd` 仅允许 1 个运行中任务，不设总墙钟超时）。在 Antigravity 下自动作为后台任务执行并在本轮结束时唤醒主会话；其他 Harness 下立即返回 `taskId`。
+- `pi_worker_start(cwd, prompt, tier?, readOnly?, model?, provider?, thinking?, excludeTools?, waitSeconds?)`：在独立隔离 Session 启动任务（不设总墙钟超时）。
+  - `tier`：抽象模型档位 `fast` / `default` / `heavy`（缺省为 `default`），按本机独立配置文件映射到实际模型。
+  - `readOnly`：设为 `true` 时机械禁用 `write` / `edit` 工具并追加只读约束，且不占 `cwd` 写锁，允许同工作区多路只读任务并发；默认 `false`（同 `cwd` 独占写锁）。
+  - 在 Antigravity 下自动作为后台任务执行并在本轮结束时唤醒主会话；其他 Harness 下立即返回 `taskId`。
 - `pi_worker_status(taskId, waitSeconds?)`：查看实时进度（`turnCount`/`lastTool`/`lastActivityAt`/`recentEvents`）、挂起问题或最终摘要与 `gitChanges`；非 Antigravity 环境下可传 `waitSeconds: 0–30` 短等。
-- `pi_worker_reply(taskId, reply, model?, provider?, thinking?, waitSeconds?)`：向非运行中的任务（`needs_input`/`done`/`blocked`/`failed`/`cancelled`）发送回复沿原隔离 Session 续跑，支持覆盖模型与思考档位；在 Antigravity 下同样作为后台任务异步唤醒。
+- `pi_worker_reply(taskId, reply, tier?, model?, provider?, thinking?, waitSeconds?)`：向非运行中的任务（`needs_input`/`done`/`blocked`/`failed`/`cancelled`）发送回复沿原隔离 Session 续跑，支持按需切换 `tier` 或覆盖模型与思考档位；在 Antigravity 下同样作为后台任务异步唤醒。
 - `pi_worker_cancel(taskId)`：优雅取消运行中或挂起的任务。
 - `pi_worker_list(status?, cwd?, limit?)`：列出任务摘要。
+- `pi_worker_monitor(taskId?)`（仅 AGY 模式）：打开右侧实时进度监控面板。
+
+## 抽象档位与本机模型映射配置（per-machine，不入库）
+
+路由表与调用侧**只使用抽象档位**（`fast` / `default` / `heavy`），不在仓内规则或模板里写死具体模型 ID；抽象档位到实际 `provider` / `model` / `thinking` 的映射统一放在独立本机配置文件中维护：
+
+- **配置文件路径**：`~/.pi/agent/pi-worker/config.json`（受 `PI_WORKER_STATE_DIR` / `PI_CODING_AGENT_DIR` 覆盖，不提交入库；结构模板见 `plugins/pi-worker/config.example.json`）。
+- **配置结构示例**：
+
+```json
+{
+  "default": {
+    "provider": "example-provider",
+    "model": "example-default-model",
+    "thinking": "medium"
+  },
+  "tiers": {
+    "fast": {
+      "provider": "example-provider",
+      "model": "example-fast-model",
+      "thinking": "low"
+    },
+    "heavy": {
+      "provider": "example-provider",
+      "model": "example-heavy-model",
+      "thinking": "high"
+    }
+  }
+}
+```
+
+- **解析优先级**（从高到低）：
+  1. **显式入参**：本次 `pi_worker_start` / `pi_worker_reply` 传入的 `provider`、`model`、`thinking`（注意：仅显式传 `model` 而不传 `provider` 时，不会混用下层默认或档位里的 `provider`）；
+  2. **抽象档位映射（`tier`）**：按 `PI_WORKER_TIER_<TIER>_{PROVIDER,MODEL,THINKING}` 环境变量覆盖 `config.json` 中对应的 `tiers.<tier>`；
+  3. **默认配置（`default`）**：按 `PI_WORKER_DEFAULT_{PROVIDER,MODEL,THINKING}` 环境变量覆盖 `config.json` 中的 `default`（兼容顶层直接写 `provider`/`model`/`thinking` 的扁平写法）；
+  4. **Pi 自身默认模型**：以上均未配置时，沿用本机 Pi 默认设置。
+- **缺省回退与校验**：
+  - 若本机未配置 `tiers.fast` 或 `tiers.heavy`，调用对应 `tier` 时**自动回退到 `default`**（新机器零报错）；若某档位仅配置了 `thinking` 而未配 `model`，则继承 `default` 的模型并应用该档位的思考级别。
+  - 任何层级指定了 `provider` 时必须同时指定 `model`；`thinking` 须为合法档位（`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`）。
 
 ## 标准派单模板（`prompt` 必须包含 4 要素）
 
 1. **目标与范围**：明确要完成什么、不做什么；
 2. **精确文件锚点**：给出相关文件/计划路径，避免子进程盲搜；
-3. **硬性约束与红线**：禁止破坏的契约、兼容要求、代码风格或提交纪律；
-4. **验收命令**：收工前必须运行并通过的具体测试/构建命令。
+3. **硬性约束与红线**：禁止破坏的契约、只读约束、代码风格或提交纪律；
+4. **验收命令 / 返回证据要求**：编码任务写明必跑验收命令；只读探索/验证/审查任务写明要求的证据格式（文件行号、真实退出码、失败栈帧等）。
 
 ## Suspend-Resume 协作协议
 
-1. **委派期间冻结同工作区写入**：`pi-worker` 运行期间，主会话严禁同时修改同一 `cwd` 的文件。
+1. **读写期间冻结同工作区写入**：非 `readOnly` 任务运行期间，主会话严禁同时修改同一 `cwd` 的文件；`readOnly: true` 任务允许同 `cwd` 并行 2–4 路。
 2. **收到 `status: "needs_input"` 时二级接球**：
    - 先检查主会话上下文是否已有明确答案（如用户早前拍板的取舍）；**能自答就直接 `pi_worker_reply` 秒答续跑**（在几分钟内续跑可命中 Pi 的前缀缓存，省成本且不打扰用户）；
    - 若确实属于需要人类拍板的产品/架构歧义，向用户简明呈现 `question` 与 `options`，拿到答复后再 `pi_worker_reply` 续跑。
-3. **收到 `status: "done"` 后核验交付**：主会话核对 `summary`、`verifiedCommands` 与 `gitChanges`，必要时再对最终 diff 发起独立代码审查。
-4. **收到 `status: "blocked"` 或 `"failed"`**：先查看 `error`、`stopReason` 与最近事件，补充条件后 `pi_worker_reply` 或改由主会话接手处理。
+3. **收到 `status: "done"` 后核验交付**：主会话核对 `summary`、`verifiedCommands` 与 `gitChanges`，必要时再以 `tier: "heavy"` + `readOnly: true` 对最终 diff 发起独立代码审查。
+4. **收到 `status: "blocked"` 或 `"failed"`**：先查看 `error`、`stopReason` 与最近事件，补充条件（或按需在 `pi_worker_reply` 切换 `tier`/模型）后续跑，或改由主会话接手处理。

@@ -1,0 +1,19 @@
+{
+  "default": {
+    "provider": "example-provider",
+    "model": "example-default-model",
+    "thinking": "medium"
+  },
+  "tiers": {
+    "fast": {
+      "provider": "example-provider",
+      "model": "example-fast-model",
+      "thinking": "low"
+    },
+    "heavy": {
+      "provider": "example-provider",
+      "model": "example-heavy-model",
+      "thinking": "high"
+    }
+  }
+}

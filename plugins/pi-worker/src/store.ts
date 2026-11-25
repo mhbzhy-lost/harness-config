@@ -17,6 +17,9 @@ import type { StreamEventSummary } from "./protocol.ts";
 
 export type TaskStatus = "running" | "needs_input" | "done" | "blocked" | "failed" | "cancelled";
 
+export const WORKER_TIERS = ["fast", "default", "heavy"] as const;
+export type WorkerTier = (typeof WORKER_TIERS)[number];
+
 export interface TaskRecord {
   taskId: string;
   cwd: string;
@@ -26,6 +29,8 @@ export interface TaskRecord {
   outcomePath: string;
   status: TaskStatus;
   pid: number | null;
+  tier?: WorkerTier;
+  readOnly?: boolean;
   model?: string;
   provider?: string;
   thinking?: string;
@@ -91,6 +96,214 @@ export interface TaskListFilter {
   status?: TaskStatus;
   cwd?: string;
   limit?: number;
+}
+
+export interface WorkerDefaultConfig {
+  provider?: string;
+  model?: string;
+  thinking?: string;
+}
+
+export interface WorkerConfig {
+  default: WorkerDefaultConfig;
+  tiers: Partial<Record<WorkerTier, WorkerDefaultConfig>>;
+}
+
+const VALID_TIER_SET = new Set<string>(WORKER_TIERS);
+const VALID_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+export function validateWorkerTier(value: unknown): WorkerTier | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !VALID_TIER_SET.has(value)) {
+    throw new Error(`非法 tier: ${String(value)}（仅支持 ${WORKER_TIERS.join(" / ")}）`);
+  }
+  return value as WorkerTier;
+}
+
+function normalizeOptionalField(value: unknown, field: string, source: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") {
+    throw new Error(`${source} 中的 ${field} 必须是字符串`);
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function validateThinkingLevel(value: string | undefined, source: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (!VALID_THINKING_LEVELS.has(value)) {
+    throw new Error(`${source} 中的 thinking 非法: ${value}`);
+  }
+  return value;
+}
+
+function parseProfileObject(value: unknown, source: string): WorkerDefaultConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${source} 必须是 JSON 对象`);
+  }
+  const obj = value as Record<string, unknown>;
+  const provider = normalizeOptionalField(obj.provider, "provider", source);
+  const model = normalizeOptionalField(obj.model, "model", source);
+  const thinking = validateThinkingLevel(
+    normalizeOptionalField(obj.thinking, "thinking", source),
+    source,
+  );
+  if (provider && !model) {
+    throw new Error(`${source} 指定了 provider 但缺少 model`);
+  }
+  return {
+    ...(provider ? { provider } : {}),
+    ...(model ? { model } : {}),
+    ...(thinking ? { thinking } : {}),
+  };
+}
+
+function overlayEnvProfile(
+  base: WorkerDefaultConfig,
+  env: NodeJS.ProcessEnv,
+  prefix: string,
+): WorkerDefaultConfig {
+  const providerVar = `${prefix}_PROVIDER`;
+  const modelVar = `${prefix}_MODEL`;
+  const thinkingVar = `${prefix}_THINKING`;
+  const envProvider = normalizeOptionalField(env[providerVar], providerVar, "环境变量");
+  const envModel = normalizeOptionalField(env[modelVar], modelVar, "环境变量");
+  const envThinking = validateThinkingLevel(
+    normalizeOptionalField(env[thinkingVar], thinkingVar, "环境变量"),
+    "环境变量",
+  );
+  if (envProvider && !envModel) {
+    throw new Error(`环境变量指定了 ${providerVar} 但缺少 ${modelVar}`);
+  }
+  // 环境变量若显式覆盖了 model，则不混用文件中的旧 provider
+  const model = envModel ?? base.model;
+  const provider = envModel !== undefined ? envProvider : base.provider;
+  const thinking = envThinking ?? base.thinking;
+  return {
+    ...(provider ? { provider } : {}),
+    ...(model ? { model } : {}),
+    ...(thinking ? { thinking } : {}),
+  };
+}
+
+export function loadWorkerConfig(
+  stateDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): WorkerConfig {
+  const configPath = join(resolve(stateDir), "config.json");
+  let fileDefault: WorkerDefaultConfig = {};
+  const fileTiers: Partial<Record<WorkerTier, WorkerDefaultConfig>> = {};
+
+  let raw: string | null = null;
+  try {
+    raw = readFileSync(configPath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new Error(`读取默认配置文件失败 (${configPath}): ${(err as Error).message}`);
+    }
+  }
+
+  if (raw !== null) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      throw new Error(`解析默认配置文件失败 (${configPath}): ${(err as Error).message}`);
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`默认配置文件必须是 JSON 对象 (${configPath})`);
+    }
+    const obj = parsed as Record<string, unknown>;
+
+    // 兼容顶层直接写 provider/model/thinking 与嵌套 default 对象两种写法
+    const rootProfile = parseProfileObject(obj, `默认配置文件 (${configPath})`);
+    const nestedDefault = obj.default !== undefined
+      ? parseProfileObject(obj.default, `默认配置文件 (${configPath}) default`)
+      : {};
+    const mergedDefaultModel = nestedDefault.model ?? rootProfile.model;
+    const mergedDefaultProvider = nestedDefault.model !== undefined
+      ? nestedDefault.provider
+      : rootProfile.provider;
+    const mergedDefaultThinking = nestedDefault.thinking ?? rootProfile.thinking;
+    fileDefault = {
+      ...(mergedDefaultProvider ? { provider: mergedDefaultProvider } : {}),
+      ...(mergedDefaultModel ? { model: mergedDefaultModel } : {}),
+      ...(mergedDefaultThinking ? { thinking: mergedDefaultThinking } : {}),
+    };
+
+    if (obj.tiers !== undefined) {
+      if (!obj.tiers || typeof obj.tiers !== "object" || Array.isArray(obj.tiers)) {
+        throw new Error(`默认配置文件 (${configPath}) 中的 tiers 必须是 JSON 对象`);
+      }
+      const tiersObj = obj.tiers as Record<string, unknown>;
+      for (const tierName of WORKER_TIERS) {
+        if (tiersObj[tierName] !== undefined) {
+          fileTiers[tierName] = parseProfileObject(
+            tiersObj[tierName],
+            `默认配置文件 (${configPath}) tiers.${tierName}`,
+          );
+        }
+      }
+      if (fileTiers.default) {
+        const td = fileTiers.default;
+        const m = td.model ?? fileDefault.model;
+        const p = td.model !== undefined ? td.provider : fileDefault.provider;
+        const th = td.thinking ?? fileDefault.thinking;
+        fileDefault = {
+          ...(p ? { provider: p } : {}),
+          ...(m ? { model: m } : {}),
+          ...(th ? { thinking: th } : {}),
+        };
+      }
+    }
+  }
+
+  const resolvedDefault = overlayEnvProfile(fileDefault, env, "PI_WORKER_DEFAULT");
+  const resolvedTiers: Partial<Record<WorkerTier, WorkerDefaultConfig>> = {};
+  for (const tierName of ["fast", "heavy"] as const) {
+    const envPrefix = `PI_WORKER_TIER_${tierName.toUpperCase()}`;
+    const merged = overlayEnvProfile(fileTiers[tierName] ?? {}, env, envPrefix);
+    if (merged.provider || merged.model || merged.thinking) {
+      resolvedTiers[tierName] = merged;
+    }
+  }
+
+  return {
+    default: resolvedDefault,
+    tiers: resolvedTiers,
+  };
+}
+
+export function resolveWorkerTierProfile(
+  stateDir: string,
+  tier?: WorkerTier,
+  env: NodeJS.ProcessEnv = process.env,
+): WorkerDefaultConfig {
+  const validTier = validateWorkerTier(tier);
+  const config = loadWorkerConfig(stateDir, env);
+  if (!validTier || validTier === "default") {
+    return config.default;
+  }
+  const tierProfile = config.tiers[validTier];
+  if (!tierProfile) {
+    return config.default;
+  }
+  // 档位若未单独指定 model（例如仅配置了 thinking 档位），自动回退 default 的 provider/model
+  const model = tierProfile.model ?? config.default.model;
+  const provider = tierProfile.model !== undefined ? tierProfile.provider : config.default.provider;
+  const thinking = tierProfile.thinking ?? config.default.thinking;
+  return {
+    ...(provider ? { provider } : {}),
+    ...(model ? { model } : {}),
+    ...(thinking ? { thinking } : {}),
+  };
+}
+
+export function loadWorkerDefaultConfig(
+  stateDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): WorkerDefaultConfig {
+  return resolveWorkerTierProfile(stateDir, "default", env);
 }
 
 interface LockPayload {
@@ -169,6 +382,18 @@ export class TaskStore {
   constructor(stateDir: string = resolveStateDir(), options: TaskStoreOptions = {}) {
     this.stateDir = resolve(stateDir);
     this.isPidAlive = options.isPidAlive ?? defaultIsPidAlive;
+  }
+
+  get configPath(): string {
+    return join(this.stateDir, "config.json");
+  }
+
+  loadDefaultConfig(env: NodeJS.ProcessEnv = process.env): WorkerDefaultConfig {
+    return loadWorkerDefaultConfig(this.stateDir, env);
+  }
+
+  resolveModelProfile(tier?: WorkerTier, env: NodeJS.ProcessEnv = process.env): WorkerDefaultConfig {
+    return resolveWorkerTierProfile(this.stateDir, tier, env);
   }
 
   ensureDirs(): void {

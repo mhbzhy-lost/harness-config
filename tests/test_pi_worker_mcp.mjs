@@ -55,6 +55,13 @@ function cleanEnv(overrides = {}) {
   const env = { ...process.env };
   delete env.PI_SUBAGENT_CHILD;
   delete env.PI_WORKER_DEPTH;
+  delete env.PI_WORKER_AGY;
+  delete env.PI_WORKER_DEFAULT_PROVIDER;
+  delete env.PI_WORKER_DEFAULT_MODEL;
+  delete env.PI_WORKER_DEFAULT_THINKING;
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("PI_WORKER_TIER_")) delete env[key];
+  }
   return { ...env, ...overrides };
 }
 
@@ -140,6 +147,9 @@ test("test_mcp_full_lifecycle_validation_and_graceful_shutdown", async () => {
     const replySchema = listRes.result.tools.find((t) => t.name === "pi_worker_reply").inputSchema;
     assert.equal("timeoutSeconds" in startSchema.properties, false);
     assert.equal("timeoutSeconds" in replySchema.properties, false);
+    assert.deepEqual(startSchema.properties.tier.enum, ["fast", "default", "heavy"]);
+    assert.equal(startSchema.properties.readOnly.type, "boolean");
+    assert.deepEqual(replySchema.properties.tier.enum, ["fast", "default", "heavy"]);
 
     // 1. start -> needs_input
     const startRes = await client.request("tools/call", {

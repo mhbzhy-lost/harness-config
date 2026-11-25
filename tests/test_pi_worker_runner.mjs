@@ -7,6 +7,7 @@ import { PROTOCOL_APPEND_PROMPT } from "../plugins/pi-worker/src/protocol.ts";
 import {
   DEFAULT_EXCLUDE_TOOLS,
   PiWorkerRunner,
+  READONLY_EXCLUDE_TOOLS,
   WORKER_EXTENSION_PATH,
   resolvePiBinary,
 } from "../plugins/pi-worker/src/runner.ts";
@@ -16,6 +17,13 @@ function cleanEnv(overrides = {}) {
   const env = { ...process.env };
   delete env.PI_SUBAGENT_CHILD;
   delete env.PI_WORKER_DEPTH;
+  delete env.PI_WORKER_AGY;
+  delete env.PI_WORKER_DEFAULT_PROVIDER;
+  delete env.PI_WORKER_DEFAULT_MODEL;
+  delete env.PI_WORKER_DEFAULT_THINKING;
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("PI_WORKER_TIER_")) delete env[key];
+  }
   return { ...env, ...overrides };
 }
 
@@ -37,6 +45,7 @@ const record = {
     PI_WORKER_DEPTH: process.env.PI_WORKER_DEPTH ?? null,
     PI_WORKER_OUTCOME_FILE: process.env.PI_WORKER_OUTCOME_FILE ?? null,
     PI_SESSION_OWNER_ID: process.env.PI_SESSION_OWNER_ID ?? null,
+    PI_WORKER_AGY: process.env.PI_WORKER_AGY ?? null,
   },
 };
 appendFileSync(${JSON.stringify(recordFile)}, JSON.stringify(record) + "\\n", "utf8");
@@ -145,7 +154,11 @@ test("test_start_needs_input_then_reply_resumes_same_session_via_stdin", async (
     const runner = new PiWorkerRunner({
       store,
       piBinary: fakePi,
-      env: cleanEnv({ PI_SESSION_OWNER_ID: "should-be-stripped", FAKE_PI_SCENARIO: "two-round" }),
+      env: cleanEnv({
+        PI_SESSION_OWNER_ID: "should-be-stripped",
+        PI_WORKER_AGY: "1",
+        FAKE_PI_SCENARIO: "two-round",
+      }),
     });
 
     const first = await runner.start({
@@ -190,6 +203,7 @@ test("test_start_needs_input_then_reply_resumes_same_session_via_stdin", async (
       assert.equal(r.env.PI_SUBAGENT_CHILD, "1");
       assert.equal(r.env.PI_WORKER_DEPTH, "1");
       assert.equal(r.env.PI_SESSION_OWNER_ID, null);
+      assert.equal(r.env.PI_WORKER_AGY, null);
     }
     assert.equal(r1.stdin, "- 检查 @src/index.ts 中的边界问题");
     assert.equal(r2.stdin, "@confirm 选方案 A");
@@ -540,6 +554,149 @@ test("test_wait_until_settled_blocks_until_round_finishes", async () => {
     const second = await runner.reply({ taskId: first.taskId, reply: "A", waitUntilSettled: true });
     assert.equal(second.status, "done");
     assert.equal(second.roundCount, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_start_applies_default_model_config_with_env_and_explicit_precedence", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-default-model-"));
+  try {
+    const stateDir = join(dir, "state");
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    mkdirSync(stateDir, { recursive: true });
+    const recordFile = join(dir, "invocations.jsonl");
+    const fakePi = createFakePi(dir, recordFile);
+
+    const store = new TaskStore(stateDir);
+    writeFileSync(
+      store.configPath,
+      JSON.stringify({ provider: "zai-coding-cn", model: "glm-5.4", thinking: "high" }),
+      "utf8",
+    );
+
+    // 1. start 省略模型参数时读取 config.json 默认值
+    const runner1 = new PiWorkerRunner({
+      store,
+      piBinary: fakePi,
+      env: cleanEnv({ FAKE_PI_SCENARIO: "two-round" }),
+    });
+    const t1 = await runner1.start({ cwd: workDir, prompt: "use file defaults", waitUntilSettled: true });
+    assert.equal(t1.provider, "zai-coding-cn");
+    assert.equal(t1.model, "glm-5.4");
+    assert.equal(t1.thinking, "high");
+
+    // 2. 显式仅传 model 时不混用 config.json 默认 provider，仍继承默认 thinking
+    const t2 = await runner1.start({ cwd: workDir, prompt: "explicit model", model: "openai/gpt-4o", waitUntilSettled: true });
+    assert.equal(t2.provider, undefined);
+    assert.equal(t2.model, "openai/gpt-4o");
+    assert.equal(t2.thinking, "high");
+
+    // 3. 环境变量覆盖 config.json 默认值
+    const runner2 = new PiWorkerRunner({
+      store,
+      piBinary: fakePi,
+      env: cleanEnv({
+        FAKE_PI_SCENARIO: "two-round",
+        PI_WORKER_DEFAULT_PROVIDER: "qoder-pool",
+        PI_WORKER_DEFAULT_MODEL: "GLM-5.3",
+        PI_WORKER_DEFAULT_THINKING: "low",
+      }),
+    });
+    const t3 = await runner2.start({ cwd: workDir, prompt: "use env defaults", waitUntilSettled: true });
+    assert.equal(t3.provider, "qoder-pool");
+    assert.equal(t3.model, "GLM-5.3");
+    assert.equal(t3.thinking, "low");
+
+    const records = readFileSync(recordFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(records.length, 3);
+    assert.equal(records[0].argv[records[0].argv.indexOf("--provider") + 1], "zai-coding-cn");
+    assert.equal(records[0].argv[records[0].argv.indexOf("--model") + 1], "glm-5.4");
+    assert.equal(records[0].argv[records[0].argv.indexOf("--thinking") + 1], "high");
+    assert.equal(records[1].argv.includes("--provider"), false);
+    assert.equal(records[1].argv[records[1].argv.indexOf("--model") + 1], "openai/gpt-4o");
+    assert.equal(records[2].argv[records[2].argv.indexOf("--provider") + 1], "qoder-pool");
+    assert.equal(records[2].argv[records[2].argv.indexOf("--model") + 1], "GLM-5.3");
+    assert.equal(records[2].argv[records[2].argv.indexOf("--thinking") + 1], "low");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_tier_resolution_reply_switch_and_readonly_concurrency", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-tier-ro-"));
+  try {
+    const stateDir = join(dir, "state");
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    mkdirSync(stateDir, { recursive: true });
+    const recordFile = join(dir, "invocations.jsonl");
+    const fakePi = createFakePi(dir, recordFile);
+
+    const store = new TaskStore(stateDir);
+    writeFileSync(
+      store.configPath,
+      JSON.stringify({
+        default: { provider: "zai-coding-cn", model: "glm-5.4", thinking: "medium" },
+        tiers: {
+          fast: { provider: "zai-coding-cn", model: "glm-5.3-flash", thinking: "low" },
+        },
+      }),
+      "utf8",
+    );
+
+    const runner = new PiWorkerRunner({
+      store,
+      piBinary: fakePi,
+      env: cleanEnv({ FAKE_PI_SCENARIO: "two-round" }),
+    });
+
+    // 1. fast 档位 + readOnly 禁用 write/edit 并追加只读提示
+    const fastRo = await runner.start({
+      cwd: workDir,
+      prompt: "inspect codebase",
+      tier: "fast",
+      readOnly: true,
+      waitUntilSettled: true,
+    });
+    assert.equal(fastRo.tier, "fast");
+    assert.equal(fastRo.readOnly, true);
+    assert.equal(fastRo.provider, "zai-coding-cn");
+    assert.equal(fastRo.model, "glm-5.3-flash");
+    assert.equal(fastRo.thinking, "low");
+    for (const tool of READONLY_EXCLUDE_TOOLS) {
+      assert.ok(fastRo.excludeTools.includes(tool), `readOnly must exclude ${tool}`);
+    }
+
+    // 2. reply 可切换 tier（heavy 未配置时自动回退 default）
+    const upgraded = await runner.reply({
+      taskId: fastRo.taskId,
+      reply: "deep review",
+      tier: "heavy",
+      waitUntilSettled: true,
+    });
+    assert.equal(upgraded.tier, "heavy");
+    assert.equal(upgraded.provider, "zai-coding-cn");
+    assert.equal(upgraded.model, "glm-5.4");
+    assert.equal(upgraded.thinking, "medium");
+
+    const records = readFileSync(recordFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.match(records[0].argv[records[0].argv.indexOf("--append-system-prompt") + 1], /只读模式/);
+    assert.equal(records[0].argv[records[0].argv.indexOf("--model") + 1], "glm-5.3-flash");
+    assert.equal(records[1].argv[records[1].argv.indexOf("--model") + 1], "glm-5.4");
+
+    // 3. 同一 cwd 支持多路 readOnly=true 任务并发运行（不互相抢写锁）
+    const sleepRunner = new PiWorkerRunner({
+      store: new TaskStore(join(dir, "state-concurrent")),
+      piBinary: fakePi,
+      env: cleanEnv({ FAKE_PI_SCENARIO: "sleep" }),
+    });
+    const ro1 = await sleepRunner.start({ cwd: workDir, prompt: "ro-1", readOnly: true, waitSeconds: 0 });
+    const ro2 = await sleepRunner.start({ cwd: workDir, prompt: "ro-2", readOnly: true, waitSeconds: 0 });
+    assert.equal(ro1.status, "running");
+    assert.equal(ro2.status, "running");
+    await sleepRunner.shutdown();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

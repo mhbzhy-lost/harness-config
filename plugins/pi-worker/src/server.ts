@@ -11,8 +11,8 @@ import {
   PiWorkerRunner,
   isNestedWorkerEnv,
 } from "./runner.ts";
-import { TaskStore, resolveStateDir } from "./store.ts";
-import type { TaskRecord, TaskStatus } from "./store.ts";
+import { TaskStore, resolveStateDir, validateWorkerTier } from "./store.ts";
+import type { TaskRecord, TaskStatus, WorkerTier } from "./store.ts";
 import { formatTerminalLine, readFormattedEventsDelta } from "./stream.ts";
 import type { FormattedStreamEvent } from "./stream.ts";
 
@@ -42,26 +42,35 @@ const BASE_TOOLS: ToolDefinition[] = [
   {
     name: "pi_worker_start",
     description:
-      "在独立隔离的 Pi Session 中启动一个长程编码/执行任务。仅用于规格已清晰、有可执行验收命令、预计多轮工具调用的长任务；同一 cwd 同时只允许 1 个运行中任务，严禁在 Pi 会话内部自我嵌套调用。",
+      "在独立隔离的 Pi Session 中启动子代理/长程执行任务。支持通过抽象档位 tier（fast/default/heavy，由本机 config.json 映射到实际模型）和 readOnly（禁用 write/edit 并允许同 cwd 多路并发只读）承接探索、测试验证、代码审查与多步编码任务；读写模式同一 cwd 同时只允许 1 个运行中任务，严禁在 Pi 会话内部自我嵌套调用。",
     inputSchema: {
       type: "object",
       properties: {
         cwd: { type: "string", description: "目标工作区绝对路径（必填）" },
         prompt: {
           type: "string",
-          description: "完整自包含任务说明（目标、文件锚点、约束红线与验收命令，必填）",
+          description: "完整自包含任务说明（目标、文件锚点、约束红线与验收/返回证据要求，必填）",
         },
-        model: { type: "string", description: "可选：传给 Pi 的 --model 参数" },
-        provider: { type: "string", description: "可选：传给 Pi 的 --provider 参数（须配合 model）" },
+        tier: {
+          type: "string",
+          enum: ["fast", "default", "heavy"],
+          description: "可选：抽象模型档位（fast/default/heavy），按本机 <stateDir>/config.json 的 tiers 映射解析，未配置档位自动回退 default",
+        },
+        readOnly: {
+          type: "boolean",
+          description: "可选：只读模式（默认 false）。设为 true 时自动禁用 write/edit 工具，且不占 cwd 写锁，允许同工作区多路只读任务并发",
+        },
+        model: { type: "string", description: "可选：显式指定传给 Pi 的 --model 参数（优先级高于 tier 与默认配置）" },
+        provider: { type: "string", description: "可选：传给 Pi 的 --provider 参数（须配合 model；缺省且未显式指定 model 时按 tier/默认配置解析）" },
         thinking: {
           type: "string",
           enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
-          description: "可选：传给 Pi 的 --thinking 思考档位",
+          description: "可选：传给 Pi 的 --thinking 思考档位（缺省时按 tier/默认配置解析）",
         },
         excludeTools: {
           type: "array",
           items: { type: "string" },
-          description: "可选：额外禁用的工具名列表（始终自动合并默认禁用列表）",
+          description: "可选：额外禁用的工具名列表（始终自动合并默认禁用列表；readOnly=true 时额外合并 write/edit）",
         },
         waitSeconds: {
           type: "number",
@@ -77,12 +86,17 @@ const BASE_TOOLS: ToolDefinition[] = [
   {
     name: "pi_worker_reply",
     description:
-      "向非运行中的任务（needs_input / done / blocked / failed / cancelled）发送回复，沿原隔离 Session 续跑，并支持按需覆盖 model/provider/thinking。收到 needs_input 时优先由主代理依据已有上下文秒答续跑以保持前缀缓存命中；无法拍板时再转问人类。",
+      "向非运行中的任务（needs_input / done / blocked / failed / cancelled）发送回复，沿原隔离 Session 续跑，并支持按需覆盖 tier/model/provider/thinking。收到 needs_input 时优先由主代理依据已有上下文秒答续跑以保持前缀缓存命中；无法拍板时再转问人类。",
     inputSchema: {
       type: "object",
       properties: {
         taskId: { type: "string", description: "由 pi_worker_start 返回的任务 UUID" },
         reply: { type: "string", description: "给 Pi 的明确回复或补充指示" },
+        tier: {
+          type: "string",
+          enum: ["fast", "default", "heavy"],
+          description: "可选：覆盖本轮及后续的抽象模型档位（按本机 config.json 解析）",
+        },
         model: { type: "string", description: "可选：覆盖本轮及后续 --model 参数" },
         provider: { type: "string", description: "可选：覆盖 --provider 参数（须已有或同时指定 model）" },
         thinking: {
@@ -212,10 +226,10 @@ const ACTIVE_TOOLS: ToolDefinition[] = agyMode ? [...BASE_TOOLS, ...AGY_APP_TOOL
 const TOOL_NAME_SET = new Set(ACTIVE_TOOLS.map((t) => t.name));
 
 const BASE_INSTRUCTIONS = [
-  "仅将规格明确、具备硬验收命令、需要多轮工具执行的独立长任务委派给 pi-worker。",
-  "小改动直接主会话完成；宽探索/测试日志/Diff 文档交给更轻量的只读或验证子代理；严禁在 Pi 会话内部自嵌套调用。",
+  "通过 pi-worker 委派独立子代理与长程任务：广泛探索/测试日志压缩/重噪声抽取用 tier=fast + readOnly=true；独立代码审查用 tier=heavy + readOnly=true；多步编码长任务用默认 tier=default（读写模式）。",
+  "1–2 步定向读写由主会话直接完成；严禁在 Pi 会话内部自嵌套调用。",
   "当任务返回 status=needs_input 时，优先依据主会话已有上下文通过 pi_worker_reply 秒答续跑（命中前缀缓存），拍不了板再转问用户。",
-  "委派运行期间主会话不得同时修改同一工作区文件；任务 done 后由主会话核验 gitChanges 与 diff。",
+  "只读任务（readOnly=true）可同工作区并发；读写任务运行期间主会话不得同时修改同一工作区文件，done 后由主会话核验 gitChanges 与 diff。",
 ];
 
 const INSTRUCTIONS = (
@@ -259,6 +273,17 @@ function optionalNumber(value: unknown, field: string): number | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`${field} 必须是有限数字`);
   return value;
+}
+
+function optionalBoolean(value: unknown, field: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new Error(`${field} 必须是布尔值`);
+  return value;
+}
+
+function optionalTier(value: unknown): WorkerTier | undefined {
+  if (value === undefined) return undefined;
+  return validateWorkerTier(optionalString(value, "tier"));
 }
 
 function optionalStringArray(value: unknown, field: string): string[] | undefined {
@@ -358,6 +383,8 @@ async function callTool(
         const record = await runner.start({
           cwd,
           prompt,
+          tier: optionalTier(args.tier),
+          readOnly: optionalBoolean(args.readOnly, "readOnly"),
           model: optionalString(args.model, "model"),
           provider: optionalString(args.provider, "provider"),
           thinking: optionalString(args.thinking, "thinking"),
@@ -383,6 +410,7 @@ async function callTool(
         const record = await runner.reply({
           taskId,
           reply,
+          tier: optionalTier(args.tier),
           model: optionalString(args.model, "model"),
           provider: optionalString(args.provider, "provider"),
           thinking: optionalString(args.thinking, "thinking"),
