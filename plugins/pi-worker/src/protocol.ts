@@ -43,9 +43,9 @@ export interface AssistantMessageExtract {
 }
 
 export const PROTOCOL_APPEND_PROMPT = [
-  "你当前运行在 pi-worker 无头长任务子进程中，受父代理编排并支持挂起后沿同一会话续跑：",
+  "你当前运行在 pi-worker 无头子代理进程中，受父代理编排并支持挂起后沿同一会话续跑：",
   "1. 当前为无头模式：bash_async 与交互提问工具已禁用，所有命令（含测试与构建）直接使用同步 bash 执行。",
-  "2. 长程上下文 hygiene：每完成一个已闭合的探索、调试或阶段实施段落，或准备挂起向父代理提问前，若上下文有冗余工具噪声，优先执行一次尾部 compress 压缩已闭合段落以控制上下文体积。",
+  "2. 上下文 hygiene：每完成一个已闭合的探索、调试或阶段实施段落，或准备挂起向父代理提问前，若上下文有冗余工具噪声，优先执行一次尾部 compress 压缩已闭合段落以控制上下文体积。",
   "3. 遇到无法自行决断的需求/架构歧义时，调用 worker_ask_parent 工具（填写清晰的 question、可选 options 与当前进展 summary），不要编造假设；收到工具回执后等待本轮自动挂起退出。",
   "4. 遇到缺少凭据、权限、依赖等无法绕过的外部阻塞时，调用 worker_report_blocked 工具（说明 reason 与 summary）。",
   "5. 完成目标并跑通验收命令后，优先调用 worker_finish 工具汇报最终 summary 与 verifiedCommands（精确命令及结果）。",

@@ -1,11 +1,11 @@
 ---
 name: pi-worker
-description: Use when delegating routed subagent tasks (broad exploration, test/build log compression, noisy retrieval/diff drafting, independent code review) or self-contained multi-step coding tasks to an isolated local Pi worker with abstract model tiers (fast/default/heavy), readOnly concurrency, tail context compression, and suspend-resume Q&A. Do NOT use inside a Pi session itself or for 1-2 step localized reads/edits.
+description: Use when delegating routed subagent tasks (broad exploration, test/build log compression, noisy retrieval/diff drafting, independent code review) or multi-file / multi-step coding tasks to an isolated local Pi subagent with abstract model tiers (fast/default/heavy), readOnly concurrency, worktree-based write parallelism, tail context compression, and suspend-resume Q&A. Do NOT use inside a Pi session itself or for 1-3 file localized direct edits.
 ---
 
-# pi-worker：跨 Harness 子代理与独立长任务工作器
+# pi-worker：跨 Harness 通用子代理
 
-通过 MCP 将本地自定义 Pi 封装为可异步执行、支持抽象档位映射、只读并发、内部尾部 DCP 压缩与挂起提问续跑（Suspend-Resume）的独立执行器，统一承接路由表子代理任务与长程编码任务，不污染主会话上下文。
+通过 MCP 将本地自定义 Pi 封装为可异步执行、支持抽象档位映射、只读并发、内部尾部 DCP 压缩与挂起提问续跑（Suspend-Resume）的跨 Harness 通用子代理，统一承接探索、验证、审查与多步编码任务，不污染主会话上下文。
 
 ## 何时使用 vs 何时不要使用
 
@@ -15,11 +15,12 @@ description: Use when delegating routed subagent tasks (broad exploration, test/
      - 常规测试、构建、lint、类型检查与报错日志压缩 → `tier: "fast"` + `readOnly: true`；
      - 多源网络调研/查外部技术文档、重噪声外部检索/长文档与大 JSON 抽取、Git 历史考古、基于最终 Diff 生成 PR/文档初稿 → `tier: "fast"` + `readOnly: true`；
      - 独立代码审查（只读审查） → `tier: "heavy"` + `readOnly: true`。
-  2. **多步编码 / 长程任务（默认 `readOnly: false`，同 `cwd` 独占写锁）**：
-     - 规格与红线清晰、具备可执行验收命令、预计多轮编辑与试错闭环 → `tier: "default"`（或按复杂度传 `heavy`）。
+  2. **多步编码与大范围实现任务（默认 `readOnly: false`，同 `cwd` 独占写锁；跨独立 `git worktree` 支持真并发）**：
+     - **无明确计划（未走 `writing-plans`）**：超出 1–3 个文件小范围定向修改的跨多文件实现、大文件重构、批量迁移或预计多轮改测闭环 → 默认直接委派 `tier: "default"`（复杂任务可传 `heavy`），不得因已拿到 `file:line` 锚点就由主会话包揽全部写入；
+     - **有明确计划（如 `writing-plans`）**：由用户在 **执行者（`pi-worker` vs `Native`）× 模式（`串行` vs `并发`）** 中选择；选 `pi-worker + 并发` 时，由主代理为无文件重叠的独立任务组分别创建 `git worktree` 并将各自 worktree 路径作为 `cwd` 并发派发，逐路验收后再合并并清理 worktree。
 - **不要使用**：
-  - 1–2 步就能直达的定向文件读写或极小改动 → 主会话直接完成；
-  - 需求高度模糊、需要和人类边聊边改方向的探索开发 → 直接打开 Pi 交互式 TUI 窗口；
+  - 1–3 个文件、已有明确锚点且无需多轮改测试错的小范围定向修改或局部集成收口 → 主会话直接完成；
+  - 需求高度模糊、需要和人类边聊边改方向的探索开发 → 先澄清需求，或直接打开 Pi 交互式 TUI 窗口；
   - 用户显式指定其他原生 subagent（如 `browser`）时按用户指定执行；
   - **当前已经处在 Pi 会话内部 → 严禁自我委派嵌套**。
 
@@ -97,7 +98,7 @@ description: Use when delegating routed subagent tasks (broad exploration, test/
 
 ## Suspend-Resume 协作协议
 
-1. **读写期间冻结同工作区写入**：非 `readOnly` 任务运行期间，主会话严禁同时修改同一 `cwd` 的文件；`readOnly: true` 任务允许同 `cwd` 并行 2–4 路。
+1. **读写隔离与真并发**：非 `readOnly` 任务运行期间，主会话严禁同时修改同一 `cwd` 的文件；`readOnly: true` 任务允许同 `cwd` 并行 2–4 路；多个读写任务需要真并发时，由主会话为无文件重叠的任务组分别建立独立 `git worktree` 并传入各自 worktree 路径作为 `cwd` 并发派发，完成后逐路验收、合并并清理 worktree。
 2. **收到 `status: "needs_input"` 时二级接球**：
    - 先检查主会话上下文是否已有明确答案（如用户早前拍板的取舍）；**能自答就直接 `pi_worker_reply` 秒答续跑**（在几分钟内续跑可命中 Pi 的前缀缓存，省成本且不打扰用户）；
    - 若确实属于需要人类拍板的产品/架构歧义，向用户简明呈现 `question` 与 `options`，拿到答复后再 `pi_worker_reply` 续跑。

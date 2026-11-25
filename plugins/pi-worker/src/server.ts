@@ -1,7 +1,7 @@
 /**
  * pi-worker MCP server（stdio）。
- * 将本机自定义 Pi 封装为支持异步长跑、独立 Session 隔离、挂起提问续跑（Suspend-Resume）、
- * 跨 Harness 标准进度流与 Antigravity MCP App 侧面板的独立长任务工作器。
+ * 将本机自定义 Pi 封装为支持异步执行、抽象档位映射、只读并发、独立 Session 隔离、
+ * 挂起提问续跑（Suspend-Resume）、跨 Harness 标准进度流与 Antigravity MCP App 侧面板的跨 Harness 通用子代理。
  */
 
 import { readFileSync } from "node:fs";
