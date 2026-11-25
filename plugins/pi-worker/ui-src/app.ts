@@ -6,6 +6,7 @@ import {
 import { z } from "zod";
 import { parseGitStatusFileUri } from "./git-uri.ts";
 import { createCoalescingRunner } from "./poller.ts";
+import { iconForEvent, isExpandableDetail, summarizeDetailPreview } from "./timeline.ts";
 
 interface TaskSummary {
   taskId: string;
@@ -74,6 +75,7 @@ let requestEpoch = 0;
 let pollTimer: number | null = null;
 let followScroll = true;
 let thinkingOpen = false;
+const openEventSeqs = new Set<number>();
 let lastRenderKey = "";
 
 const elSelect = document.getElementById("task-select") as HTMLSelectElement;
@@ -145,6 +147,7 @@ function applyPayload(payload: MonitorPayload, resetStream: boolean): boolean {
     offset = 0;
     events = [];
     latestThinking = null;
+    openEventSeqs.clear();
   }
   currentTask = incomingTask;
   if (incomingTask) selectedTaskId = incomingTask.taskId;
@@ -154,6 +157,7 @@ function applyPayload(payload: MonitorPayload, resetStream: boolean): boolean {
     if (payload.stream.truncated) {
       events = [];
       latestThinking = null;
+      openEventSeqs.clear();
     }
     offset = payload.stream.nextOffset;
     hasMore = payload.stream.hasMore;
@@ -262,6 +266,12 @@ function render(): void {
   const prevScrollTop = elMain.scrollTop;
   const existingDetails = elMain.querySelector<HTMLDetailsElement>(".thinking-details");
   if (existingDetails) thinkingOpen = existingDetails.open;
+  elMain.querySelectorAll<HTMLDetailsElement>("details.ev-expandable[data-ev-seq]").forEach((el) => {
+    const seq = Number(el.dataset.evSeq);
+    if (!Number.isFinite(seq)) return;
+    if (el.open) openEventSeqs.add(seq);
+    else openEventSeqs.delete(seq);
+  });
 
   if (!currentTask) {
     elMain.innerHTML = `<div class="empty">当前没有可展示的 Pi Worker 任务。<br>发起 <code>pi_worker_start</code> 后将自动在此显示实时进度。</div>`;
@@ -354,23 +364,31 @@ function render(): void {
     : `<div class="timeline">${events.map((ev) => {
         const cls = ev.isError ? "ev ev-error" : `ev ev-${escapeHtml(ev.kind)}`;
         const dur = fmtDuration(ev.durationMs);
-        const icon = ev.kind === "tool_start"
-          ? "▶"
-          : ev.kind === "tool_end"
-            ? (ev.isError ? "✖" : "✓")
-            : ev.kind === "assistant"
-              ? "💬"
-              : ev.kind === "compact"
-                ? "🗜"
-                : ev.kind === "status"
-                  ? "●"
-                  : "·";
+        const icon = iconForEvent(ev);
+        const headText = `${icon} ${escapeHtml(ev.title)}${dur ? ` (${escapeHtml(dur)})` : ""}`;
+        const timeText = escapeHtml(fmtTime(ev.timestamp));
+        if (ev.detail && isExpandableDetail(ev.detail)) {
+          const isOpen = openEventSeqs.has(ev.seq);
+          const preview = summarizeDetailPreview(ev.detail);
+          return `
+            <details class="${cls} ev-expandable" data-ev-seq="${ev.seq}"${isOpen ? " open" : ""}>
+              <summary class="ev-summary">
+                <div class="ev-head">
+                  <span class="ev-title"><span class="ev-caret" aria-hidden="true"></span>${headText}</span>
+                  <span class="muted">${timeText}</span>
+                </div>
+                <div class="ev-preview">${escapeHtml(preview)}</div>
+              </summary>
+              <div class="ev-detail">${escapeHtml(ev.detail)}</div>
+            </details>
+          `;
+        }
         const detail = ev.detail ? `<div class="ev-detail">${escapeHtml(ev.detail)}</div>` : "";
         return `
           <div class="${cls}">
             <div class="ev-head">
-              <span>${icon} ${escapeHtml(ev.title)}${dur ? ` (${escapeHtml(dur)})` : ""}</span>
-              <span class="muted">${escapeHtml(fmtTime(ev.timestamp))}</span>
+              <span class="ev-title">${headText}</span>
+              <span class="muted">${timeText}</span>
             </div>
             ${detail}
           </div>
@@ -393,6 +411,21 @@ function render(): void {
     });
   });
 
+  const nextThinkingDetails = elMain.querySelector<HTMLDetailsElement>(".thinking-details");
+  if (nextThinkingDetails) {
+    nextThinkingDetails.addEventListener("toggle", () => {
+      thinkingOpen = nextThinkingDetails.open;
+    });
+  }
+  elMain.querySelectorAll<HTMLDetailsElement>("details.ev-expandable[data-ev-seq]").forEach((el) => {
+    el.addEventListener("toggle", () => {
+      const seq = Number(el.dataset.evSeq);
+      if (!Number.isFinite(seq)) return;
+      if (el.open) openEventSeqs.add(seq);
+      else openEventSeqs.delete(seq);
+    });
+  });
+
   if (followScroll) {
     elMain.scrollTop = elMain.scrollHeight;
   } else {
@@ -408,6 +441,7 @@ elSelect.addEventListener("change", () => {
   offset = 0;
   events = [];
   latestThinking = null;
+  openEventSeqs.clear();
   clearPoll();
   void pollSnapshot(true);
 });

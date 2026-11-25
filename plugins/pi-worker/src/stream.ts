@@ -53,7 +53,8 @@ export interface EventFormatterOptions {
 }
 
 const DEFAULT_THINKING_THROTTLE_MS = 1500;
-const MAX_ARG_SUMMARY_CHARS = 200;
+const MAX_ARG_SUMMARY_CHARS = 1200;
+const MAX_TERMINAL_ARG_CHARS = 160;
 const MAX_ASSISTANT_DETAIL_CHARS = 1200;
 const MAX_THINKING_PREVIEW_CHARS = 400;
 const DEFAULT_MAX_BYTES = 128 * 1024;
@@ -78,7 +79,7 @@ function summarizeToolArgs(args: unknown): string | undefined {
   for (const key of ["command", "CommandLine", "path", "Path", "filePath", "file_path", "pattern", "query", "question", "reason"]) {
     const val = obj[key];
     if (typeof val === "string" && val.trim()) {
-      return truncateHead(val.replace(/\s+/g, " "), MAX_ARG_SUMMARY_CHARS);
+      return truncateHead(val, MAX_ARG_SUMMARY_CHARS);
     }
   }
   try {
@@ -309,7 +310,8 @@ export function formatTerminalLine(ev: FormattedStreamEvent): string {
     return `${prefix} 💭 ${ev.title}${preview}`;
   }
   if (ev.kind === "tool_start") {
-    return `${prefix} ▶ ${ev.toolName ?? ev.title}${ev.detail ? `: ${ev.detail}` : ""}`;
+    const summary = ev.detail ? `: ${truncateHead(ev.detail.replace(/\s+/g, " "), MAX_TERMINAL_ARG_CHARS)}` : "";
+    return `${prefix} ▶ ${ev.toolName ?? ev.title}${summary}`;
   }
   if (ev.kind === "tool_end") {
     const mark = ev.isError ? "✖" : "✓";

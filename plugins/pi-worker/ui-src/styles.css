@@ -270,9 +270,55 @@ html, body {
 .ev-head {
   display: flex;
   justify-content: space-between;
+  align-items: baseline;
   gap: 8px;
   font-size: 12px;
   font-weight: 500;
+}
+
+.ev-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  word-break: break-word;
+}
+
+.ev-summary {
+  list-style: none;
+  cursor: pointer;
+}
+
+.ev-summary::-webkit-details-marker {
+  display: none;
+}
+
+.ev-caret {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 5px solid var(--color-text-secondary, #57606a);
+  transition: transform 0.12s ease;
+  flex-shrink: 0;
+}
+
+.ev-expandable[open] .ev-caret {
+  transform: rotate(90deg);
+}
+
+.ev-preview {
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--color-text-secondary, #57606a);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ev-expandable[open] .ev-preview {
+  display: none;
 }
 
 .ev-detail {

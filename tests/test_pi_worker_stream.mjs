@@ -47,19 +47,24 @@ test("test_formatter_throttles_thinking_and_tracks_tool_duration", () => {
   assert.equal(throttled[0].thinkingChars, "正在分析架构与依赖关系，准备执行命令".length);
   assert.match(throttled[0].detail ?? "", /正在分析架构/);
 
-  // 工具开始：带参数摘要并记录起始时间
+  // 工具开始：带参数摘要（保留多行，上限 1200 字）并记录起始时间；终端单行保持紧凑
   clock += 200;
+  const multilineCmd = "cd ~/repo\nnode --test\necho " + "x".repeat(260);
   const startEvs = formatter.feedRawLine(JSON.stringify({
     type: "tool_execution_start",
     toolCallId: "tc-1",
     toolName: "bash",
-    args: { command: "node --test" },
+    args: { command: multilineCmd },
   }));
   assert.equal(startEvs.length, 1);
   assert.equal(startEvs[0].kind, "tool_start");
   assert.equal(startEvs[0].toolName, "bash");
-  assert.match(startEvs[0].detail ?? "", /node --test/);
-  assert.match(formatTerminalLine(startEvs[0]), /bash.*node --test/);
+  assert.ok((startEvs[0].detail ?? "").includes("\n"), "tool_start detail should preserve newlines for expandable UI");
+  assert.ok((startEvs[0].detail ?? "").length > 250, "tool_start detail should retain >200 chars for expansion");
+  const termLine = formatTerminalLine(startEvs[0]);
+  assert.match(termLine, /bash.*node --test/);
+  assert.ok(!termLine.includes("\n"), "terminal line must stay single-line");
+  assert.ok(termLine.length < 220, "terminal line must stay compact");
 
   // 工具结束：计算耗时并记录 isError
   clock += 350;

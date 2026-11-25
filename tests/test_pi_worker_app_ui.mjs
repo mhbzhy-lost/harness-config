@@ -7,6 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parseGitStatusFileUri } from "../plugins/pi-worker/ui-src/git-uri.ts";
 import { createCoalescingRunner } from "../plugins/pi-worker/ui-src/poller.ts";
+import { iconForEvent, isExpandableDetail, summarizeDetailPreview } from "../plugins/pi-worker/ui-src/timeline.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MONITOR_HTML = join(ROOT, "plugins", "pi-worker", "ui", "monitor.html");
@@ -61,6 +62,27 @@ test("test_coalescing_runner_never_drops_task_switch_while_in_flight", async () 
   assert.deepEqual(calls, [{ forceReset: false }, { forceReset: true }]);
 });
 
+test("test_timeline_helpers_avoid_misleading_caret_and_gate_expandable_details", () => {
+  // 静态事件图标不得使用 "▶"，避免看起来像可展开的折叠三角却无法点击
+  for (const kind of ["tool_start", "tool_end", "assistant", "compact", "retry_failed", "status", "turn_end", "session"]) {
+    assert.notEqual(iconForEvent({ kind }), "▶", `static icon for ${kind} must not look like a disclosure triangle`);
+  }
+  assert.equal(iconForEvent({ kind: "tool_start" }), "⚙");
+  assert.equal(iconForEvent({ kind: "tool_end", isError: false }), "✓");
+  assert.equal(iconForEvent({ kind: "tool_end", isError: true }), "✖");
+
+  // 短单行详情不折叠，多行或超长详情才渲染为可展开 <details>
+  assert.equal(isExpandableDetail(undefined), false);
+  assert.equal(isExpandableDetail('{"target":"mac"}'), false);
+  assert.equal(isExpandableDetail("line1\nline2"), true);
+  assert.equal(isExpandableDetail("a".repeat(120)), true);
+
+  assert.equal(summarizeDetailPreview("line1\n  line2"), "line1 line2");
+  const longPreview = summarizeDetailPreview("x".repeat(150), 40);
+  assert.equal(longPreview.length, 41);
+  assert.ok(longPreview.endsWith("…"));
+});
+
 test("test_monitor_html_is_self_contained_csp_safe_and_served_by_mcp", async () => {
   const st = statSync(MONITOR_HTML);
   assert.ok(st.size > 1024 && st.size < 2 * 1024 * 1024, `unexpected monitor.html size: ${st.size}`);
@@ -71,6 +93,9 @@ test("test_monitor_html_is_self_contained_csp_safe_and_served_by_mcp", async () 
   // 严格遵守 default-src 'none' 默认 CSP：禁止外部 http(s) script/link
   assert.doesNotMatch(html, /<script[^>]+src=["']https?:/i);
   assert.doesNotMatch(html, /<link[^>]+href=["']https?:/i);
+  // 可展开进度条目须使用原生 <details> + ev-expandable，且不得再用 ▶ 作为 tool_start 静态图标
+  assert.match(html, /ev-expandable/);
+  assert.doesNotMatch(html, /tool_start"\?"▶"/);
 
   const dir = mkdtempSync(join(tmpdir(), "pi-worker-ui-mcp-"));
   const child = spawn(process.execPath, [SERVER_PATH], {
