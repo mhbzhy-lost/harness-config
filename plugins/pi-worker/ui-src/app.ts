@@ -361,7 +361,7 @@ function render(): void {
         const headText = `${icon} ${escapeHtml(ev.title)}${dur ? ` (${escapeHtml(dur)})` : ""}`;
         const timeText = escapeHtml(fmtTime(ev.timestamp));
         const renderDetailHtml = (detailText: string): string => {
-          if (ev.kind === "tool_start") {
+          if (ev.kind === "tool_start" || ev.kind === "tool_end") {
             return `<pre class="ev-detail ev-code">${escapeHtml(detailText)}</pre>`;
           }
           if ((ev.kind === "assistant" || ev.kind === "status") && !ev.isError) {

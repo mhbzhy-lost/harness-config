@@ -54,6 +54,7 @@ export interface EventFormatterOptions {
 
 const DEFAULT_THINKING_THROTTLE_MS = 1500;
 const MAX_ARG_SUMMARY_CHARS = 1200;
+const MAX_TOOL_OUTPUT_CHARS = 2400;
 const MAX_TERMINAL_ARG_CHARS = 160;
 const MAX_ASSISTANT_DETAIL_CHARS = 1200;
 const MAX_THINKING_PREVIEW_CHARS = 400;
@@ -71,6 +72,45 @@ function truncateTailPreview(text: string, maxChars: number): string {
   const cleaned = text.trim();
   if (cleaned.length <= maxChars) return cleaned;
   return `…${cleaned.slice(cleaned.length - maxChars)}`;
+}
+
+function truncateHeadTail(text: string, maxChars: number): string {
+  const cleaned = text.trim();
+  if (cleaned.length <= maxChars) return cleaned;
+  const side = Math.max(100, Math.floor((maxChars - 40) / 2));
+  const omitted = cleaned.length - side * 2;
+  return `${cleaned.slice(0, side)}\n… (已省略 ${omitted} chars) …\n${cleaned.slice(cleaned.length - side)}`;
+}
+
+function summarizeToolOutput(result: unknown): string | undefined {
+  if (typeof result === "string") {
+    const trimmed = result.trim();
+    return trimmed ? truncateHeadTail(trimmed, MAX_TOOL_OUTPUT_CHARS) : undefined;
+  }
+  if (!result || typeof result !== "object") return undefined;
+  const obj = result as Record<string, unknown>;
+  const contentText = extractTextFromContent(obj.content);
+  if (contentText.trim()) {
+    return truncateHeadTail(contentText, MAX_TOOL_OUTPUT_CHARS);
+  }
+  for (const key of ["output", "error", "message", "text"]) {
+    const val = obj[key];
+    if (typeof val === "string" && val.trim()) {
+      return truncateHeadTail(val, MAX_TOOL_OUTPUT_CHARS);
+    }
+  }
+  const fallback = obj.structuredContent ?? obj.details;
+  if (fallback !== undefined) {
+    try {
+      const raw = JSON.stringify(fallback, null, 2);
+      if (raw && raw !== "{}" && raw !== "[]") {
+        return truncateHeadTail(raw, MAX_TOOL_OUTPUT_CHARS);
+      }
+    } catch {
+      // 忽略序列化失败
+    }
+  }
+  return undefined;
 }
 
 function summarizeToolArgs(args: unknown): string | undefined {
@@ -208,11 +248,13 @@ export function createEventFormatter(options: EventFormatterOptions = {}): {
         if (started !== undefined) toolStartTimes.delete(startKey);
         const durationMs = started !== undefined ? Math.max(0, nowFn() - started) : undefined;
         const isError = obj.isError === true;
+        const detail = summarizeToolOutput(obj.result);
         out.push(emit({
           kind: "tool_end",
           title: toolName,
           toolName,
           ...(toolCallId ? { toolCallId } : {}),
+          ...(detail ? { detail } : {}),
           isError,
           ...(durationMs !== undefined ? { durationMs } : {}),
         }));
@@ -315,7 +357,10 @@ export function formatTerminalLine(ev: FormattedStreamEvent): string {
   }
   if (ev.kind === "tool_end") {
     const mark = ev.isError ? "✖" : "✓";
-    return `${prefix} ${mark} ${ev.toolName ?? ev.title}${formatDuration(ev.durationMs)}`;
+    const errPreview = ev.isError && ev.detail
+      ? `: ${truncateHead(ev.detail.replace(/\s+/g, " "), 120)}`
+      : "";
+    return `${prefix} ${mark} ${ev.toolName ?? ev.title}${formatDuration(ev.durationMs)}${errPreview}`;
   }
   if (ev.kind === "assistant") {
     return `${prefix} 💬 ${ev.detail ? truncateHead(ev.detail.replace(/\s+/g, " "), 120) : ev.title}`;

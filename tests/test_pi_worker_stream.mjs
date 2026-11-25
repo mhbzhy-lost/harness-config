@@ -66,19 +66,26 @@ test("test_formatter_throttles_thinking_and_tracks_tool_duration", () => {
   assert.ok(!termLine.includes("\n"), "terminal line must stay single-line");
   assert.ok(termLine.length < 220, "terminal line must stay compact");
 
-  // 工具结束：计算耗时并记录 isError
+  // 工具结束：计算耗时、记录 isError 并提取首尾截断的工具输出（单行终端输出仍保持紧凑）
   clock += 350;
+  const longOutput = `HEADER\n${"middle line\n".repeat(300)}FOOTER_OK`;
   const endEvs = formatter.feedRawLine(JSON.stringify({
     type: "tool_execution_end",
     toolCallId: "tc-1",
     toolName: "bash",
     isError: false,
+    result: { content: [{ type: "text", text: longOutput }] },
   }));
   assert.equal(endEvs.length, 1);
   assert.equal(endEvs[0].kind, "tool_end");
   assert.equal(endEvs[0].durationMs, 350);
   assert.equal(endEvs[0].isError, false);
-  assert.match(formatTerminalLine(endEvs[0]), /bash.*0\.4s|0\.35s|350ms/);
+  assert.match(endEvs[0].detail ?? "", /^HEADER/);
+  assert.match(endEvs[0].detail ?? "", /已省略 \d+ chars/);
+  assert.match(endEvs[0].detail ?? "", /FOOTER_OK$/);
+  const endTermLine = formatTerminalLine(endEvs[0]);
+  assert.match(endTermLine, /bash.*0\.4s|0\.35s|350ms/);
+  assert.ok(!endTermLine.includes("HEADER"), "non-error tool_end terminal line should stay compact");
 
   // 助手消息与 turn_end
   const msgEvs = formatter.feedRawLine(JSON.stringify({

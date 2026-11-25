@@ -590,7 +590,7 @@ container holding the app. Specify either width or maxWidth, and either height o
         <div class="section-title">\u5DE5\u4F5C\u533A\u53D8\u66F4 (${o.gitChanges.length})</div>
         <ul class="file-list">${d}</ul>
       </div>
-    `)}let u=Te.length===0?'<div class="muted">\u7B49\u5F85\u6D41\u5F0F\u4E8B\u4EF6...</div>':`<div class="timeline">${Te.map(d=>{let m=d.isError?"ev ev-error":`ev ev-${X(d.kind)}`,b=Sy(d.durationMs),f=`${Xp(d)} ${X(d.title)}${b?` (${X(b)})`:""}`,v=X(sl(d.timestamp)),z=S=>d.kind==="tool_start"?`<pre class="ev-detail ev-code">${X(S)}</pre>`:(d.kind==="assistant"||d.kind==="status")&&!d.isError?`<div class="ev-detail md-body">${Pn(S)}</div>`:`<div class="ev-detail">${X(S)}</div>`;if(d.detail&&ef(d.detail)){let S=at.has(d.seq),N=tf(d.detail);return`
+    `)}let u=Te.length===0?'<div class="muted">\u7B49\u5F85\u6D41\u5F0F\u4E8B\u4EF6...</div>':`<div class="timeline">${Te.map(d=>{let m=d.isError?"ev ev-error":`ev ev-${X(d.kind)}`,b=Sy(d.durationMs),f=`${Xp(d)} ${X(d.title)}${b?` (${X(b)})`:""}`,v=X(sl(d.timestamp)),z=S=>d.kind==="tool_start"||d.kind==="tool_end"?`<pre class="ev-detail ev-code">${X(S)}</pre>`:(d.kind==="assistant"||d.kind==="status")&&!d.isError?`<div class="ev-detail md-body">${Pn(S)}</div>`:`<div class="ev-detail">${X(S)}</div>`;if(d.detail&&ef(d.detail)){let S=at.has(d.seq),N=tf(d.detail);return`
             <details class="${m} ev-expandable" data-ev-seq="${d.seq}"${S?" open":""}>
               <summary class="ev-summary">
                 <div class="ev-head">
