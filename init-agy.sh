@@ -5,7 +5,7 @@
 #   3. 确保 ~/.gemini/config/skills.json 的 entries 含 <仓库根>/skills（保留已有条目）
 #   4. agy/rules/*.md 逐文件软链接进 ~/.gemini/config/rules/（全局规则）
 #   5. agy/agents/*.md 逐文件软链接进 ~/.gemini/config/agents/（自定义 subagent）
-#   6. 注入内置 subagent 模型档位兜底 hook 到 ~/.gemini/config/hooks.json（按名幂等管理）
+#   6. 注入受管 hooks（内置 subagent 档位兜底 / pi-worker 会话注入 / swarm 模型守卫）到 ~/.gemini/config/hooks.json（按名幂等管理）
 #   7. agy/shell.zsh 注册 source 进 ~/.zshrc（标记块，幂等；提供 agyui / agyide 代理启动器）
 set -euo pipefail
 
@@ -17,6 +17,7 @@ RULES_SRC="$SCRIPT_DIR/agy/rules"
 AGENTS_SRC="$SCRIPT_DIR/agy/agents"
 HOOK_SCRIPT="$SCRIPT_DIR/agy/hooks/subagent-model-router.py"
 PI_WORKER_HOOK_SCRIPT="$SCRIPT_DIR/agy/hooks/pi-worker-session-injector.py"
+SWARM_HOOK_SCRIPT="$SCRIPT_DIR/agy/hooks/swarm-model-guard.py"
 SHELL_SNIPPET="$SCRIPT_DIR/agy/shell.zsh"
 
 SETTINGS_TARGET="${AGY_SETTINGS_PATH:-$HOME/.gemini/antigravity-cli/settings.json}"
@@ -64,6 +65,7 @@ command -v python3 >/dev/null 2>&1 || die "需要 python3"
 [[ -f "$SETTINGS_TEMPLATE" ]] || die "找不到 AGY 设置模板: $SETTINGS_TEMPLATE"
 [[ -f "$HOOK_SCRIPT" ]] || die "找不到 AGY hook 脚本: $HOOK_SCRIPT"
 [[ -f "$PI_WORKER_HOOK_SCRIPT" ]] || die "找不到 AGY hook 脚本: $PI_WORKER_HOOK_SCRIPT"
+[[ -f "$SWARM_HOOK_SCRIPT" ]] || die "找不到 AGY hook 脚本: $SWARM_HOOK_SCRIPT"
 [[ -f "$SHELL_SNIPPET" ]] || die "找不到 AGY shell 片段: $SHELL_SNIPPET"
 
 # --- 1. 深度合并 agy/settings.json ---
@@ -264,11 +266,11 @@ else
 fi
 
 # --- 6. 注入受管 AGY hooks 到 ~/.gemini/config/hooks.json ---
-AGY_SYNC_DRY_RUN="$DRY_RUN" python3 - "$HOOKS_JSON" "$HOOK_SCRIPT" "$PI_WORKER_HOOK_SCRIPT" <<'PY'
+AGY_SYNC_DRY_RUN="$DRY_RUN" python3 - "$HOOKS_JSON" "$HOOK_SCRIPT" "$PI_WORKER_HOOK_SCRIPT" "$SWARM_HOOK_SCRIPT" <<'PY'
 import copy, json, os, sys, tempfile
 from datetime import datetime
 
-target_path, router_hook_script, pi_worker_hook_script = sys.argv[1:4]
+target_path, router_hook_script, pi_worker_hook_script, swarm_hook_script = sys.argv[1:5]
 dry_run = os.environ.get("AGY_SYNC_DRY_RUN") == "1"
 managed_hooks = {
     "harness-config-subagent-model-router": {
@@ -293,6 +295,20 @@ managed_hooks = {
                     {
                         "type": "command",
                         "command": f'python3 "{pi_worker_hook_script}"',
+                        "timeout": 5,
+                    }
+                ],
+            }
+        ]
+    },
+    "harness-config-swarm-model-guard": {
+        "PreToolUse": [
+            {
+                "matcher": "swarm",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f'python3 "{swarm_hook_script}"',
                         "timeout": 5,
                     }
                 ],

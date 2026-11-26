@@ -237,6 +237,132 @@ class AgySyncTest(unittest.TestCase):
         # 5. 非法输入 → fail-open 放行
         self.assertEqual(run_hook("not-json"), {"decision": "allow"})
 
+    def test_swarm_model_guard_hook_behavior(self) -> None:
+        hook_path = ROOT / "agy/hooks/swarm-model-guard.py"
+        self.assertTrue(hook_path.exists())
+
+        def run_hook(stdin_text: str, extra_env: dict | None = None) -> dict:
+            # 清理 AGY_SWARM_DEFAULT_MODEL，保证断言不受宿主机环境影响
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k != "AGY_SWARM_DEFAULT_MODEL"
+            }
+            if extra_env:
+                env.update(extra_env)
+            res = subprocess.run(
+                ["python3", str(hook_path)],
+                input=stdin_text,
+                text=True,
+                capture_output=True,
+                check=False,
+                env=env,
+            )
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            return json.loads(res.stdout)
+
+        def swarm_call(args: dict) -> str:
+            return json.dumps({"toolCall": {"name": "swarm", "args": args}})
+
+        default_overwrite = {
+            "decision": "allow",
+            "overwrite": {"model": "gemini-4-hydrogen-high"},
+        }
+
+        # 1. add 缺省 / 空串 / 空白串 / 裸别名 hydrogen → 兜底默认 Hydrogen ID
+        for args in (
+            {"action": "add", "prompt": "explore"},
+            {"action": "add", "model": None},
+            {"action": "add", "model": ""},
+            {"action": "add", "model": "   "},
+            {"action": "add", "model": "hydrogen"},
+            {"action": "add", "model": "Hydrogen"},
+        ):
+            self.assertEqual(run_hook(swarm_call(args)), default_overwrite, msg=args)
+        # 2. model 缺省 / 裸别名 hydrogen → 同样兜底
+        for args in (
+            {"action": "model"},
+            {"action": "model", "model": "hydrogen"},
+        ):
+            self.assertEqual(run_hook(swarm_call(args)), default_overwrite, msg=args)
+        # 3. 环境变量覆写默认模型生效（空白值回退内置默认）
+        self.assertEqual(
+            run_hook(
+                swarm_call({"action": "add"}),
+                {"AGY_SWARM_DEFAULT_MODEL": "gemini-5-hydrogen-xhigh"},
+            ),
+            {"decision": "allow", "overwrite": {"model": "gemini-5-hydrogen-xhigh"}},
+        )
+        self.assertEqual(
+            run_hook(
+                swarm_call({"action": "add"}),
+                {"AGY_SWARM_DEFAULT_MODEL": "   "},
+            ),
+            default_overwrite,
+        )
+        # 4. 合法 Hydrogen 目录 ID 与显示名 → 原样放行不覆盖
+        for model in (
+            "gemini-4-hydrogen-low",
+            "gemini-4-hydrogen-medium",
+            "gemini-4-hydrogen-high",
+            "gemini-4-hydrogen-xhigh",
+            "Gemini 4 Hydrogen (High)",
+        ):
+            for action in ("add", "model"):
+                self.assertEqual(
+                    run_hook(swarm_call({"action": action, "model": model})),
+                    {"decision": "allow"},
+                    msg=(action, model),
+                )
+        # 5. 非 Hydrogen 模型 → force_ask，reason 含模型名与目标
+        for model in (
+            "gemini-4-neon-high",
+            "claude-opus-5-5-high",
+            "pro",
+            "flash",
+            "gpt-oss-120b-medium",
+        ):
+            cases = (
+                ({"action": "add", "name": "scout", "model": model}, "worker 'scout'"),
+                ({"action": "add", "model": model}, "新 worker"),
+                ({"action": "model", "name": "scout", "model": model}, "worker 'scout'"),
+                ({"action": "model", "model": model}, "当前会话自身"),
+            )
+            for args, target in cases:
+                out = run_hook(swarm_call(args))
+                self.assertEqual(out["decision"], "force_ask", msg=args)
+                self.assertIn(model, out["reason"], msg=args)
+                self.assertIn(target, out["reason"], msg=args)
+                if "claude" in model.lower():
+                    self.assertIn(
+                        "Claude 系列模型仅限只读审查代码或计划", out["reason"], msg=args
+                    )
+                else:
+                    self.assertNotIn("只读审查", out["reason"], msg=args)
+        # 6. 其他 action → 直接放行
+        for action in ("status", "models", "kill", "title"):
+            self.assertEqual(
+                run_hook(swarm_call({"action": action, "model": "pro"})),
+                {"decision": "allow"},
+                msg=action,
+            )
+        # 7. 非 swarm 工具名 → 直接放行
+        self.assertEqual(
+            run_hook(
+                json.dumps(
+                    {
+                        "toolCall": {
+                            "name": "invoke_subagent",
+                            "args": {"action": "add", "model": "pro"},
+                        }
+                    }
+                )
+            ),
+            {"decision": "allow"},
+        )
+        # 8. 非法 JSON → fail-open 放行
+        self.assertEqual(run_hook("not-json"), {"decision": "allow"})
+
     def test_pi_worker_session_injector_hook_behavior(self) -> None:
         hook_path = ROOT / "agy/hooks/pi-worker-session-injector.py"
         self.assertTrue(hook_path.exists())
@@ -757,6 +883,12 @@ class AgySyncTest(unittest.TestCase):
             self.assertIn(
                 str(ROOT / "agy/hooks/pi-worker-session-injector.py"),
                 pi_worker_hook["PreToolUse"][0]["hooks"][0]["command"],
+            )
+            swarm_hook = merged_hooks["harness-config-swarm-model-guard"]
+            self.assertEqual(swarm_hook["PreToolUse"][0]["matcher"], "swarm")
+            self.assertIn(
+                str(ROOT / "agy/hooks/swarm-model-guard.py"),
+                swarm_hook["PreToolUse"][0]["hooks"][0]["command"],
             )
             self.assertEqual(stat.S_IMODE(hooks_json.stat().st_mode), 0o600)
             self.assertEqual(len(list(config_dir.glob("hooks.json.bak.*"))), 1)

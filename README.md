@@ -21,7 +21,7 @@ Qwen Code / Pi / Antigravity（AGY）个人配置与插件的多机同步仓库�
 | `agy/settings.json` | AGY CLI 设置模板（跨机通用 UI 偏好：全屏 `altScreenMode: always`），深度合并进 `~/.gemini/antigravity-cli/settings.json` |
 | `agy/rules/` | AGY 全局规则（带 `trigger: always_on`），逐文件软链接进 `~/.gemini/config/rules/`（对所有项目生效） |
 | `agy/agents/` | AGY 自定义 subagent 定义（`test-runner` 只读验证与失败日志压缩，frontmatter 声明 `model: flash`），逐文件软链接进 `~/.gemini/config/agents/` |
-| `agy/hooks/` | AGY 生命周期 hook（`subagent-model-router.py`：内置 `research` 缺省/`inherit` 时机械兜底 `flash`；`pi-worker-session-injector.py`：为 `pi_worker_start` / `pi_worker_monitor` 调用自动补全 `parentSessionId` / `cwd` / `parentSessionTitle`，兼容直接调用与 `call_mcp_tool` 间接调用，失败不阻塞），按名幂等注入 `~/.gemini/config/hooks.json` |
+| `agy/hooks/` | AGY 生命周期 hook（`subagent-model-router.py`：内置 `research` 缺省/`inherit` 时机械兜底 `flash`；`pi-worker-session-injector.py`：为 `pi_worker_start` / `pi_worker_monitor` 调用自动补全 `parentSessionId` / `cwd` / `parentSessionTitle`，兼容直接调用与 `call_mcp_tool` 间接调用，失败不阻塞；`swarm-model-guard.py`：swarm 新增 worker/切换模型默认锁定 Hydrogen 目录，非 Hydrogen 模型需用户显式授权），按名幂等注入 `~/.gemini/config/hooks.json` |
 | `qwen/settings.json` | 设置模板（跨机通用偏好：TUI 精简 + 主题插值 + Explore 抽象 `fast` 档位） |
 | `qwen/shell.zsh` | qwen shell 包装：主题随系统明暗（macOS light→Xcode / dark→Qwen Dark） |
 | `qwen/QWEN.md` | 全局指令与子代理路由表，软链接为 `~/.qwen/QWEN.md`（对所有项目生效） |
