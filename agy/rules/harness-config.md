@@ -42,3 +42,7 @@ trigger: always_on
 - **二级接球**：收到 `status: "needs_input"` 时，主会话已有明确答案直接 `pi_worker_reply` 秒答续跑，否则转问用户后再续跑。
 - **运行中实时插话**：运行中（`running`）任务需要主动纠偏或补充约束时，用 `pi_worker_steer(taskId, message)` 同步入队立即返回，消息在当前 turn 工具执行完、下一次 LLM 请求前注入；非运行态任务改用 `pi_worker_reply` 续跑。
 - **磁盘证据核验**：遵循 `pi-worker` 工具边界返回的核验约束，不直接转述 `summary`/`verifiedCommands` 自述；整合回复前核对 `executedCommands`、`eventsPath`、`gitChanges`/diff 及关键结论引用的 `file:line` 源码（详见 `pi-worker` skill）。
+
+## Swarm 模式
+
+- 在 Swarm 模式下使用 Claude 系列模型（含添加 worker 或切换模型）时，仅限用于**只读审查代码或计划**，禁止将其用于编码实现、命令执行、调研探索或其他任何非审查任务。
