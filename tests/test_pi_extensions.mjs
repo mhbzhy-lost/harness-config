@@ -210,6 +210,9 @@ test("session-owner: --version/--help 归为 non-interactive，未设 SESSION_DI
   assert.equal(classifyPiLaunch(["--version"], tty).kind, "non-interactive");
   assert.equal(classifyPiLaunch(["-V"], tty).kind, "non-interactive");
   assert.equal(classifyPiLaunch(["--help"], tty).kind, "non-interactive");
+  assert.equal(classifyPiLaunch(["-p", "--no-session"], tty).kind, "ephemeral");
+  assert.equal(classifyPiLaunch(["--print", "--resume"], tty).kind, "resume");
+  assert.equal(classifyPiLaunch(["--skill", "--resume"], tty).kind, "new");
 
   const root = realpathSync(mkdtempSync(join(tmpdir(), "so-test-")));
   const agentDir = join(root, "agent");
