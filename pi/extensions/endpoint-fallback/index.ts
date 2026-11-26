@@ -1,5 +1,5 @@
 /**
- * endpoint-fallback 核心实现 — 通用 provider 级 baseUrl 自动故障切换
+ * endpoint-fallback 核心实现 — 通用 provider 级 baseUrl 静默按需故障切换
  *
  * 在 models.json 的 provider 里声明备用端点（对任何 provider 生效，不限本地模型）：
  *
@@ -10,12 +10,14 @@
  *     "fallback": {
  *       "healthPath": "/health",
  *       "fallbackHealthPath": "/health",
- *       "probeIntervalMs": 10000,
- *       "failAfter": 2,
- *       "recoverAfter": 2,
- *       "minHoldMs": 30000
+ *       "retryPrimaryAfterMs": 60000                      // fallback 态下距上次请求超过该间隔时回试主端点（兼容 minHoldMs）
  *     }
  *   }
+ *
+ * 设计约束：
+ * - 无后台定时轮询：绝不在空闲或使用其他 provider 时发起探测。
+ * - 完全静默：自动切换/切回/双端点异常不弹 UI 通知、不写状态栏；仅手动 `/endpoint-status` 展示状态。
+ * - 按需触发：仅当当前活跃模型命中受管 provider 并执行请求时生效；处于 fallback 态且距上次请求间隔超过阈值时自动重探主端点并切回。
  */
 
 import { readFileSync } from "node:fs";
@@ -26,9 +28,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 interface FallbackOptions {
 	healthPath?: string;
 	fallbackHealthPath?: string;
-	probeIntervalMs?: number;
-	failAfter?: number;
-	recoverAfter?: number;
+	retryPrimaryAfterMs?: number;
 	minHoldMs?: number;
 }
 
@@ -46,15 +46,10 @@ interface Monitored {
 	fallbackApiKey?: string;
 	primaryHealthUrl: string;
 	fallbackHealthUrl: string;
-	probeIntervalMs: number;
-	failAfter: number;
-	recoverAfter: number;
-	minHoldMs: number;
+	retryPrimaryAfterMs: number;
 	mode: "primary" | "fallback";
-	primaryFailStreak: number;
-	primaryOkStreak: number;
-	fallbackFailStreak: number;
 	switchedAt: number;
+	lastRequestAt: number;
 	lastProbeAt: number;
 	bothDown: boolean;
 }
@@ -62,7 +57,7 @@ interface Monitored {
 const NETWORK_ERROR_RE =
 	/fetch failed|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|EPIPE|EPROTO|socket hang up|network|timed? ?out|terminated|UND_ERR|aborted/i;
 
-const MIN_PROBE_INTERVAL_MS = 1000;
+const DEFAULT_RETRY_PRIMARY_AFTER_MS = 60_000;
 const PROBE_TIMEOUT_MS = 3000;
 
 /** 默认探测 URL：去掉 baseUrl 尾部 /v1，再拼 /health。 */
@@ -88,9 +83,9 @@ async function defaultProbe(url: string): Promise<boolean> {
 	}
 }
 
-function clampPositiveInt(value: unknown, fallback: number, min = 1): number {
+function clampNonNegativeInt(value: unknown, fallback: number): number {
 	const num = Number(value);
-	return Number.isFinite(num) && num >= min ? Math.floor(num) : fallback;
+	return Number.isFinite(num) && num >= 0 ? Math.floor(num) : fallback;
 }
 
 function defaultModelsPath(): string {
@@ -111,10 +106,7 @@ export function createEndpointFallbackExtension(pi: ExtensionAPI, deps: Endpoint
 	const nowFn = deps.now ?? Date.now;
 
 	let providers: Monitored[] = [];
-	let timer: ReturnType<typeof setInterval> | undefined;
-	let startupTimer: ReturnType<typeof setTimeout> | undefined;
-	let probing = false;
-	let lastCtx: ExtensionContext | undefined;
+	let preparedByBeforeAgent = false;
 
 	const restoreFallbacks = (): void => {
 		for (const m of providers) {
@@ -131,6 +123,7 @@ export function createEndpointFallbackExtension(pi: ExtensionAPI, deps: Endpoint
 	const load = (): void => {
 		restoreFallbacks();
 		providers = [];
+		preparedByBeforeAgent = false;
 		let raw: string;
 		try {
 			raw = readFileSync(resolveModelsPath(), "utf8");
@@ -146,6 +139,7 @@ export function createEndpointFallbackExtension(pi: ExtensionAPI, deps: Endpoint
 		for (const [name, p] of Object.entries(doc.providers ?? {})) {
 			if (typeof p?.baseUrl !== "string" || typeof p?.fallbackBaseUrl !== "string") continue;
 			const opt = p.fallback ?? {};
+			const retryRaw = opt.retryPrimaryAfterMs ?? opt.minHoldMs;
 			providers.push({
 				name,
 				primaryBaseUrl: p.baseUrl,
@@ -153,30 +147,14 @@ export function createEndpointFallbackExtension(pi: ExtensionAPI, deps: Endpoint
 				fallbackApiKey: typeof p.fallbackApiKey === "string" ? p.fallbackApiKey : undefined,
 				primaryHealthUrl: resolveHealthUrl(p.baseUrl, opt.healthPath),
 				fallbackHealthUrl: resolveHealthUrl(p.fallbackBaseUrl, opt.fallbackHealthPath),
-				probeIntervalMs: clampPositiveInt(opt.probeIntervalMs, 10_000, MIN_PROBE_INTERVAL_MS),
-				failAfter: clampPositiveInt(opt.failAfter, 2, 1),
-				recoverAfter: clampPositiveInt(opt.recoverAfter, 2, 1),
-				minHoldMs: clampPositiveInt(opt.minHoldMs, 30_000, 0),
+				retryPrimaryAfterMs: clampNonNegativeInt(retryRaw, DEFAULT_RETRY_PRIMARY_AFTER_MS),
 				mode: "primary",
-				primaryFailStreak: 0,
-				primaryOkStreak: 0,
-				fallbackFailStreak: 0,
 				switchedAt: 0,
+				lastRequestAt: 0,
 				lastProbeAt: 0,
 				bothDown: false,
 			});
 		}
-	};
-
-	const notify = (text: string, kind: "info" | "warning" | "error"): void => {
-		const ui = lastCtx?.hasUI ? lastCtx.ui : undefined;
-		if (ui) ui.notify(text, kind);
-	};
-
-	const statusText = (): string | undefined => {
-		const active = providers.filter((m) => m.mode === "fallback");
-		if (active.length === 0) return undefined;
-		return `endpoint-fallback: ${active.map((m) => m.name).join(", ")} → fallback`;
 	};
 
 	const doFailover = (m: Monitored): void => {
@@ -186,19 +164,11 @@ export function createEndpointFallbackExtension(pi: ExtensionAPI, deps: Endpoint
 				m.name,
 				m.fallbackApiKey ? { baseUrl: m.fallbackBaseUrl, apiKey: m.fallbackApiKey } : { baseUrl: m.fallbackBaseUrl },
 			);
-		} catch (err) {
-			notify(`endpoint-fallback: ${m.name} 切换失败: ${err instanceof Error ? err.message : String(err)}`, "error");
+		} catch {
 			return;
 		}
 		m.mode = "fallback";
 		m.switchedAt = nowFn();
-		m.primaryFailStreak = 0;
-		m.primaryOkStreak = 0;
-		notify(
-			`endpoint-fallback: ${m.name} 主端点不可用，已切换到备用端点（${m.fallbackBaseUrl}）`,
-			"warning",
-		);
-		if (lastCtx?.hasUI) lastCtx.ui.setStatus("endpoint-fallback", statusText());
 	};
 
 	const doFailback = (m: Monitored): boolean => {
@@ -210,135 +180,118 @@ export function createEndpointFallbackExtension(pi: ExtensionAPI, deps: Endpoint
 		}
 		m.mode = "primary";
 		m.switchedAt = 0;
-		m.primaryFailStreak = 0;
-		m.primaryOkStreak = 0;
-		m.fallbackFailStreak = 0;
 		m.bothDown = false;
-		notify(`endpoint-fallback: ${m.name} 主端点已恢复，切回 ${m.primaryBaseUrl}`, "info");
-		if (lastCtx?.hasUI) lastCtx.ui.setStatus("endpoint-fallback", statusText());
 		return true;
 	};
 
-	const probeOne = async (m: Monitored, now: number): Promise<void> => {
+	const probeAndSync = async (m: Monitored, now: number): Promise<void> => {
+		m.lastProbeAt = now;
 		const primaryOk = await probe(m.primaryHealthUrl);
-		if (m.mode === "primary") {
-			if (primaryOk) {
-				m.primaryFailStreak = 0;
-				m.primaryOkStreak++;
-			} else {
-				m.primaryOkStreak = 0;
-				m.primaryFailStreak++;
-				if (m.primaryFailStreak >= m.failAfter) doFailover(m);
-			}
+		if (primaryOk) {
+			if (m.mode === "fallback") doFailback(m);
+			m.bothDown = false;
 			return;
 		}
-		if (primaryOk) {
-			m.primaryOkStreak++;
-			m.primaryFailStreak = 0;
-			if (m.primaryOkStreak >= m.recoverAfter && now - m.switchedAt >= m.minHoldMs) {
-				if (doFailback(m)) return;
-			}
-		} else {
-			m.primaryOkStreak = 0;
+		if (m.mode === "primary") {
+			doFailover(m);
 		}
 		const fallbackOk = await probe(m.fallbackHealthUrl);
-		if (fallbackOk) {
-			if (m.bothDown) {
-				m.bothDown = false;
-				notify(`endpoint-fallback: ${m.name} 备用端点已恢复`, "info");
-			}
-			m.fallbackFailStreak = 0;
-		} else if (!m.bothDown) {
-			m.bothDown = true;
-			m.fallbackFailStreak++;
-			notify(`endpoint-fallback: ${m.name} 主端点与备用端点均不可用，请求将失败`, "error");
-		}
+		m.bothDown = !fallbackOk;
 	};
 
-	const tickAll = async (force: boolean): Promise<void> => {
-		if (probing || providers.length === 0) return;
-		probing = true;
-		try {
-			const now = nowFn();
-			for (const m of providers) {
-				if (!force && now - m.lastProbeAt < m.probeIntervalMs) continue;
+	const prepareForRequest = async (providerName: string | undefined): Promise<void> => {
+		if (!providerName) return;
+		const m = providers.find((p) => p.name === providerName);
+		if (!m) return;
+		const now = nowFn();
+		if (m.mode === "primary") {
+			if (m.lastRequestAt === 0) {
 				m.lastProbeAt = now;
-				await probeOne(m, now);
+				const primaryOk = await probe(m.primaryHealthUrl);
+				if (!primaryOk) {
+					doFailover(m);
+				}
 			}
-		} finally {
-			probing = false;
+		} else if (now - m.lastRequestAt >= m.retryPrimaryAfterMs) {
+			m.lastProbeAt = now;
+			const primaryOk = await probe(m.primaryHealthUrl);
+			if (primaryOk) {
+				doFailback(m);
+			}
 		}
+		m.lastRequestAt = now;
 	};
 
-	const stopTimer = (): void => {
-		if (startupTimer) {
-			clearTimeout(startupTimer);
-			startupTimer = undefined;
-		}
-		if (timer) {
-			clearInterval(timer);
-			timer = undefined;
-		}
-	};
-
-	pi.on("session_start", async (_event, ctx) => {
-		lastCtx = ctx;
-		stopTimer();
+	pi.on("session_start", async () => {
 		load();
-		if (providers.length === 0) return;
-		void tickAll(true);
-		startupTimer = setTimeout(() => {
-			startupTimer = undefined;
-			void tickAll(true);
-		}, 1500);
-		startupTimer.unref?.();
-		const interval = Math.max(MIN_PROBE_INTERVAL_MS, Math.min(...providers.map((m) => m.probeIntervalMs)));
-		timer = setInterval(() => void tickAll(false), interval);
-		timer.unref?.();
 	});
 
 	pi.on("session_shutdown", async () => {
-		stopTimer();
 		restoreFallbacks();
 		providers = [];
-		lastCtx = undefined;
+		preparedByBeforeAgent = false;
+	});
+
+	pi.on("before_agent_start", async (_event, ctx) => {
+		preparedByBeforeAgent = true;
+		await prepareForRequest(ctx.model?.provider);
+	});
+
+	pi.on("turn_start", async (_event, ctx) => {
+		if (preparedByBeforeAgent) {
+			preparedByBeforeAgent = false;
+			return;
+		}
+		await prepareForRequest(ctx.model?.provider);
+	});
+
+	pi.on("agent_end", async () => {
+		preparedByBeforeAgent = false;
 	});
 
 	pi.on("message_end", async (event) => {
 		const msg = event.message;
 		if (msg.role !== "assistant") return;
-		if (msg.stopReason !== "error" || !msg.errorMessage) return;
-		if (!NETWORK_ERROR_RE.test(msg.errorMessage)) return;
 		const m = providers.find((p) => p.name === msg.provider);
 		if (!m) return;
+		const now = nowFn();
+		m.lastRequestAt = now;
+		if (msg.stopReason !== "error" || !msg.errorMessage) {
+			m.bothDown = false;
+			return;
+		}
+		if (!NETWORK_ERROR_RE.test(msg.errorMessage)) return;
+		m.lastProbeAt = now;
 		if (m.mode === "primary") {
 			const ok = await probe(m.primaryHealthUrl);
 			if (!ok) {
-				m.primaryFailStreak = m.failAfter;
 				doFailover(m);
 			}
 		} else {
 			const ok = await probe(m.fallbackHealthUrl);
-			if (!ok && !m.bothDown) {
-				m.bothDown = true;
-				notify(`endpoint-fallback: ${m.name} 主端点与备用端点均不可用，请求将失败`, "error");
-			}
+			m.bothDown = !ok;
 		}
 	});
 
 	pi.registerCommand("endpoint-status", {
 		description: "显示 endpoint-fallback 状态；带 probe 参数立即强制探测一轮",
-		handler: async (args, ctx) => {
-			const force = /probe/i.test(args ?? "");
-			if (force) await tickAll(true);
+		handler: async (args, ctx: ExtensionContext) => {
 			if (providers.length === 0) {
 				ctx.ui.notify("endpoint-fallback: models.json 中没有声明 fallbackBaseUrl 的 provider", "info");
 				return;
 			}
+			const force = /probe/i.test(args ?? "");
+			if (force) {
+				const now = nowFn();
+				for (const m of providers) {
+					await probeAndSync(m, now);
+				}
+			}
 			for (const m of providers) {
-				const age = m.lastProbeAt ? `${Math.round((nowFn() - m.lastProbeAt) / 1000)}s 前` : "尚未探测";
+				const lastReq = m.lastRequestAt ? `${Math.round((nowFn() - m.lastRequestAt) / 1000)}s 前` : "尚无请求";
+				const retrySec = Math.round(m.retryPrimaryAfterMs / 1000);
 				ctx.ui.notify(
-					`${m.name}: ${m.mode.toUpperCase()}  主端点连续成功 ${m.primaryOkStreak} / 失败 ${m.primaryFailStreak}  上次探测 ${age}` +
+					`${m.name}: ${m.mode.toUpperCase()}  上次请求 ${lastReq}  回试主端点间隔 ${retrySec}s` +
 						(m.bothDown ? "  ⚠ 双端点不可用" : ""),
 					m.mode === "fallback" ? "warning" : "info",
 				);

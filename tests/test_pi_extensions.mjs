@@ -140,7 +140,7 @@ test("openai-proxy: ENOENT 静默跳过，installScopedProxyFetch 同步恢复�
 
 // ---- 4. endpoint-fallback ----
 
-test("endpoint-fallback: 主端点恢复切回后不误探测备用端点，session_shutdown 完整清理", async () => {
+test("endpoint-fallback: 零后台轮询、按活跃 provider 与请求间隔静默切换/回试主端点", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "ef-test-")));
   const modelsFile = join(root, "models.json");
   writeFileSync(modelsFile, JSON.stringify({
@@ -148,7 +148,7 @@ test("endpoint-fallback: 主端点恢复切回后不误探测备用端点，sess
       "home-llm": {
         baseUrl: "http://primary.local/v1",
         fallbackBaseUrl: "http://backup.local/v1",
-        fallback: { failAfter: 1, recoverAfter: 1, minHoldMs: 0, probeIntervalMs: 60_000 },
+        fallback: { retryPrimaryAfterMs: 30_000 },
       },
     },
   }));
@@ -158,9 +158,11 @@ test("endpoint-fallback: 主端点恢复切回后不误探测备用端点，sess
     const registered = [];
     const unregistered = [];
     const notices = [];
+    const statusCalls = [];
     const probeLog = [];
     let primaryHealthy = false;
-    let backupHealthy = false;
+    let backupHealthy = true;
+    let now = 100_000;
 
     const pi = {
       on(event, fn) { handlers.set(event, fn); },
@@ -170,34 +172,88 @@ test("endpoint-fallback: 主端点恢复切回后不误探测备用端点，sess
     };
     createEndpointFallbackExtension(pi, {
       modelsPath: () => modelsFile,
+      now: () => now,
       probe: async (url) => {
         probeLog.push(url);
         if (url.includes("primary")) return primaryHealthy;
         return backupHealthy;
       },
     });
-    const ctx = {
+    const makeCtx = (provider) => ({
       hasUI: true,
+      model: provider ? { provider, id: "m1" } : undefined,
       ui: {
         notify(text, kind) { notices.push([kind, text]); },
-        setStatus() {},
+        setStatus(k, v) { statusCalls.push([k, v]); },
       },
-    };
-    await handlers.get("session_start")({}, ctx);
-    await new Promise((r) => setTimeout(r, 30));
+    });
+
+    // 1. session_start 与非受管 provider 请求均不触发任何探测或通知
+    await handlers.get("session_start")({}, makeCtx("cloud-provider"));
+    await handlers.get("before_agent_start")({}, makeCtx("cloud-provider"));
+    await handlers.get("turn_start")({}, makeCtx("cloud-provider"));
+    assert.deepEqual(probeLog, []);
+    assert.equal(registered.length, 0);
+    assert.equal(notices.length, 0);
+    assert.equal(statusCalls.length, 0);
+
+    // 2. 首次使用 home-llm（主端点宕机）：静默切到 fallback，同轮 turn_start 不重复探测
+    await handlers.get("before_agent_start")({}, makeCtx("home-llm"));
+    await handlers.get("turn_start")({}, makeCtx("home-llm"));
+    assert.deepEqual(probeLog, ["http://primary.local/health"]);
     assert.equal(registered.length, 1);
     assert.equal(registered[0][0], "home-llm");
+    assert.equal(notices.length, 0);
+    assert.equal(statusCalls.length, 0);
 
-    // 切回主端点（此时备用端点仍然宕机）：切回后不得误报双端点不可用
-    notices.length = 0;
+    await handlers.get("message_end")({ message: { role: "assistant", provider: "home-llm", stopReason: "stop" } });
+    await handlers.get("agent_end")({});
+
+    // 3. 间隔未超过 30s 的下一次请求：不探测主端点，直接走 fallback
     probeLog.length = 0;
     primaryHealthy = true;
-    await commands.get("endpoint-status").handler("probe", ctx);
-    assert.equal(unregistered.length, 1);
+    now += 15_000;
+    await handlers.get("before_agent_start")({}, makeCtx("home-llm"));
+    await handlers.get("turn_start")({}, makeCtx("home-llm"));
+    assert.deepEqual(probeLog, []);
+    assert.equal(unregistered.length, 0);
+    await handlers.get("message_end")({ message: { role: "assistant", provider: "home-llm", stopReason: "stop" } });
+    await handlers.get("agent_end")({});
+
+    // 4. 间隔超过 30s 后再次请求：重探主端点并静默切回 primary
+    now += 35_000;
+    await handlers.get("before_agent_start")({}, makeCtx("home-llm"));
+    await handlers.get("turn_start")({}, makeCtx("home-llm"));
     assert.deepEqual(probeLog, ["http://primary.local/health"]);
+    assert.equal(unregistered.length, 1);
+    assert.equal(notices.length, 0);
+    assert.equal(statusCalls.length, 0);
+
+    // 5. 已在 primary 态下继续请求：不再主动探测；仅网络报错时才故障切换
+    probeLog.length = 0;
+    now += 50_000;
+    await handlers.get("before_agent_start")({}, makeCtx("home-llm"));
+    assert.deepEqual(probeLog, []);
+
+    primaryHealthy = false;
+    await handlers.get("message_end")({
+      message: { role: "assistant", provider: "home-llm", stopReason: "error", errorMessage: "fetch failed: ECONNREFUSED" },
+    });
+    assert.deepEqual(probeLog, ["http://primary.local/health"]);
+    assert.equal(registered.length, 2);
+    assert.equal(notices.length, 0);
+
+    // 6. 手动 /endpoint-status probe 才输出 UI 状态，切回主端点后不误探备用端点
+    probeLog.length = 0;
+    primaryHealthy = true;
+    backupHealthy = false;
+    await commands.get("endpoint-status").handler("probe", makeCtx("home-llm"));
+    assert.deepEqual(probeLog, ["http://primary.local/health"]);
+    assert.equal(unregistered.length, 2);
+    assert.equal(notices.length, 1);
     assert.ok(!notices.some(([kind]) => kind === "error"), `主端点恢复后不应误报错误: ${JSON.stringify(notices)}`);
 
-    await handlers.get("session_shutdown")({}, ctx);
+    await handlers.get("session_shutdown")({}, makeCtx("home-llm"));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
