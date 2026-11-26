@@ -10,6 +10,6 @@
   ],
   "packages": [
     "npm:@arhen/pi-core-ask@1.1.0",
-    "git:github.com/mhbzhy-lost/pi-dcp-migrate@v0.1.5"
+    "git:github.com/mhbzhy-lost/pi-dcp@v1.0.0"
   ]
 }

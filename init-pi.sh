@@ -117,6 +117,10 @@ if os.path.exists(target_path):
     if not isinstance(existing, dict):
         sys.exit(f"错误: {target_path} 顶层不是 JSON 对象")
 
+PACKAGE_ALIASES = {
+    ("git", "github.com/mhbzhy-lost/pi-dcp-migrate"): ("git", "github.com/mhbzhy-lost/pi-dcp"),
+}
+
 def package_identity(spec):
     if not isinstance(spec, str):
         return None
@@ -129,9 +133,11 @@ def package_identity(spec):
             if slash == -1:
                 return None
             at = body.find("@", slash + 1)
-            return ("npm", body[:at] if at != -1 else body)
+            ident = ("npm", body[:at] if at != -1 else body)
+            return PACKAGE_ALIASES.get(ident, ident)
         at = body.find("@")
-        return ("npm", body[:at] if at != -1 else body)
+        ident = ("npm", body[:at] if at != -1 else body)
+        return PACKAGE_ALIASES.get(ident, ident)
     if spec.startswith("git:") or spec.startswith("https://") or spec.startswith("http://"):
         body = spec
         for prefix in ("git:", "https://", "http://"):
@@ -149,7 +155,10 @@ def package_identity(spec):
         body = body.rstrip("/")
         if body.endswith(".git"):
             body = body[:-4]
-        return ("git", body.lower()) if body else None
+        if not body:
+            return None
+        ident = ("git", body.lower())
+        return PACKAGE_ALIASES.get(ident, ident)
     return None
 
 def merge_packages(base_list, template_list):
@@ -160,9 +169,11 @@ def merge_packages(base_list, template_list):
         src = item.get("source") if isinstance(item, dict) else item
         pkg_id = package_identity(src)
         matched = False
+        keep_idx = None
         for i, existing_item in enumerate(out):
             if existing_item == item:
                 matched = True
+                keep_idx = i
                 break
             existing_src = existing_item.get("source") if isinstance(existing_item, dict) else existing_item
             if pkg_id and package_identity(existing_src) == pkg_id:
@@ -173,8 +184,14 @@ def merge_packages(base_list, template_list):
                 else:
                     out[i] = copy.deepcopy(item)
                 matched = True
+                keep_idx = i
                 break
-        if not matched:
+        if matched and pkg_id:
+            out = [
+                el for j, el in enumerate(out)
+                if j == keep_idx or package_identity(el.get("source") if isinstance(el, dict) else el) != pkg_id
+            ]
+        elif not matched:
             out.append(copy.deepcopy(item))
     return out
 

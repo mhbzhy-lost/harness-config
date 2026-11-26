@@ -8,7 +8,7 @@ Qwen Code 个人配置与插件的多机同步仓库。
 |---|---|
 | `init-qwen.sh` | 同步脚本：合并设置 + 注入 HARNESS_CONFIG_ROOT + 链接插件 + 注册 shell 片段 + 链接全局 QWEN.md + 链接 agent 定义 |
 | `init-pi.sh` | 同步到 Pi：合并 `pi/settings.json` 并按序注入 `pi/extensions/*` 与 `skills/` 到 `~/.pi/agent/settings.json` + 链接 `pi/keybindings.json` + 链接 `pi/GLOBAL.md` 到 `~/.pi/agent/AGENTS.md` + 复制 `pi/bin/apply_patch` 到 `~/.pi/agent/bin/` + 链接跨运行时插件到 `~/.agents/plugins` + 注册 `pi/shell.zsh` 到 `~/.zshrc` + 自动软链本机 Pi 包文档到 `.agents/skills/pi-docs/` |
-| `pi/settings.json` | Pi 跨机通用设置模板（`hideThinkingBlock`、`cacheWarming`、`defaultTools` 与锁版社区包 `npm:@arhen/pi-core-ask@1.1.0` / `git:github.com/mhbzhy-lost/pi-dcp-migrate@v0.1.5`），深度合并进 `~/.pi/agent/settings.json`（保留本机模型、本地 packages 与非受管扩展） |
+| `pi/settings.json` | Pi 跨机通用设置模板（`hideThinkingBlock`、`cacheWarming`、`defaultTools` 与锁版社区包 `npm:@arhen/pi-core-ask@1.1.0` / `git:github.com/mhbzhy-lost/pi-dcp@v1.0.0`），深度合并进 `~/.pi/agent/settings.json`（保留本机模型、本地 packages 与非受管扩展） |
 | `pi/GLOBAL.md` | Pi 全局指令（Commit 规范、Pi bin 工具与 `bash_async` 约定），软链接为 `~/.pi/agent/AGENTS.md`（仓内不命名为 `AGENTS.md` 避免目录扫描误加载） |
 | `pi/keybindings.json` | Pi 快捷键配置（`alt+p` / `shift+alt+p` 切换模型），软链接为 `~/.pi/agent/keybindings.json` |
 | `pi/bin/` | Pi 辅助工具 `apply_patch`（由 `init-pi.sh` 复制到 `~/.pi/agent/bin/apply_patch`，与 Pi 原生管理的 `fd` / `rg` 一同自动进入 Pi bash 子进程 `PATH`） |
