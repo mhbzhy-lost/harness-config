@@ -318,14 +318,15 @@ test("agent-plugins: 发现本仓全部 Agent Plugins v1 插件的技能与 MCP 
     const { plugins, diagnostics } = await discoverPlugins(join(process.cwd(), "plugins"), agentDir);
     const errors = diagnostics.filter((d) => d.severity === "error");
     assert.deepEqual(errors, [], `插件校验不应报错: ${JSON.stringify(errors)}`);
-    assert.deepEqual(plugins.map((p) => p.name), ["deepseek-search", "home-connect", "playwright"]);
+    assert.deepEqual(plugins.map((p) => p.name), ["deepseek-search", "home-connect", "pi-worker", "playwright"]);
     const serverNames = plugins.flatMap((p) => p.servers.map((s) => s.name)).sort();
     assert.ok(serverNames.includes("deepseek-search__deepseek-search"));
     assert.ok(serverNames.includes("home-connect__home"));
     assert.ok(serverNames.includes("home-connect__comfyui"));
+    assert.ok(serverNames.includes("pi-worker__pi-worker"));
     assert.ok(serverNames.includes("playwright__playwright"));
     const skillCount = plugins.flatMap((p) => p.skills).length;
-    assert.ok(skillCount >= 4, `预期至少发现 4 个插件 skill，实际 ${skillCount}`);
+    assert.ok(skillCount >= 5, `预期至少发现 5 个插件 skill，实际 ${skillCount}`);
   } finally {
     rmSync(agentDir, { recursive: true, force: true });
   }
