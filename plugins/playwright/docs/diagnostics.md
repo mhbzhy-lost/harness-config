@@ -4,14 +4,14 @@
 
 - 默认是 headless，不弹窗是预期行为。
 - headed 只在用户明确要求或手动登录时使用。
-- `start` 成功的依据是 browser/context/page/about:blank/title smoke，不是 PID、socket 或“进程存在”。
+- `browser_start`（CLI `start`）成功的依据是 browser/context/page/about:blank/title smoke，不是 PID、socket 或“进程存在”。
 
 ## 常见错误
 
 | 错误 | 处理 |
 |---|---|
 | `chrome-unavailable` | 准备系统 Google Chrome；不自动下载、换 browser 或把升级 SDK 当作修复 |
-| `sdk-missing` | 插件依赖未安装：执行 `bash "$HARNESS_CONFIG_ROOT/plugins/playwright/scripts/setup.sh"` 后重试；不要用升级 SDK 代替安装或改用 npx 缓存 |
+| `sdk-missing` | 插件依赖未安装：执行 server 提示中给出的 `setup.sh` 绝对路径（Qwen 为 `bash "$HARNESS_CONFIG_ROOT/plugins/playwright/scripts/setup.sh"`；Pi / AGY 没有该变量，用插件目录下的 `scripts/setup.sh`）后重试；不要用升级 SDK 代替安装或改用 npx 缓存 |
 | `instance-in-use` | 选择自己新的 instance；不覆写或接管未知实例 |
 | `profile-in-use` | 等 owner 正常 stop 或请求 owner 确认；不删租约、不因 PID 消失抢占 |
 | `socket-path-too-long` | 报告私有状态根过长；不放宽安全预算或换公共 socket |
@@ -24,7 +24,7 @@
 ## 安全诊断顺序
 
 1. 记录实际 CLI 命令、instance、profile 名称和错误阶段；不要记录页面内容或认证材料。
-2. 确认是否使用了 browser tool 的 `runtime/` 和根 package-lock 依赖；不要调用旧 Python 文件、外部 skill、MCP、`npx` 或 `_npx` 缓存。
+2. 确认是否使用了本插件的 `src/runtime/` 和根 package-lock 依赖；不要调用旧 Python 文件、外部 skill、第三方 Playwright MCP 包（如 `@playwright/mcp`）、`npx` 或 `_npx` 缓存。
 3. 检查目标 profile 是否是明确批准的 named profile、owner 当前用户、真实目录、`0700`；不要扫描其他 profile。
 4. 只检查本次 owned instance 的状态和清理结果；不使用 stopall、不发送裸 PID 信号。
 5. 如果仍无法确认来源，fail closed，报告首个偏离点和调用链，不添加自动 fallback。

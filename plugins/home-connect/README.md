@@ -2,70 +2,70 @@
 
 Agent Plugins 1.0.0 包：把家中 Mac / Windows / WSL 的连接能力收敛成 MCP 工具，替代原来的「连接 CLI + 踩坑手册」组合。
 
-## 包结构（本机插件目录）
+## 包结构（仓内真身）
+
+插件真身在仓内 `plugins/home-connect/`，由 `init-qwen.sh` / `init-pi.sh` / `init-agy.sh` 软链到各运行时的插件目录（Qwen `~/.qwen/extensions/`、Pi `~/.agents/plugins/`、AGY `~/.gemini/config/plugins/`）；凭据放在插件目录内已 gitignore 的位置，不入库：
 
 ```text
-~/.agents/plugins/home-connect/    # 真身（本机，不入任何仓库）
+plugins/home-connect/
 ├── plugin.json                  # Agent Plugins 清单（name: home-connect）
-├── mcp.json                     # stdio server: node ./src/server.ts
-├── src/server.ts                # MCP stdio 服务端，通道/引号/重试/截断都在这里
-├── scripts/                     # connect.sh 及 6 个通道脚本
-├── skills/home-connect/SKILL.md # 精简后的使用策略（31 行）
+├── mcp.json                     # Qwen / Pi 用：两个 stdio server（home → src/server.ts，comfyui → src/server-comfyui.ts）
+├── mcp_config.json              # AGY 原生模式用：${PLUGIN_ROOT} 定位同一对 server，并开启 HOME_CONNECT_AGY_ASYNC
+├── src/server.ts                # home MCP stdio 服务端，通道/引号/重试/截断都在这里
+├── src/server-comfyui.ts        # comfyui MCP stdio 服务端（独立入口）
+├── src/server-http.ts           # 宿主模式 Streamable HTTP 入口（见下文）
+├── scripts/                     # connect.sh 入口 + 8 个通道脚本 + deploy-host.sh / host-cert.sh
+├── skills/                      # home-connect / comfyui / comfyui-download 三个 skill
 └── README.md
 ```
 
-运行时目录 `~/.pi/agent/home-connect/` 只保留**配置与身份**：`config/*.env`、`.env`、`.ssh/`（私钥、known_hosts）。
-脚本随插件走，两边通过 `HOME_CONNECT_ROOT` 对接；凭据与主机事实永远不进仓库。
+凭据与主机事实（`.env`、`.ssh/`、`config/*.env`、`.remote-files/`；宿主模式另有 `host.json`、`tls/`）均放在仓内插件目录的 gitignore 位置，`config/` 只保留 `*.example` 模板。连接层 `src/connection.ts` 以 `RUNTIME_ROOT`（`$HARNESS_CONFIG_ROOT/plugins/home-connect`，无锚点时回退插件自定位）作为配置/身份根，并以 `HOME_CONNECT_ROOT` 传给脚本；脚本缺该变量时同样回退到自身目录的上一级。
 
 ## 工具面
 
-| 工具 | 说明 |
-|---|---|
-| `home_status` | Tailscale 在线、是否在家（LAN）、目标通道可达性、实际走 LAN 还是中继 |
-| `home_exec` | 通道内执行平台原生命令：`windows`=PowerShell，`mac`/`wsl`=bash；真实退出码 |
-| `home_copy` | 文件传输：mac 上传走 LAN、下载按 LAN 选路；windows 仅上传（多文件用 `files` 批量模式，单条 sftp 会话）；wsl 双向。同一时刻只允许一个 copy 任务（含批量），并发立即报错 |
-| `home_wake` | 显式唤醒 WSL（`home_exec` 已自动重试一次） |
+`mcp.json` 定义两个独立 stdio server，工具面分别如下：
 
-传输层脚本随插件分发（`scripts/connect.sh`），配置与私钥留在运行时目录
-`~/.pi/agent/home-connect/`（`config/*.env`、`.env`、`.ssh/`），两边用 `HOME_CONNECT_ROOT` 对接。
-旧 skill 目录已迁出 `~/.agents/skills/`（否则会与插件同名技能冲突），并归档到
-`~/.agents/backups/home-connect-20261122.tar.gz`。
+| server | 工具 | 说明 |
+|---|---|---|
+| `home`（`src/server.ts`） | `home_status` | Tailscale 在线、是否在家（LAN）、目标通道可达性、实际走 LAN 还是中继 |
+| | `home_exec` | 通道内执行平台原生命令：`windows`=PowerShell，`mac`/`wsl`=bash；真实退出码 |
+| | `home_copy` | 文件传输：mac 上传走 LAN、下载按 LAN 选路；windows 仅上传（多文件用 `files` 批量模式，单条 sftp 会话）；wsl 双向。同一时刻只允许一个 copy 任务（含批量），并发立即报错 |
+| | `home_wake` | 显式唤醒 WSL（`home_exec` 已自动重试一次） |
+| | `home_reset` | 救援工具：终止 home-connect 正在执行的远程命令/传输，清理本机 SSH ControlMaster 复用状态（卡死或 `Session open refused by peer` 时调用） |
+| | `home_exec_bg` / `home_copy_bg` | 仅 `HOME_CONNECT_AGY_ASYNC=1` 时暴露（AGY 经 `mcp_config.json` 启用，并标记 `background: always`）：长时命令/大文件传输交由 Antigravity 宿主作为后台任务执行、完成后唤醒主会话 |
+| `comfyui`（`src/server-comfyui.ts`） | `comfyui_generate` / `comfyui_list` | 文生图与结果/模型列表；与 home server 独立入口、共用连接层 |
 
-## 安装（按机器，不入库）
+## Pi 侧加载方式
 
-插件是真身目录，直接放本机插件主目录：
-
-```text
-~/.agents/plugins/home-connect/          # 真身，不入任何仓库
-├── plugin.json  mcp.json  src/  scripts/  skills/  README.md
-```
-
-仓库侧只保留一个自有客户端 `src/agent-plugins/`（约 400 行），启动时：
+仓库侧的 Agent Plugins 客户端 `pi/extensions/agent-plugins/`（由 `init-pi.sh` 注入 `~/.pi/agent/settings.json`）启动时：
 
 1. 扫描 `~/.agents/plugins/*/plugin.json`（可用 `AGENT_PLUGINS_HOME` 覆盖）
 2. 校验清单、收集 `skills/*/SKILL.md` → 经 `resources_discover` 注入
 3. 解析根 `mcp.json` → `pi.registerMcpServer()` 内存注册（不写投影文件、不维护信任状态）
 
-因此没有 `<agentDir>/plugins` 桥、没有 `state.json`、没有 `PI_AGENT_DIR` 环境变量；任何启动入口
-（TUI、headless、pi-web）行为一致。配置与私钥仍在运行时目录 `~/.pi/agent/home-connect/`
-（`config/*.env`、`.env`、`.ssh/`），通过 `HOME_CONNECT_ROOT` 对接。
+因此没有 `<agentDir>/plugins` 桥、没有 `state.json`；任何启动入口（TUI、headless、pi-web）行为一致。
 
-迁移到另一台机器：
-
-```bash
-rsync -a ~/.agents/plugins/home-connect/ other-host:.agents/plugins/home-connect/
-rsync -a ~/.pi/agent/home-connect/       other-host:.pi/agent/home-connect/
-```
+迁移到另一台机器：`git clone` 本仓后重跑对应 init 脚本即可，凭据按 `.gitignore` 约定的位置手工放置，不随仓库同步。
 
 ## 验证
 
 ```bash
-# 直接跑 JSON-RPC，不经过 pi
-node /path/to/mcp-drive.mjs ~/.agents/plugins/home-connect/src/server.ts '[]'
+cd plugins/home-connect
+# 直接向 stdio server 发 JSON-RPC（不经任何运行时），取 tools/list 的回包
+rpc() { printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | "$@" | tail -1; }
+rpc node src/server.ts                                  # home_status home_exec home_copy home_wake home_reset
+rpc env HOME_CONNECT_AGY_ASYNC=1 node src/server.ts     # AGY 异步模式额外暴露 home_exec_bg / home_copy_bg
+rpc node src/server-comfyui.ts                          # comfyui_generate comfyui_list
 
-# 经 pi 的投影与内置 MCP
-PI_AGENT_DIR=$PWD/pi PI_CODING_AGENT_DIR=$PWD/pi node node_modules/@earendil-works/pi-coding-agent/dist/cli.js mcp list --json
+# 异步工具面回归测试
+node --test tests/test_home_connect_async.mjs
+
+# 经运行时加载：Pi 会话内输入 /mcp，应看到来源为 agent-plugins 扩展的 home 与 comfyui。
+# 注意 `pi mcp list --json`（PI_CODING_AGENT_DIR 可指定配置根目录）不加载扩展、只读 <配置根>/mcp.json，
+# 看不到由扩展注册的 server，不能用它判定本插件是否生效。
 ```
+
 ## 宿主模式：给手机端 agent 的远程 HTTP 入口
 
 手机端 agent 没有 bash 环境，也不该持有 ssh 凭据，所以需要一个跑在家中 mac 上的 remote MCP server。

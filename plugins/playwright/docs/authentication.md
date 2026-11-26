@@ -6,7 +6,7 @@
 
 支持：明确批准的 named profile、用户手动登录、exact origin 与非敏感业务壳验证、停止 headed 后复用 headless。
 
-不支持：提取或导出 cookie/token/storageState、跨进程凭据交接、任意页面脚本、同源 fetch、自动填写密码/MFA。遇到这些需求停止并报告，不绕过browser 工具 的安全边界。
+不支持：提取或导出 cookie/token/storageState、跨进程凭据交接、任意页面脚本、同源 fetch、自动填写密码/MFA。遇到这些需求停止并报告，不绕过 `browser_*` 工具的安全边界。
 
 ## 认证流程
 
@@ -17,6 +17,8 @@
 5. 只导航正常的非签名 URL。认证完成后，仅验证 exact origin 和非敏感业务结构；`auth-check` 返回两个布尔值，不代表账号、租户或下游权限已验证。
 6. 用户确认认证完成后，停止 headed instance，再用同一个 named profile 启动普通 headless；两个 instance 不得并发使用同 profile。
 7. 任务结束 stop 自己的 instance。named profile 保留，不复制到其他机器、不擅自删除。
+
+以下 `$CLI` 指插件内 `src/runtime/cli.ts`（与 MCP 工具的对应关系见 [operations.md](operations.md)）：
 
 ```bash
 node "$CLI" --instance auth-task --profile task-sso start --headed --auth

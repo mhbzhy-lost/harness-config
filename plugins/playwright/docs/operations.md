@@ -7,6 +7,8 @@
 3. 未匹配返回 `locator-not-found`，多匹配返回 `locator-not-unique`，不得擅自选择第一个。
 4. 任务结束 stop 自己的 instance。
 
+下文及 `authentication.md` 中的 `$CLI` 均指插件内的 `src/runtime/cli.ts`（相对 `plugins/playwright/`），即 `node "$CLI"` ≡ `node plugins/playwright/src/runtime/cli.ts`；CLI 子命令与 MCP 工具一一对应：`start`=`browser_start`、`command`=`browser_command`、`status`=`browser_status`、`stop`=`browser_stop`、`instances`=`browser_instances`，参数完全相同。
+
 ```bash
 node "$CLI" --instance task-browser command '{"op":"snapshot"}'
 node "$CLI" --instance task-browser command '{"op":"fill","locator":{"kind":"testId","value":"query"},"value":"example"}'
@@ -27,7 +29,7 @@ node "$CLI" --instance task-browser command '{"op":"inspect","query":"visible","
 | `screenshot` | 只提供如 `result.png` 的 artifact name；写入实例私有目录、`0600`、不覆盖，不接受路径 |
 | `aone-config-readonly` | 固定 app `332260`，仅 `verify` 和指定单环境 `export`；不接收 URL、locator、脚本或输出路径 |
 
-普通 snapshot/title 可能包含业务页面文字，不是秘密检测器；只在任务授权且不涉及凭据时使用。当前 CLI 没有任意页面 JavaScript、浏览器 storage、网络详情或脚本执行入口。
+普通 snapshot/title 可能包含业务页面文字，不是秘密检测器；只在任务授权且不涉及凭据时使用。CLI 与 MCP 工具面都没有任意页面 JavaScript、浏览器 storage、网络详情或脚本执行入口。
 
 ## 动作失败错误码
 

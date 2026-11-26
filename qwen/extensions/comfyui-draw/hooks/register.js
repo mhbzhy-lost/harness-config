@@ -5,8 +5,8 @@
 //                $.prompt.submit(asUser) 作为 Mod 自己的 prompt 送入模型（模型零暴露片段）；
 //   prompt.submit：为本插件来源的 prompt 附加生图契约 context；普通用户文本清残留片段；
 //   tool.call：第一次 comfyui_generate 调用时把片段机械追加进 prompt 参数（消费一次）。
-// Web Shell/ACP 中 $.prompt.submit 会被 drop、Mods 禁用时命令不存在——均回落
-// commands/draw.md 命令体展开的降级路径（agent 自行转抄片段）。
+// Web Shell/ACP 中 $.prompt.submit 会被 drop（片段已缓存但无 prompt 触发模型）、Mods 禁用时命令不存在
+// （需开启 experimental.mods）——两种情况均无降级路径，/draw 不可用。
 
 let drawFragment = null;
 

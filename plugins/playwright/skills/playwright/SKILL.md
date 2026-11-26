@@ -9,10 +9,11 @@ description: Use when needing real browser UI interaction, web automation, E2E s
 
 ## 工具与顺序
 
-`browser_start` → `browser_command`（navigate / snapshot / click / fill / wait / screenshot / tabs / inspect）→ `browser_stop`。
+`browser_start` → `browser_command`（navigate / snapshot / click / fill / wait / screenshot / tabs / inspect）→ `browser_stop`；`browser_status` / `browser_instances` 随时查询状态。
 
 - `browser_start(instance, profile?, headed?, auth?)`：启动实例。`profile` 复用 `~/.playwright-sdk/profiles` 持久登录态（跨实例凭据共享）；`auth: true` 进手动认证模式（限制页面操作，供用户人工登录沉淀登录态）。
 - `browser_command(instance, command)`：安全命令对象，如 `{op:'navigate',url:'https://example.com'}`、`{op:'snapshot'}`、`{op:'click',locator:...}`。
+- `browser_status(instance)`：查询实例运行状态（daemon、浏览器/页面就绪、headless/authMode）；`start` 后核对就绪、异常时判断实例是否存活。
 - `browser_instances()`：列出全部实例；遗留实例排查后 `browser_stop`。
 
 ## 依赖（懒加载）
@@ -24,7 +25,7 @@ MCP server 自身不依赖 SDK 即可启动；`playwright` SDK 只在首次 `bro
 bash "$HARNESS_CONFIG_ROOT/plugins/playwright/scripts/setup.sh"
 ```
 
-脚本位于插件目录的 `scripts/setup.sh`（`HARNESS_CONFIG_ROOT` 由 init-qwen 注入；pi 运行时直接用插件目录下的脚本）。它按 `package-lock.json` 安装且不下载浏览器（运行时使用系统 Chrome）。装好后直接重试 `browser_start`，无需重启 Qwen 或重连 MCP。
+脚本位于插件目录的 `scripts/setup.sh`（`HARNESS_CONFIG_ROOT` 仅由 init-qwen 注入 Qwen 设置；Pi / AGY 运行时没有该变量，直接用 server 提示中给出的 `setup.sh` 绝对路径，或插件目录下的脚本）。它按 `package-lock.json` 安装且不下载浏览器（运行时使用系统 Chrome）。装好后直接重试 `browser_start`，无需重启 Qwen / Pi / AGY 或重连 MCP。
 
 ## 规则
 

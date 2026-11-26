@@ -1,12 +1,12 @@
 # harness-config
 
-Qwen Code 个人配置与插件的多机同步仓库。
+Qwen Code / Pi / Antigravity（AGY）个人配置与插件的多机同步仓库：含跨运行时的 Agent Plugins v1 插件与 skills，以及通用远程终端 `remote-terminal/`。
 
 ## 结构
 
 | 路径 | 说明 |
 |---|---|
-| `init-qwen.sh` | 同步脚本：合并设置 + 注入 HARNESS_CONFIG_ROOT + 链接插件 + 注册 shell 片段 + 链接全局 QWEN.md + 链接 agent 定义 |
+| `init-qwen.sh` | Qwen 同步脚本：合并设置 + 注入 HARNESS_CONFIG_ROOT + 链接插件 + 注册 shell 片段 + 链接全局 QWEN.md + 链接 agent 定义 + 注入 codex-proxy 生命周期 hooks、清理 comfyui-draw 旧版 classic hooks（已迁 Mods） |
 | `init-pi.sh` | 同步到 Pi：合并 `pi/settings.json` 并按序注入 `pi/extensions/*` 与 `skills/` 到 `~/.pi/agent/settings.json` + 链接 `pi/keybindings.json` + 链接 `pi/GLOBAL.md` 到 `~/.pi/agent/AGENTS.md` + 复制 `pi/bin/apply_patch` 到 `~/.pi/agent/bin/` + 链接跨运行时插件到 `~/.agents/plugins` + 注册 `pi/shell.zsh` 到 `~/.zshrc` + 自动软链本机 Pi 包文档到 `.agents/skills/pi-docs/` |
 | `pi/settings.json` | Pi 跨机通用设置模板（`hideThinkingBlock`、`cacheWarming`、`defaultTools` 与锁版社区包 `npm:@arhen/pi-core-ask@1.1.0` / `git:github.com/mhbzhy-lost/pi-dcp@v1.0.0`），深度合并进 `~/.pi/agent/settings.json`（保留本机模型、本地 packages 与非受管扩展） |
 | `pi/GLOBAL.md` | Pi 全局指令（Commit 规范、Pi bin 工具与 `bash_async` 约定），软链接为 `~/.pi/agent/AGENTS.md`（仓内不命名为 `AGENTS.md` 避免目录扫描误加载） |
@@ -21,24 +21,29 @@ Qwen Code 个人配置与插件的多机同步仓库。
 | `agy/settings.json` | AGY CLI 设置模板（跨机通用 UI 偏好：全屏 `altScreenMode: always`），深度合并进 `~/.gemini/antigravity-cli/settings.json` |
 | `agy/rules/` | AGY 全局规则（带 `trigger: always_on`），逐文件软链接进 `~/.gemini/config/rules/`（对所有项目生效） |
 | `agy/agents/` | AGY 自定义 subagent 定义（`test-runner` 只读验证与失败日志压缩，frontmatter 声明 `model: flash`），逐文件软链接进 `~/.gemini/config/agents/` |
-| `agy/hooks/` | AGY 生命周期 hook（`subagent-model-router.py`：内置 `research` 缺省/`inherit` 时机械兜底 `flash`），按名幂等注入 `~/.gemini/config/hooks.json` |
+| `agy/hooks/` | AGY 生命周期 hook（`subagent-model-router.py`：内置 `research` 缺省/`inherit` 时机械兜底 `flash`；`pi-worker-session-injector.py`：为 `pi_worker_start` / `pi_worker_monitor` 调用自动补全 `parentSessionId` / `cwd` / `parentSessionTitle`，兼容直接调用与 `call_mcp_tool` 间接调用，失败不阻塞），按名幂等注入 `~/.gemini/config/hooks.json` |
 | `qwen/settings.json` | 设置模板（跨机通用偏好：TUI 精简 + 主题插值 + Explore 抽象 `fast` 档位） |
 | `qwen/shell.zsh` | qwen shell 包装：主题随系统明暗（macOS light→Xcode / dark→Qwen Dark） |
 | `qwen/QWEN.md` | 全局指令与子代理路由表，软链接为 `~/.qwen/QWEN.md`（对所有项目生效） |
 | `qwen/agents/` | subagent 定义（test-runner 只读验证与失败日志压缩，frontmatter 声明 `model: fast`；review-agent 重模型覆盖；antigravity 外部执行器委托 `agy acp`），逐文件软链接进 `~/.qwen/agents/` |
-| `qwen/extensions/` | 原生 Qwen extension（codex-proxy：/codex-login、/codex-status + 生命周期脚本），软链接进 `~/.qwen/extensions/` |
+| `qwen/extensions/` | 原生 Qwen extension（codex-proxy：/codex-login、/codex-status + 生命周期脚本；comfyui-draw：`/draw` 生图命令，基于 Mods `hooks/register.js` 实现，需开启 `experimental.mods`），软链接进 `~/.qwen/extensions/` |
 | `skills/` | 跨项目独立 skill（superpowers 改写版：`writing-skills` / `writing-plans`），分别注入 Qwen `skills.directories`、AGY `skills.json` 与 Pi `skills` 加载 |
 | `.agents/skills/` | 仅在本仓加载的项目级 skill：`pi-manage-provider`（安全管理 `~/.pi/agent/models.json` 与 `/dev/tty` 凭据录入）、`pi-docs`（Pi 官方文档索引，本机 `docs`/`examples`/`schemas`/`README.md` 软链由 `init-pi.sh` 自动生成且 gitignore） |
 | `plugins/` | Agent Plugins v1 插件：deepseek-search / home-connect / pi-worker / playwright |
 
 ## 同步范围
 
-- **同步**：模板中定义的设置键；`plugins/*` → `~/.qwen/extensions/<name>` 软链接；`qwen/shell.zsh` 的 source 注册进 `~/.zshrc`；`qwen/QWEN.md` → `~/.qwen/QWEN.md` 软链接（全局指令）；`skills/` 经注入的 `skills.directories` 加载（user 级 skill）；`qwen/agents/*.md` → `~/.qwen/agents/<name>.md` 逐文件软链接（subagent 定义）；`qwen/extensions/*` → `~/.qwen/extensions/<name>` 软链接 + codex-proxy 生命周期 hooks 注入 settings。
-- **不同步（per-machine）**：`model`、`fastModel`、`agents.modelGrades`、`modelProviders`、`security.auth`、`env` 中的密钥、`providerMetadata`、`$version`、`ui.autoModeAcknowledged` 等机器本地状态。具体模型、轻量档位映射、提供商和认证在各机器自行配置；模板只写 `fast` / `inherit` 等抽象角色档位。
+本仓按运行时分为四块，各自由对应 init 脚本幂等同步；凭据与 per-machine 状态一律不入库：
 
-`init-qwen.sh` 还会向本机设置注入 `env.HARNESS_CONFIG_ROOT`（本仓库绝对路径）——per-machine 值，不入模板。Qwen 将设置 `env` 注入进程环境，插件可据此按相对路径定位仓内资源（如 home-connect 凭据在 `$HARNESS_CONFIG_ROOT/plugins/home-connect`）；无锚点时插件回退自定位。仓库移动后重跑脚本更新。
+- **Qwen Code（`./init-qwen.sh`）**：模板中定义的设置键；`plugins/*` → `~/.qwen/extensions/<name>` 软链接；`qwen/shell.zsh` 的 source 注册进 `~/.zshrc`；`qwen/QWEN.md` → `~/.qwen/QWEN.md` 软链接（全局指令）；`skills/` 经注入的 `skills.directories` 加载（user 级 skill）；`qwen/agents/*.md` → `~/.qwen/agents/<name>.md` 逐文件软链接（subagent 定义）；`qwen/extensions/*` → `~/.qwen/extensions/<name>` 软链接 + codex-proxy 生命周期 hooks 注入 settings（同时清理 comfyui-draw 旧版 classic hooks）。
+- **Pi（`./init-pi.sh`）**：`pi/settings.json` 深度合并进 `~/.pi/agent/settings.json` 并按序注入 `pi/extensions/*` 与 `skills/`（保留本机模型、本地 packages 与非受管扩展）；`pi/keybindings.json`、`pi/GLOBAL.md`（→ `AGENTS.md`）软链接；`plugins/*` 逐插件软链到 `~/.agents/plugins/`（Pi 经 `agent-plugins` 扩展加载）；注册 `pi/shell.zsh`；软链本机 Pi 包文档到 `.agents/skills/pi-docs/`。
+- **AGY（`./init-agy.sh`）**：`agy/settings.json` 深度合并进 `~/.gemini/antigravity-cli/settings.json`；`plugins/*` 软链到 `~/.gemini/config/plugins`；`skills/` 目录注册进 `skills.json`；`agy/rules/*.md`、`agy/agents/*.md` 逐文件软链；`agy/hooks/` 按名注入 `hooks.json`；注册 `agy/shell.zsh`。
+- **remote-terminal（`./init-remote.sh`，可选）**：检查 Node >= 22.19 与 tmux、按需 `npm install`、注册 `rt` / `rtctl` 包装进 `~/.zshrc`；运行时状态与配置保存在 `~/.harness-remote/`，不入库。
+- **不同步（per-machine）**：Qwen 的 `model`、`fastModel`、`agents.modelGrades`、`modelProviders`、`security.auth`、`env` 中的密钥、`providerMetadata`、`$version`、`ui.autoModeAcknowledged`，Pi 的模型选择、`models.json`、`auth.json`、`enabledModels`，AGY 的本机登录态与模型选择，以及各插件的 `.env` / `.ssh/` / `config/*.env` 凭据等机器本地状态。具体模型、轻量档位映射、提供商和认证在各机器自行配置；模板只写 `fast` / `inherit` 等抽象角色档位。
 
-同理，脚本确保 `skills.directories` 含 `<仓库根>/skills`（保留用户已有的其他目录条目）。不用软链、不入模板：设置插值先于 settings env 注入，`${HARNESS_CONFIG_ROOT}` 写法首次加载解析不了，故注入字面绝对路径。skill 以 user 级加载、不受文件夹信任门控，**重启 Qwen Code 生效**。仓库移动后重跑会追加新路径，旧路径条目需手动删除。
+`init-qwen.sh` 还会向本机设置注入 `env.HARNESS_CONFIG_ROOT`（本仓库绝对路径）——per-machine 值，不入模板（Pi 与 AGY 侧不注入该变量）。Qwen 将设置 `env` 注入进程环境，插件可据此按相对路径定位仓内资源（如 home-connect 凭据在 `$HARNESS_CONFIG_ROOT/plugins/home-connect`）；无锚点时插件回退自定位。仓库移动后重跑脚本更新。
+
+`init-qwen.sh` 同时确保 `skills.directories` 含 `<仓库根>/skills`（保留用户已有的其他目录条目）。不用软链、不入模板：设置插值先于 settings env 注入，`${HARNESS_CONFIG_ROOT}` 写法首次加载解析不了，故注入字面绝对路径。skill 以 user 级加载、不受文件夹信任门控，**重启 Qwen Code 生效**。仓库移动后重跑会追加新路径，旧路径条目需手动删除。
 
 ## 子代理路由与模型档位
 
@@ -66,15 +71,16 @@ CLIProxyAPI（`brew install cliproxyapi`）把 ChatGPT 订阅配额暴露为本�
 - **上游代理**：OpenAI 流量必须走代理——config `requests.proxy-url` 默认 `http://127.0.0.1:7897`（`CODEX_UPSTREAM_PROXY` 可覆盖），登录用 `-login-proxy` 同值。只作用于 cliproxyapi 进程，Qwen 自身流量不受影响。
 - **一次性接入**：`brew install cliproxyapi` → 确保 7897 代理客户端在跑 → `/codex-login`（浏览器 ChatGPT OAuth，命令引导后续模型条目写入）。模型条目属 per-machine 配置，不入模板。
 - **状态目录** `~/.qwen/codex-proxy/`：config.yaml、auth/（OAuth 凭据，per-machine 秘密，不在仓内）、proxy.log、注册表。未安装/未登录时 hooks 静默 no-op，不阻塞任何会话。
-- **风险**：个人自用属 OpenAI 当前默许的灰区；共享/转售触发风控（详见调研记忆）。
+- **风险**：个人自用属 OpenAI 当前默许的灰区；共享/转售触发风控。
 
 ## 新机器用法
 
 ```bash
 git clone <repo-url> harness-config && cd harness-config
-./init-qwen.sh
-./init-pi.sh      # 若使用 pi：链接插件到 ~/.agents/plugins
-./init-agy.sh     # 若使用 agy：链接插件 + 注册 skills.json + 链接 AGY 全局规则
+./init-qwen.sh    # 使用 Qwen Code：合并设置 + 注入 HARNESS_CONFIG_ROOT + 链接插件/shell/QWEN.md/agents/extensions
+./init-pi.sh      # 使用 Pi：合并 settings + 注入扩展与 skills + 链接 keybindings/AGENTS.md/插件 + 注册 shell + 软链 pi-docs
+./init-agy.sh     # 使用 AGY：合并 settings + 链接插件/skills/rules/agents + 注入 hooks + 注册 shell
+./init-remote.sh  # 可选：初始化通用远程终端 rt/rtctl（需要 Node >= 22.19 与 tmux；--skip-install 可跳过 npm install）
 # 可选：playwright 依赖按需安装（首次 browser_start 返回 sdk-missing 时再执行也可以）
 bash plugins/playwright/scripts/setup.sh
 cp plugins/deepseek-search/.env.example plugins/deepseek-search/.env   # 填写密钥
@@ -103,8 +109,9 @@ cp plugins/deepseek-search/.env.example plugins/deepseek-search/.env   # 填写�
 ./init-qwen.sh --dry-run    # 预览 Qwen 变更
 ./init-pi.sh --dry-run      # 预览 Pi 变更
 ./init-agy.sh --dry-run     # 预览 AGY 变更
-python3 -m unittest discover -s tests -p 'test_*.py'   # 路由与 init 回归测试
-node --test tests/test_pi_extensions.mjs               # Pi 扩展与 session-owner 回归测试
+./init-remote.sh --dry-run  # 预览 remote-terminal 变更
+python3 -m unittest discover -s tests -p 'test_*.py'   # Qwen 路由、Qwen/Pi/AGY/remote-terminal 同步脚本与 pi-manage-provider 回归测试
+node --test tests/test_*.mjs                           # JS 回归测试：Pi 扩展与 session-owner、pi-worker、home-connect 异步工具、remote-terminal
 QWEN_SETTINGS_PATH=/tmp/t.json QWEN_EXTENSIONS_DIR=/tmp/ext QWEN_SHELL_RC=/tmp/zshrc QWEN_GLOBAL_MD=/tmp/QWEN.md QWEN_AGENTS_DIR=/tmp/agents ./init-qwen.sh   # 临时目录同步测试
 PI_AGENT_DIR=/tmp/pi-agent PI_PLUGINS_DIR=/tmp/pi-plugins PI_SHELL_RC=/tmp/pi-zshrc ./init-pi.sh   # Pi 临时目录同步测试
 AGY_SETTINGS_PATH=/tmp/agy-settings.json AGY_CONFIG_DIR=/tmp/agy-config ./init-agy.sh   # AGY 临时目录同步测试
@@ -112,16 +119,17 @@ AGY_SETTINGS_PATH=/tmp/agy-settings.json AGY_CONFIG_DIR=/tmp/agy-config ./init-a
 
 ## 更新
 
-- 设置：把想同步的键手动加进 `qwen/settings.json`（勿加 per-machine 配置），提交推送。
-- 插件：直接改 `plugins/` 下内容（本机链接即时生效），提交推送；其他机器 `git pull` 即可，新增插件需重跑 `./init-qwen.sh` 建链接。
-- shell 包装：改 `qwen/shell.zsh`（source 即时生效于新终端），提交推送；其他机器 `git pull` 即可。
-- 全局指令：改 `qwen/QWEN.md`（软链接即时生效于新会话），提交推送；其他机器 `git pull` 即可。内容保持短而具体，项目专属内容写各项目的 QWEN.md。
-- skill：改 `skills/<name>/`（重启 Qwen Code 生效），提交推送；其他机器 `git pull` 即可。新增 skill 无需重跑 init（目录已被扫描）。
-- agent 定义：改 `qwen/agents/<name>.md`（软链接即时生效于新会话），提交推送；新增 agent 文件需重跑 `./init-qwen.sh` 建链接。review-agent 提示词升级后需对照内置重同步。
+- 设置模板：Qwen 改 `qwen/settings.json`、Pi 改 `pi/settings.json`、AGY 改 `agy/settings.json`（勿加 per-machine 配置），提交推送；其他机器 `git pull` 后重跑对应 init 脚本合并进本机设置。
+- 插件：直接改 `plugins/` 下内容（本机链接即时生效），提交推送；其他机器 `git pull` 即可。**新增插件**需按所用运行时重跑对应 init 脚本建链接：Qwen `./init-qwen.sh`、Pi `./init-pi.sh`（之后重启 Pi 让 `agent-plugins` 扩展重新扫描）、AGY `./init-agy.sh`。
+- shell 包装：改 `qwen/shell.zsh` / `pi/shell.zsh` / `agy/shell.zsh` / `remote-terminal/shell.zsh`（source 即时生效于新终端），提交推送；其他机器 `git pull` 即可。
+- 全局指令：Qwen 改 `qwen/QWEN.md`、Pi 改 `pi/GLOBAL.md`（软链接即时生效于新会话），AGY 改 `agy/rules/*.md`（新增文件需重跑 `./init-agy.sh` 建链接），提交推送；其他机器 `git pull` 即可。内容保持短而具体，项目专属内容写各项目自己的指令文件。
+- skill：改 `skills/<name>/`（Qwen 重启生效，Pi 新会话生效，AGY 新会话生效），提交推送；其他机器 `git pull` 即可。新增 skill 无需重跑 init：Qwen / Pi / AGY 均按目录级注册，目录已被扫描。
+- agent 定义：Qwen 改 `qwen/agents/<name>.md`、AGY 改 `agy/agents/<name>.md`（软链接即时生效于新会话），提交推送；新增 agent 文件需重跑对应 `./init-qwen.sh` / `./init-agy.sh` 建链接。review-agent 提示词升级后需对照内置重同步。
+- hooks 与扩展：AGY `agy/hooks/` 变更需重跑 `./init-agy.sh` 重新注入；Pi `pi/extensions/*` 由 `init-pi.sh` 扫描目录按序注入，新增扩展重跑 `./init-pi.sh` 后重启 Pi；Qwen `qwen/extensions/*` 变更即时生效，新增扩展需重跑 `./init-qwen.sh` 建链接。
 
 ## 注意
 
-- 需要 bash + python3；插件运行依赖 node（playwright 依赖按需安装：`plugins/playwright/scripts/setup.sh`）。
+- 需要 bash + python3；插件运行依赖 node（playwright 依赖按需安装：`plugins/playwright/scripts/setup.sh`）；remote-terminal 需要 Node >= 22.19 与 tmux。
 - 本机设置必须是标准 JSON；脚本不处理手写的 `//` 注释。
-- 设置变更重启 Qwen Code 生效；插件变更可用 `/reload-plugins`；shell 包装新开终端生效；全局 QWEN.md 新会话加载（`/memory` 可查看）。
+- 设置变更重启对应运行时生效（Qwen Code / Pi / AGY）；Qwen 插件变更可用 `/reload-plugins`，Pi 扩展变更需重启 Pi；shell 包装新开终端生效；全局指令（Qwen `QWEN.md` / Pi `AGENTS.md` / AGY `rules/`）新会话加载（Qwen 可用 `/memory` 查看）。
 - 主题包装依赖 zsh（注册进 `~/.zshrc`）；bash-only 机器不生效，主题回退默认。

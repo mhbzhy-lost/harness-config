@@ -38,7 +38,7 @@ rtctl revoke <设备id>      # 即时切断该设备存量连接
 
 ## 本机配置（`~/.harness-remote/config.json`）
 
-可从 [config.example.json](file:///Users/leshi.zhy/harness-config/remote-terminal/config.example.json) 复制：
+可从 [config.example.json](./config.example.json) 复制：
 
 | `webExposure` | 行为 |
 |---|---|

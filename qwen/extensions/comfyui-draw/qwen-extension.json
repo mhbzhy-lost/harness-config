@@ -1,5 +1,5 @@
 {
   "name": "comfyui-draw",
   "version": "0.1.0",
-  "description": "/draw 生图命令：自然语言部分进 LLM 由 agent 判断调用，{花括号}内文本经 PreToolUse hook 机械保证原样进入 positive prompt（hooks 由 init-qwen.sh 注入 settings）"
+  "description": "/draw 生图命令（Mod 实现，需开启 experimental.mods）：session.start 注册命令；{花括号}内文本由 command.run 机械缓存，并在首次 comfyui_generate 调用时原样追加进 positive prompt，自然语言部分交由 agent 判断"
 }
