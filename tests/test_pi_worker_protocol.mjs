@@ -21,6 +21,7 @@ test("test_protocol_prompt_is_static_and_mentions_worker_tools", () => {
   assert.ok(PROTOCOL_APPEND_PROMPT.includes("worker_report_blocked"));
   assert.ok(PROTOCOL_APPEND_PROMPT.includes("worker_finish"));
   assert.ok(PROTOCOL_APPEND_PROMPT.includes("compress"));
+  assert.match(PROTOCOL_APPEND_PROMPT, /worker_finish.*跳过 compress/);
   assert.ok(PROTOCOL_APPEND_PROMPT.includes("bash"));
   assert.ok(PROTOCOL_APPEND_PROMPT.includes("bash_async"));
 });
