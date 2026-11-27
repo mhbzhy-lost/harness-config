@@ -110,6 +110,101 @@ class RemoteTerminalSyncTest(unittest.TestCase):
         self.assertIn("<h1>终端会话</h1>", html)
         self.assertNotIn("<h1>pi 会话</h1>", html)
 
+    def test_shell_ensure_fast_path_skips_node_when_web_exposure_off(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_root = tmp_path / "rt-root"
+            fake_root.mkdir()
+            (fake_root / "node_modules").mkdir()
+            shell_copy = fake_root / "shell.zsh"
+            shell_copy.write_text((ROOT / "remote-terminal/shell.zsh").read_text(encoding="utf-8"), encoding="utf-8")
+
+            log_file = tmp_path / "node_calls.log"
+            fake_node = tmp_path / "fake-node"
+            fake_node.write_text(f"#!/bin/sh\necho \"$@\" >> \"{log_file}\"\n", encoding="utf-8")
+            fake_node.chmod(0o755)
+
+            state_dir = tmp_path / "state"
+            state_dir.mkdir()
+            cfg = state_dir / "config.json"
+            cfg.write_text('{"webExposure": "off"}\n', encoding="utf-8")
+
+            env = os.environ.copy()
+            env["HARNESS_REMOTE_NODE"] = str(fake_node)
+            env["HARNESS_REMOTE_DIR"] = str(state_dir)
+            env["HARNESS_REMOTE_CONFIG"] = str(cfg)
+
+            # 1) webExposure=off 且无存活 pid，且开启干扰性 zsh 选项（验证 emulate -L zsh）时，应跳过 Node
+            res_off = subprocess.run(
+                ["zsh", "-c", f'setopt ksh_arrays sh_word_split; source "{shell_copy}"; _rt_ensure_server'],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(res_off.returncode, 0, msg=f"stderr:\n{res_off.stderr}")
+            self.assertFalse(log_file.exists(), msg=f"webExposure=off 不应调用 node，实际调用: {log_file.read_text() if log_file.exists() else ''}")
+
+            # 2) webExposure=lan 且无 web.pid 时，应调用 Node ensure
+            cfg.write_text('{"webExposure": "lan"}\n', encoding="utf-8")
+            res_lan_missing = subprocess.run(
+                ["zsh", "-c", f'source "{shell_copy}"; _rt_ensure_server'],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(res_lan_missing.returncode, 0, msg=f"stderr:\n{res_lan_missing.stderr}")
+            self.assertTrue(log_file.exists() and "ensure" in log_file.read_text(encoding="utf-8"))
+
+            # 3) webExposure=lan 且 web.pid 存活、同 shell 已 ensured 时，应跳过二次调用 Node
+            log_file.unlink()
+            live_proc = subprocess.Popen(["sleep", "30"])
+            try:
+                (state_dir / "web.pid").write_text(f"{live_proc.pid}\n", encoding="utf-8")
+                res_lan_cached = subprocess.run(
+                    ["zsh", "-c", f'source "{shell_copy}"; _HARNESS_REMOTE_ENSURED=1; _rt_ensure_server'],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(res_lan_cached.returncode, 0, msg=f"stderr:\n{res_lan_cached.stderr}")
+                self.assertFalse(log_file.exists(), msg="webExposure=lan 存活且已 ensured 时不应重复拉起 node")
+
+                # 4) webExposure=public 且缺 agent.pid 时，即使 _HARNESS_REMOTE_ENSURED=1 也应拉起 Node
+                cfg.write_text('{"webExposure": "public"}\n', encoding="utf-8")
+                res_pub_missing_agent = subprocess.run(
+                    ["zsh", "-c", f'source "{shell_copy}"; _HARNESS_REMOTE_ENSURED=1; _rt_ensure_server'],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(res_pub_missing_agent.returncode, 0, msg=f"stderr:\n{res_pub_missing_agent.stderr}")
+                self.assertTrue(log_file.exists() and "ensure" in log_file.read_text(encoding="utf-8"))
+
+                # 5) webExposure=public 且 web.pid 与 agent.pid 均存活且已 ensured 时，应跳过 Node
+                log_file.unlink()
+                (state_dir / "agent.pid").write_text(f"{live_proc.pid}\n", encoding="utf-8")
+                res_pub_cached = subprocess.run(
+                    ["zsh", "-c", f'source "{shell_copy}"; _HARNESS_REMOTE_ENSURED=1; _rt_ensure_server'],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(res_pub_cached.returncode, 0, msg=f"stderr:\n{res_pub_cached.stderr}")
+                self.assertFalse(log_file.exists(), msg="webExposure=public 双进程存活且已 ensured 时不应重复拉起 node")
+            finally:
+                live_proc.terminate()
+                live_proc.wait(timeout=5)
+
 
 if __name__ == "__main__":
     unittest.main()

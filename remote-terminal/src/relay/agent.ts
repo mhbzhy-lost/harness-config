@@ -31,6 +31,7 @@ import {
 } from "../protocol.ts";
 import { loadRemoteSettings, resolveWebPort } from "./config.ts";
 import { addPending, clearStalePending, readDevices, readPending, writeLastSeen } from "./devices.ts";
+import { createEarlyBuffer, createHeaderRewriter, type HeaderRewriteState } from "./header-rewrite.ts";
 
 const execFileAsync = promisify(execFile);
 const HEARTBEAT_PING_CHECK_MS = 5_000;
@@ -101,17 +102,7 @@ function fetchSessions(webPort: number): Promise<SessionBrief[]> {
   });
 }
 
-function forceConnectionClose(chunk: Buffer): Buffer {
-  const idx = chunk.indexOf("\r\n\r\n");
-  if (idx < 0) return chunk;
-  let header = chunk.subarray(0, idx).toString("latin1");
-  if (/^upgrade:/im.test(header)) return chunk;
-  header = header.replace(/^connection:[^\r\n]*\r\n/gim, "");
-  header += "\r\nConnection: close";
-  return Buffer.concat([Buffer.from(header, "latin1"), chunk.subarray(idx)]);
-}
-
-function pipePair(socket: Socket, ws: WebSocket, transformFirst: boolean): void {
+function pipePair(socket: Socket, ws: WebSocket, headerRewriter: HeaderRewriteState): void {
   let checkTimer: NodeJS.Timeout | null = null;
   let socketClosed = false;
 
@@ -134,11 +125,14 @@ function pipePair(socket: Socket, ws: WebSocket, transformFirst: boolean): void 
   });
   ws.on("message", (data: Buffer) => {
     if (socketClosed || socket.destroyed) return;
-    if (transformFirst) {
-      data = forceConnectionClose(data);
-      transformFirst = false;
+    const rewritten = headerRewriter.push(data);
+    if (rewritten.overflow) {
+      socket.destroy();
+      try { ws.close(1009); } catch { /* 忽略 */ }
+      return;
     }
-    if (!socket.write(data)) ws.pause();
+    if (!rewritten.output) return;
+    if (!socket.write(rewritten.output)) ws.pause();
   });
   socket.on("drain", () => ws.resume());
 
@@ -212,30 +206,58 @@ export async function runAgent(stateDir: string, configPath: string): Promise<vo
     }
   };
 
+  const activeChannels = new Set<() => void>();
+
   const openDataChannel = (channel: string): void => {
     const ws = new WebSocket(`${baseUrl}/agent/data?agentToken=${encodeURIComponent(relay.agentToken)}&channel=${encodeURIComponent(channel)}`, {
       ...tlsOptions,
       maxPayload: MAX_WS_MESSAGE_BYTES,
     });
     let socket: Socket | null = null;
-    const early: Buffer[] = [];
-    const onEarly = (data: Buffer): void => { early.push(data); };
+    const early = createEarlyBuffer();
+    const headerRewriter = createHeaderRewriter();
+    const closeChannel = (): void => {
+      early.clear();
+      socket?.destroy();
+      try { ws.terminate(); } catch { /* 忽略 */ }
+    };
+    activeChannels.add(closeChannel);
+    const onEarly = (data: Buffer): void => {
+      if (!early.push(data)) {
+        log(`data-channel-early-overflow channel=${channel}`);
+        closeChannel();
+      }
+    };
     ws.on("message", onEarly);
     ws.on("open", () => {
       socket = connect({ host: "127.0.0.1", port: webPort });
       socket.on("connect", () => {
         ws.removeListener("message", onEarly);
-        const hadEarly = early.length > 0;
-        if (hadEarly) early[0] = forceConnectionClose(early[0]!);
-        for (const chunk of early.splice(0)) socket!.write(chunk);
-        pipePair(socket!, ws, !hadEarly);
+        for (const chunk of early.drain()) {
+          const rewritten = headerRewriter.push(chunk);
+          if (rewritten.overflow) {
+            log(`data-channel-header-overflow channel=${channel}`);
+            closeChannel();
+            return;
+          }
+          if (rewritten.output) socket!.write(rewritten.output);
+        }
+        pipePair(socket!, ws, headerRewriter);
       });
       socket.on("error", () => {
         try { ws.terminate(); } catch { /* 忽略 */ }
       });
     });
-    ws.on("close", () => socket?.destroy());
-    ws.on("error", () => socket?.destroy());
+    ws.on("close", () => {
+      activeChannels.delete(closeChannel);
+      early.clear();
+      socket?.destroy();
+    });
+    ws.on("error", () => {
+      activeChannels.delete(closeChannel);
+      early.clear();
+      socket?.destroy();
+    });
   };
 
   const handleMessage = async (msg: DownMessage): Promise<void> => {
@@ -321,7 +343,7 @@ export async function runAgent(stateDir: string, configPath: string): Promise<vo
         log(code === CLOSE_AGENT_TOKEN_INVALID
           ? "agentToken 与中继不一致，请核对 config.json 与 ECS init 输出"
           : "协议版本与中继不匹配：请检查中继服务端协议版本");
-        void writeStatus(stateDir, "stopped", lastHeartbeat).then(() => process.exit(1));
+        void writeStatus(stateDir, "stopped", lastHeartbeat).catch(() => {}).finally(() => process.exit(1));
         return;
       }
       log(opened ? "control-disconnected" : "control-connect-failed");
@@ -356,18 +378,20 @@ export async function runAgent(stateDir: string, configPath: string): Promise<vo
 
   let watchDebounce: NodeJS.Timeout | null = null;
   let pollTimer: NodeJS.Timeout | null = null;
+  let watcher: ReturnType<typeof fsWatch> | null = null;
   try {
-    const watcher = fsWatch(stateDir);
+    watcher = fsWatch(stateDir);
     watcher.on("change", (_event, filename) => {
       if (String(filename) !== "devices.json") return;
       if (watchDebounce) clearTimeout(watchDebounce);
       watchDebounce = setTimeout(() => void diffDevices(true), 200);
     });
     watcher.on("error", () => {
-      watcher.close();
+      watcher?.close();
+      watcher = null;
       if (!pollTimer) pollTimer = setInterval(() => void diffDevices(true), 5_000);
     });
-    process.on("exit", () => watcher.close());
+    process.on("exit", () => watcher?.close());
   } catch {
     pollTimer = setInterval(() => void diffDevices(true), 5_000);
   }
@@ -375,11 +399,15 @@ export async function runAgent(stateDir: string, configPath: string): Promise<vo
   const shutdown = (): void => {
     stopped = true;
     if (reconnectTimer) clearTimeout(reconnectTimer);
+    if (watchDebounce) clearTimeout(watchDebounce);
     clearInterval(heartbeatTimer);
     clearInterval(lastSeenTimer);
     if (pollTimer) clearInterval(pollTimer);
+    watcher?.close();
+    for (const closeChannel of activeChannels) closeChannel();
+    activeChannels.clear();
     control?.terminate();
-    void writeStatus(stateDir, "stopped", lastHeartbeat).then(() => process.exit(0));
+    void writeStatus(stateDir, "stopped", lastHeartbeat).catch(() => {}).finally(() => process.exit(0));
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);

@@ -7,6 +7,8 @@ import { networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
+import { BACKPRESSURE_CHECK_MS, BACKPRESSURE_HIGH_BYTES, MAX_WS_MESSAGE_BYTES } from "../protocol.ts";
+import { parseRequestUrl } from "./url.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -191,7 +193,7 @@ export async function startWebServer(opts: WebServerOptions): Promise<{ server: 
     "/xterm-fit.js": { body: fitJs, type: MIME[".js"]! },
   };
 
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_MESSAGE_BYTES });
   // 仅 public 模式由 ensure 设置 HARNESS_REMOTE_TRUST_LOOPBACK=1（兼容旧 PI_WEB_TRUST_LOOPBACK=1）
   const trustLoopback = process.env.HARNESS_REMOTE_TRUST_LOOPBACK === "1" || process.env.PI_WEB_TRUST_LOOPBACK === "1";
   const isLoopback = (req: IncomingMessage): boolean => {
@@ -202,122 +204,192 @@ export async function startWebServer(opts: WebServerOptions): Promise<{ server: 
     (trustLoopback && isLoopback(req)) || !opts.token || url.searchParams.get("token") === opts.token;
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    const url = new URL(req.url ?? "/", "http://localhost");
-    if (!checkToken(url, req)) {
-      res.writeHead(401, { "content-type": "text/plain; charset=utf-8" });
-      res.end("令牌无效：请在 URL 上携带 ?token=...");
-      return;
+    try {
+      const url = parseRequestUrl(req.url);
+      if (!url) {
+        res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+        res.end("Bad Request");
+        return;
+      }
+      if (!checkToken(url, req)) {
+        res.writeHead(401, { "content-type": "text/plain; charset=utf-8" });
+        res.end("令牌无效：请在 URL 上携带 ?token=...");
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/sessions") {
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ sessions: await listTmuxSessions() }));
+        return;
+      }
+      const asset = assets[url.pathname];
+      if (!asset || req.method !== "GET") {
+        res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+        res.end("Not Found");
+        return;
+      }
+      res.writeHead(200, { "content-type": asset.type, "cache-control": "no-store" });
+      res.end(asset.body);
+    } catch {
+      if (!res.headersSent) res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+      if (!res.writableEnded) res.end("Internal Server Error");
     }
-    if (req.method === "GET" && url.pathname === "/api/sessions") {
-      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-      res.end(JSON.stringify({ sessions: await listTmuxSessions() }));
-      return;
-    }
-    const asset = assets[url.pathname];
-    if (!asset || req.method !== "GET") {
-      res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-      res.end("Not Found");
-      return;
-    }
-    res.writeHead(200, { "content-type": asset.type, "cache-control": "no-store" });
-    res.end(asset.body);
   });
 
   const livePties = new Set<pty.IPty>();
   server.on("upgrade", (req, socket, head) => {
-    const url = new URL(req.url ?? "/", "http://localhost");
-    if (url.pathname !== "/ws" || !checkToken(url, req)) {
-      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-      socket.destroy();
-      return;
-    }
-    const sessionName = url.searchParams.get("session") ?? opts.defaultSession ?? "";
-    wss.handleUpgrade(req, socket, head, async (ws) => {
-      const pending: string[] = [];
-      let attach: pty.IPty | null = null;
-      let wsClosed = false;
-
-      const killAttach = () => {
-        if (!attach) return;
-        const target = attach;
-        attach = null;
-        try {
-          target.kill();
-        } catch {
-          // 已退出则忽略
-        }
-        livePties.delete(target);
-      };
-
-      // 先于异步 tmux 校验注册 close 监听，防止握手期间客户端断开后泄漏孤儿 pty。
-      ws.on("close", () => {
-        wsClosed = true;
-        killAttach();
-      });
-
-      const dispatch = (raw: string) => {
-        if (!attach) {
-          pending.push(raw);
-          return;
-        }
-        let msg: ClientMessage;
-        try {
-          msg = JSON.parse(raw);
-        } catch {
-          return;
-        }
-        if (msg.type === "input") attach.write(msg.data);
-        else if (msg.type === "resize") {
-          const cols = Math.max(2, Math.min(500, Math.floor(msg.cols)));
-          const rows = Math.max(2, Math.min(300, Math.floor(msg.rows)));
-          try {
-            attach.resize(cols, rows);
-          } catch {
-            // attach 退出瞬间 resize 可能失败，忽略
-          }
-        }
-      };
-      ws.on("message", (raw) => dispatch(String(raw)));
-
-      const env = { ...process.env, TERM: "xterm-256color" } as Record<string, string>;
-      delete env.PI_SESSION_OWNER_ID;
-      delete env.PI_SESSION_OWNER_REGISTRY;
-      try {
-        if (!SESSION_NAME_RE.test(sessionName)) throw new Error(`会话名不合法：${sessionName || "(空)"}`);
-        await tmux(["has-session", "-t", sessionName]);
-        if (wsClosed || ws.readyState !== ws.OPEN) return;
-        const att = pty.spawn("tmux", ["attach-session", "-t", sessionName], {
-          name: "xterm-256color",
-          cols: opts.cols,
-          rows: opts.rows,
-          cwd: opts.cwd,
-          env,
-        });
-        attach = att;
-        livePties.add(att);
-        ws.send(JSON.stringify({ type: "hello", cols: att.cols, rows: att.rows } satisfies ServerMessage));
-        att.onData((data) => {
-          if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: "output", data }));
-        });
-        att.onExit(() => {
-          livePties.delete(att);
-          if (attach === att) attach = null;
-          if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) ws.close();
-        });
-        for (const raw of pending.splice(0)) dispatch(raw);
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        if (ws.readyState === ws.OPEN) {
-          ws.send(JSON.stringify({ type: "output", data: `\r\n\x1b[31m[remote-terminal 会话不可用：${reason}]\x1b[0m\r\n` }));
-        }
-        ws.close();
+    try {
+      const url = parseRequestUrl(req.url);
+      if (!url) {
+        socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+        socket.destroy();
+        return;
       }
-    });
+      if (url.pathname !== "/ws" || !checkToken(url, req)) {
+        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+      const sessionName = url.searchParams.get("session") ?? opts.defaultSession ?? "";
+      wss.handleUpgrade(req, socket, head, async (ws) => {
+        const pending: string[] = [];
+        let attach: pty.IPty | null = null;
+        let wsClosed = false;
+        let bpTimer: NodeJS.Timeout | null = null;
+
+        const clearBpTimer = () => {
+          if (bpTimer) {
+            clearInterval(bpTimer);
+            bpTimer = null;
+          }
+        };
+
+        const killAttach = () => {
+          if (!attach) return;
+          const target = attach;
+          attach = null;
+          try {
+            target.kill();
+          } catch {
+            // 已退出则忽略
+          }
+          livePties.delete(target);
+        };
+
+        // 先于异步 tmux 校验注册 close 监听，防止握手期间客户端断开后泄漏孤儿 pty。
+        ws.on("close", () => {
+          wsClosed = true;
+          clearBpTimer();
+          killAttach();
+        });
+
+        const dispatch = (raw: string) => {
+          if (!attach) {
+            pending.push(raw);
+            return;
+          }
+          let msg: ClientMessage;
+          try {
+            msg = JSON.parse(raw);
+          } catch {
+            return;
+          }
+          if (msg.type === "input") attach.write(msg.data);
+          else if (msg.type === "resize") {
+            const cols = Math.max(2, Math.min(500, Math.floor(msg.cols)));
+            const rows = Math.max(2, Math.min(300, Math.floor(msg.rows)));
+            try {
+              attach.resize(cols, rows);
+            } catch {
+              // attach 退出瞬间 resize 可能失败，忽略
+            }
+          }
+        };
+        ws.on("message", (raw) => dispatch(String(raw)));
+
+        const env = { ...process.env, TERM: "xterm-256color" } as Record<string, string>;
+        delete env.PI_SESSION_OWNER_ID;
+        delete env.PI_SESSION_OWNER_REGISTRY;
+        try {
+          if (!SESSION_NAME_RE.test(sessionName)) throw new Error(`会话名不合法：${sessionName || "(空)"}`);
+          await tmux(["has-session", "-t", sessionName]);
+          if (wsClosed || ws.readyState !== ws.OPEN) return;
+          const att = pty.spawn("tmux", ["attach-session", "-t", sessionName], {
+            name: "xterm-256color",
+            cols: opts.cols,
+            rows: opts.rows,
+            cwd: opts.cwd,
+            env,
+          });
+          attach = att;
+          livePties.add(att);
+          ws.send(JSON.stringify({ type: "hello", cols: att.cols, rows: att.rows } satisfies ServerMessage));
+          att.onData((data) => {
+            if (ws.readyState !== ws.OPEN) return;
+            ws.send(JSON.stringify({ type: "output", data }));
+            if (ws.bufferedAmount > BACKPRESSURE_HIGH_BYTES && !bpTimer) {
+              try {
+                att.pause();
+              } catch {
+                // 忽略
+              }
+              bpTimer = setInterval(() => {
+                if (ws.bufferedAmount <= BACKPRESSURE_HIGH_BYTES || ws.readyState !== ws.OPEN) {
+                  clearBpTimer();
+                  if (attach === att && ws.readyState === ws.OPEN) {
+                    try {
+                      att.resume();
+                    } catch {
+                      // 忽略
+                    }
+                  }
+                }
+              }, BACKPRESSURE_CHECK_MS);
+            }
+          });
+          att.onExit(() => {
+            clearBpTimer();
+            livePties.delete(att);
+            if (attach === att) attach = null;
+            if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) ws.close();
+          });
+          for (const raw of pending.splice(0)) dispatch(raw);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify({ type: "output", data: `\r\n\x1b[31m[remote-terminal 会话不可用：${reason}]\x1b[0m\r\n` }));
+          }
+          ws.close();
+        }
+      });
+    } catch {
+      socket.destroy();
+    }
   });
 
   await new Promise<void>((resolve) => server.listen(opts.port, opts.host, resolve));
   const close = async () => {
-    for (const ws of wss.clients) ws.close();
+    const hasClients = wss.clients.size > 0;
+    for (const ws of wss.clients) {
+      try {
+        ws.close();
+      } catch {
+        // 忽略
+      }
+    }
+    const terminateTimer = hasClients
+      ? setTimeout(() => {
+          for (const ws of wss.clients) {
+            if (ws.readyState !== ws.CLOSED) {
+              try {
+                ws.terminate();
+              } catch {
+                // 忽略
+              }
+            }
+          }
+        }, 500)
+      : null;
+    terminateTimer?.unref?.();
     for (const p of livePties) {
       try {
         p.kill();
@@ -325,7 +397,10 @@ export async function startWebServer(opts: WebServerOptions): Promise<{ server: 
         // 忽略
       }
     }
-    wss.close();
+    wss.close(() => {
+      if (terminateTimer) clearTimeout(terminateTimer);
+    });
+    server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   };
   return { server, close, urls: lanUrls(opts.port) };

@@ -11,7 +11,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { sha256Hex } from "../protocol.ts";
 import { loadRemoteSettings, resolveWebPort, type RemoteSettings } from "./config.ts";
-import { audit, readActivePending, readDevices } from "./devices.ts";
+import { audit, readActivePending, readDevices, withFileLock } from "./devices.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -135,37 +135,17 @@ async function stopAgent(stateDir: string): Promise<void> {
   await unlink(agentPidPath(stateDir)).catch(() => {});
 }
 
-async function withEnsureLock<T>(stateDir: string, fn: () => Promise<T>): Promise<T> {
-  await mkdir(stateDir, { recursive: true, mode: 0o700 });
-  const lockFile = path.join(stateDir, "ensure.lock");
-  const deadline = Date.now() + 8_000;
-  for (;;) {
-    try {
-      const handle = await open(lockFile, "wx", 0o600);
-      try { await handle.writeFile(String(process.pid)); } finally { await handle.close(); }
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      let stale = false;
-      try {
-        const pid = Number.parseInt((await readFile(lockFile, "utf8")).trim(), 10);
-        stale = !Number.isInteger(pid) || pid <= 0 || !pidAlive(pid);
-      } catch {
-        stale = true;
-      }
-      if (stale) {
-        await unlink(lockFile).catch(() => {});
-        continue;
-      }
-      if (Date.now() > deadline) throw new Error("ensure 锁等待超时：可能有其他会话正在初始化，请稍后重试");
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-  }
-  try {
-    return await fn();
-  } finally {
-    await unlink(lockFile).catch(() => {});
-  }
+export async function withEnsureLock<T>(stateDir: string, fn: () => Promise<T>): Promise<T> {
+  return withFileLock(
+    stateDir,
+    "ensure.lock",
+    {
+      timeoutMs: 8_000,
+      pollMs: 100,
+      timeoutMessage: "ensure 锁等待超时：可能有其他会话正在初始化，请稍后重试",
+    },
+    fn,
+  );
 }
 
 async function spawnDetached(pkgRoot: string, stateDir: string, args: string[], logName: string, env: Record<string, string>, pidFile: string): Promise<number> {

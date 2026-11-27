@@ -13,11 +13,21 @@ rtctl() {
   "$(_rt_node)" "${_HARNESS_REMOTE_ROOT}/scripts/remote-ctl.ts" "$@"
 }
 
+_rt_pid_alive() {
+  emulate -L zsh
+  local pid_file="$1" pid=""
+  [[ -f "$pid_file" ]] || return 1
+  pid="$(<"$pid_file")" 2>/dev/null || return 1
+  pid="${pid//[[:space:]]/}"
+  [[ "$pid" =~ '^[0-9]+$' ]] || return 1
+  (( pid > 0 )) || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
 # 按 ~/.harness-remote/config.json 的 webExposure 同步 web-server 与 relay-agent 状态。
-# 配置不存在且本 shell 已检查过时走快路径；任何错误只告警，绝不阻断前台会话。
+# 配置不存在或 webExposure=off/已就绪时走零 fork 快路径；任何错误只告警，绝不阻断前台会话。
 _rt_ensure_server() {
-  local node_bin="$(_rt_node)"
-  command -v "$node_bin" >/dev/null 2>&1 || return 0
+  emulate -L zsh
   local state_dir="${HARNESS_REMOTE_DIR:-$HOME/.harness-remote}"
   local cfg="${HARNESS_REMOTE_CONFIG:-$state_dir/config.json}"
   if [[ ! -f "$cfg" && "${_HARNESS_REMOTE_ENSURED:-}" == "1" ]]; then
@@ -25,6 +35,29 @@ _rt_ensure_server() {
   fi
   # 依赖尚未安装时静默跳过（提示由 init-remote.sh / rtctl status 承担）
   [[ -d "${_HARNESS_REMOTE_ROOT}/node_modules" ]] || return 0
+  if [[ -f "$cfg" ]]; then
+    local cfg_raw="" exposure=""
+    cfg_raw="$(<"$cfg")" 2>/dev/null || cfg_raw=""
+    if [[ "$cfg_raw" =~ '"webExposure"[[:space:]]*:[[:space:]]*"([^"]*)"' ]]; then
+      exposure="${match[1]}"
+    fi
+    if [[ "$exposure" == "off" ]]; then
+      if ! _rt_pid_alive "$state_dir/web.pid" && ! _rt_pid_alive "$state_dir/agent.pid"; then
+        typeset -g _HARNESS_REMOTE_ENSURED=1
+        return 0
+      fi
+    elif [[ "$exposure" == "lan" && "${_HARNESS_REMOTE_ENSURED:-}" == "1" ]]; then
+      if _rt_pid_alive "$state_dir/web.pid" && ! _rt_pid_alive "$state_dir/agent.pid"; then
+        return 0
+      fi
+    elif [[ "$exposure" == "public" && "${_HARNESS_REMOTE_ENSURED:-}" == "1" ]]; then
+      if _rt_pid_alive "$state_dir/web.pid" && _rt_pid_alive "$state_dir/agent.pid"; then
+        return 0
+      fi
+    fi
+  fi
+  local node_bin="${HARNESS_REMOTE_NODE:-node}"
+  command -v "$node_bin" >/dev/null 2>&1 || return 0
   "$node_bin" "${_HARNESS_REMOTE_ROOT}/scripts/remote-ctl.ts" ensure || true
   typeset -g _HARNESS_REMOTE_ENSURED=1
   return 0

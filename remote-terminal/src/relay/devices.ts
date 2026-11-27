@@ -2,7 +2,8 @@
  * 可信设备存储：devices.json / pair-pending.json 的锁协议读写与批准/吊销逻辑。
  * 所有运行时文件均保存在 stateDir（默认 ~/.harness-remote/），权限 0600。
  */
-import { appendFile, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { appendFile, link, lstat, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { PAIR_TTL_MS } from "../protocol.ts";
 
@@ -48,9 +49,14 @@ async function readJsonArray<T>(file: string): Promise<T[]> {
 }
 
 async function atomicWriteJson(file: string, value: unknown): Promise<void> {
-  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
-  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  await rename(tmp, file);
+  const tmp = `${file}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    await rename(tmp, file);
+  } catch (error) {
+    await unlink(tmp).catch(() => {});
+    throw error;
+  }
 }
 
 function pidAlive(pid: number): boolean {
@@ -62,41 +68,158 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-export async function withDeviceLock<T>(stateDir: string, fn: () => Promise<T>): Promise<T> {
-  await mkdir(stateDir, { recursive: true, mode: 0o700 });
-  const lockFile = path.join(stateDir, "devices.lock");
-  const deadline = Date.now() + 5_000;
-  for (;;) {
-    try {
-      const handle = await open(lockFile, "wx", 0o600);
-      try {
-        await handle.writeFile(String(process.pid));
-      } finally {
-        await handle.close();
-      }
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      let stale = false;
-      try {
-        const pid = Number.parseInt((await readFile(lockFile, "utf8")).trim(), 10);
-        stale = !Number.isInteger(pid) || pid <= 0 || !pidAlive(pid);
-      } catch {
-        stale = true;
-      }
-      if (stale) {
-        await unlink(lockFile).catch(() => {});
-        continue;
-      }
-      if (Date.now() > deadline) throw new Error("设备存储锁等待超时：可能有其他 rtctl 命令正在执行，请稍后重试");
-      await new Promise((resolve) => setTimeout(resolve, 50));
+type LockPayload = { pid: number; token: string | null };
+
+function parseLockPayload(raw: string): LockPayload | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = JSON.parse(trimmed) as { pid?: unknown; token?: unknown };
+    if (typeof parsed.pid === "number" && Number.isInteger(parsed.pid) && parsed.pid > 0) {
+      const token = typeof parsed.token === "string" && parsed.token.length > 0 ? parsed.token : null;
+      return { pid: parsed.pid, token };
+    }
+  } catch {
+    if (/^\d+$/.test(trimmed)) {
+      const pid = Number.parseInt(trimmed, 10);
+      if (Number.isInteger(pid) && pid > 0) return { pid, token: null };
     }
   }
+  return null;
+}
+
+async function writeLockTemp(lockFile: string, payload: { pid: number; token: string }): Promise<{ tmpPath: string; ino: number | bigint }> {
+  const tmpPath = `${lockFile}.tmp-${process.pid}-${randomUUID()}`;
+  const handle = await open(tmpPath, "wx", 0o600);
+  try {
+    await handle.writeFile(JSON.stringify(payload));
+    const st = await handle.stat();
+    return { tmpPath, ino: st.ino };
+  } catch (error) {
+    await unlink(tmpPath).catch(() => {});
+    throw error;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function tryReclaimStaleLock(lockFile: string): Promise<boolean> {
+  let st: Awaited<ReturnType<typeof lstat>>;
+  let raw: string;
+  try {
+    st = await lstat(lockFile);
+    raw = await readFile(lockFile, "utf8");
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  }
+
+  const observed = parseLockPayload(raw);
+  const hasToken = observed !== null && observed.token !== null;
+  const isDead = observed === null || !pidAlive(observed.pid);
+  const graceExpired = Date.now() - st.mtimeMs > 2_000;
+  if (!isDead || (!hasToken && !graceExpired)) return false;
+
+  const reclaimFile = `${lockFile}.reclaim`;
+  const { tmpPath: reclaimTmp, ino: reclaimIno } = await writeLockTemp(reclaimFile, {
+    pid: process.pid,
+    token: randomUUID(),
+  });
+  try {
+    await link(reclaimTmp, reclaimFile);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    try {
+      const rSt = await lstat(reclaimFile);
+      const rRaw = await readFile(reclaimFile, "utf8");
+      const rObserved = parseLockPayload(rRaw);
+      if ((rObserved === null || !pidAlive(rObserved.pid)) && Date.now() - rSt.mtimeMs > 5_000) {
+        await unlink(reclaimFile).catch(() => {});
+      }
+    } catch {
+      // 忽略
+    }
+    return false;
+  } finally {
+    await unlink(reclaimTmp).catch(() => {});
+  }
+
+  try {
+    const curSt = await lstat(lockFile);
+    const curRaw = await readFile(lockFile, "utf8");
+    const cur = parseLockPayload(curRaw);
+    if (curSt.ino === st.ino) {
+      const stillDead = hasToken
+        ? cur !== null && cur.token === observed!.token && !pidAlive(cur.pid)
+        : (cur === null || (cur.token === null && !pidAlive(cur.pid))) && Date.now() - curSt.mtimeMs > 2_000;
+      if (stillDead) {
+        await unlink(lockFile).catch(() => {});
+        return true;
+      }
+    }
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  } finally {
+    try {
+      const curReclaimSt = await lstat(reclaimFile);
+      if (curReclaimSt.ino === reclaimIno) await unlink(reclaimFile);
+    } catch {
+      // 忽略
+    }
+  }
+}
+
+/** 使用临时文件 + link 原子发布与 .reclaim 互斥回收协议的跨进程文件锁 */
+export async function withFileLock<T>(
+  stateDir: string,
+  lockName: string,
+  options: { timeoutMs: number; pollMs: number; timeoutMessage: string },
+  fn: () => Promise<T>,
+): Promise<T> {
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
+  const lockFile = path.join(stateDir, lockName);
+  const { tmpPath, ino: myIno } = await writeLockTemp(lockFile, { pid: process.pid, token: randomUUID() });
+  const deadline = Date.now() + options.timeoutMs;
+
+  try {
+    for (;;) {
+      try {
+        await link(tmpPath, lockFile);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        if (await tryReclaimStaleLock(lockFile)) continue;
+        if (Date.now() > deadline) throw new Error(options.timeoutMessage);
+        await new Promise((resolve) => setTimeout(resolve, options.pollMs));
+      }
+    }
+  } finally {
+    await unlink(tmpPath).catch(() => {});
+  }
+
   try {
     return await fn();
   } finally {
-    await unlink(lockFile).catch(() => {});
+    try {
+      const st = await lstat(lockFile);
+      if (st.ino === myIno) await unlink(lockFile);
+    } catch {
+      // 忽略
+    }
   }
+}
+
+export async function withDeviceLock<T>(stateDir: string, fn: () => Promise<T>): Promise<T> {
+  return withFileLock(
+    stateDir,
+    "devices.lock",
+    {
+      timeoutMs: 5_000,
+      pollMs: 50,
+      timeoutMessage: "设备存储锁等待超时：可能有其他 rtctl 命令正在执行，请稍后重试",
+    },
+    fn,
+  );
 }
 
 export async function readDevices(stateDir: string): Promise<DeviceRecord[]> {
