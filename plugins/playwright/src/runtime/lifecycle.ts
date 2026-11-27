@@ -1,11 +1,12 @@
-import { fork } from 'node:child_process';
+import { execFile, fork, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createConnection, createServer, type Socket } from 'node:net';
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import {
   bounded, CLOSE_TIMEOUT_MS, MAX_WIRE_BYTES, REQUEST_TIMEOUT_MS, RuntimeFault, fault,
   safeError, safeName, validateCommand, validateOptions, validateSafeResult, WIRE_TIMEOUT_MS,
@@ -13,7 +14,17 @@ import {
   type RuntimeRef, type RuntimeScope, type SafeResult, type Session, type WireReply, type WireRequest,
 } from './contracts.ts';
 
-type Ownership = { nonce: string; instance: string; kind: 'named' | 'temporary'; profile: string };
+const execFileAsync = promisify(execFile);
+const RECLAIM_STALE_MS = 5000;
+
+type Ownership = {
+  nonce: string;
+  instance: string;
+  kind: 'named' | 'temporary';
+  profile: string;
+  daemonPid?: number;
+  daemonSignature?: string;
+};
 type Metadata = { nonce: string; ready: ReadyState };
 export async function resolveScope(): Promise<RuntimeScope> {
   const home = await realpath(homedir());
@@ -54,7 +65,181 @@ export function socketPath(ref: RuntimeRef): string {
   if (Buffer.byteLength(path) >= 100) fault('config', 'socket-path-too-long'); return path;
 }
 async function writePrivate(path: string, data: unknown): Promise<void> {
-  await writeFile(path, JSON.stringify(data), { flag: 'wx', mode: 0o600 });
+  const tmp = `${path}.tmp-${process.pid}-${randomUUID()}`;
+  await writeFile(tmp, JSON.stringify(data), { flag: 'wx', mode: 0o600 });
+  try {
+    await link(tmp, path);
+  } finally {
+    await unlink(tmp).catch(() => {});
+  }
+}
+
+async function getProcessSignature(pid: number): Promise<string | null> {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const { stdout } = await execFileAsync('ps', ['-p', String(pid), '-o', 'lstart='], {
+      env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' },
+      encoding: 'utf8',
+      timeout: 2000,
+    });
+    const sig = stdout.trim();
+    return sig.length > 0 ? sig : null;
+  } catch {
+    return null;
+  }
+}
+
+async function isProcessAlive(pid: number, expectedSignature?: unknown): Promise<boolean> {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+  } catch (e: any) {
+    if (e?.code === 'ESRCH') return false;
+    return true;
+  }
+  if (typeof expectedSignature === 'string' && expectedSignature.length > 0) {
+    const currentSig = await getProcessSignature(pid);
+    if (currentSig === null) return false;
+    return currentSig === expectedSignature;
+  }
+  return true;
+}
+
+async function isSocketReachable(sockPath: string): Promise<boolean> {
+  try {
+    const s = await lstat(sockPath);
+    if (!s.isSocket()) return false;
+  } catch (e: any) {
+    if (e?.code === 'ENOENT') return false;
+    return true;
+  }
+  return await new Promise<boolean>((resolveReachable) => {
+    let settled = false;
+    const sock = createConnection(sockPath);
+    const done = (reachable: boolean) => {
+      if (settled) return;
+      settled = true;
+      sock.destroy();
+      resolveReachable(reachable);
+    };
+    sock.setTimeout(500, () => done(true));
+    sock.once('connect', () => done(true));
+    sock.once('error', (e: any) => {
+      if (e?.code === 'ENOENT' || e?.code === 'ECONNREFUSED' || e?.code === 'ENOTSOCK') done(false);
+      else done(true);
+    });
+  });
+}
+
+async function isSingletonLockAlive(profileDir: string): Promise<boolean> {
+  const lockPath = join(profileDir, 'SingletonLock');
+  let target: string;
+  try {
+    target = await readlink(lockPath);
+  } catch (e: any) {
+    if (e?.code === 'ENOENT') return false;
+    return true;
+  }
+  const match = /-(\d+)$/.exec(target);
+  if (!match) return true;
+  const pid = Number(match[1]);
+  if (!Number.isInteger(pid) || pid <= 0) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: any) {
+    return e?.code !== 'ESRCH';
+  }
+}
+
+async function readOwnerRecord(ownerPath: string): Promise<Record<string, unknown> | null> {
+  try {
+    const s = await lstat(ownerPath);
+    if (!s.isFile() || s.isSymbolicLink() || s.uid !== process.getuid?.()) return null;
+    const parsed = JSON.parse(await readFile(ownerPath, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+async function tryAcquireReclaimLock(reclaimPath: string, tmpPath: string): Promise<boolean> {
+  try {
+    await link(tmpPath, reclaimPath);
+    return true;
+  } catch (e: any) {
+    if (e?.code !== 'EEXIST') return false;
+  }
+  try {
+    const stat = await lstat(reclaimPath);
+    if (Date.now() - stat.mtimeMs <= RECLAIM_STALE_MS) return false;
+    const existing = await readOwnerRecord(reclaimPath);
+    if (!existing || typeof existing.pid !== 'number' || await isProcessAlive(existing.pid, existing.signature)) {
+      return false;
+    }
+    await unlink(reclaimPath).catch(() => {});
+    await link(tmpPath, reclaimPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function withReclaimLock(
+  reclaimPath: string,
+  inUseStage: string,
+  inUseCode: string,
+  fn: () => Promise<void>,
+): Promise<void> {
+  const tmpPath = `${reclaimPath}.tmp-${process.pid}-${randomUUID()}`;
+  const signature = await getProcessSignature(process.pid);
+  await writeFile(
+    tmpPath,
+    JSON.stringify({ pid: process.pid, signature, token: randomUUID() }),
+    { flag: 'wx', mode: 0o600 },
+  );
+  let acquired = false;
+  try {
+    acquired = await tryAcquireReclaimLock(reclaimPath, tmpPath);
+  } finally {
+    await unlink(tmpPath).catch(() => {});
+  }
+  if (!acquired) fault(inUseStage, inUseCode);
+  try {
+    await fn();
+  } finally {
+    await unlink(reclaimPath).catch(() => {});
+  }
+}
+
+async function acquireExclusiveDirectory(
+  targetDir: string,
+  inUseStage: string,
+  inUseCode: string,
+  canReclaim: () => Promise<boolean>,
+): Promise<void> {
+  try {
+    await mkdir(targetDir, { mode: 0o700 });
+    return;
+  } catch (e: any) {
+    if (e?.code !== 'EEXIST') fault(inUseStage, inUseCode);
+  }
+  await withReclaimLock(`${targetDir}.reclaim`, inUseStage, inUseCode, async () => {
+    let dirStat;
+    try {
+      dirStat = await lstat(targetDir);
+    } catch (e: any) {
+      if (e?.code === 'ENOENT') return;
+      fault(inUseStage, inUseCode);
+    }
+    if (!dirStat.isDirectory() || dirStat.isSymbolicLink() || dirStat.uid !== process.getuid?.()) {
+      fault(inUseStage, inUseCode);
+    }
+    if (!await canReclaim()) fault(inUseStage, inUseCode);
+    await rm(targetDir, { recursive: true });
+  });
+  await mkdir(targetDir, { mode: 0o700 }).catch(() => fault(inUseStage, inUseCode));
 }
 async function readMetadata(ref: RuntimeRef): Promise<Metadata | null> {
   const directory = statePath(ref);
@@ -101,6 +286,47 @@ async function wire(ref: RuntimeRef, command: WireRequest['command']): Promise<S
 function sdkInstalled(): boolean {
   try { createRequire(import.meta.url).resolve('playwright'); return true; } catch { return false; }
 }
+function waitForChildExit(child: ChildProcess, ms: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise<boolean>((resolveExit) => {
+    let done = false;
+    const onExit = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(t);
+      resolveExit(true);
+    };
+    const t = setTimeout(() => {
+      if (done) return;
+      done = true;
+      child.removeListener('exit', onExit);
+      resolveExit(false);
+    }, ms);
+    child.once('exit', onExit);
+  });
+}
+
+async function terminateChild(child: ChildProcess): Promise<void> {
+  try {
+    if (child.connected) child.send({ cancel: true });
+  } catch {}
+  if (await waitForChildExit(child, 300)) return;
+  if (child.exitCode === null && child.signalCode === null) {
+    if (child.pid) {
+      try { process.kill(-child.pid, 'SIGTERM'); } catch {}
+    }
+    try { child.kill('SIGTERM'); } catch {}
+    if (await waitForChildExit(child, 500)) return;
+  }
+  if (child.exitCode === null && child.signalCode === null) {
+    if (child.pid) {
+      try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+    }
+    try { child.kill('SIGKILL'); } catch {}
+    await waitForChildExit(child, 500);
+  }
+}
+
 export async function startRuntime(scope: RuntimeScope, options: RuntimeOptions, launch?: { daemonPath: string }): Promise<ReadyState> {
   validateOptions(options); await validateScope(scope); socketPath({ scope, instance: options.instance });
   if (!launch && !sdkInstalled()) fault('browser', 'sdk-missing');
@@ -111,18 +337,21 @@ export async function startRuntime(scope: RuntimeScope, options: RuntimeOptions,
   });
   return await new Promise((done, reject) => {
     let settled = false;
+    let timingOut = false;
     const finish = (error?: unknown, ready?: ReadyState) => {
       if (settled) return; settled = true; clearTimeout(timer);
       if (child.connected) child.disconnect(); child.unref();
       error ? reject(error) : done(ready!);
     };
     const timer = setTimeout(() => {
-      if (child.connected) child.send({ cancel: true });
-      finish(new RuntimeFault('browser', 'startup-timeout'));
+      if (settled || timingOut) return;
+      timingOut = true;
+      void terminateChild(child).finally(() => finish(new RuntimeFault('browser', 'startup-timeout')));
     }, options.startupTimeoutMs + 1000);
-    child.on('error', () => finish(new RuntimeFault('browser', 'daemon-start-failed')));
-    child.on('exit', () => finish(new RuntimeFault('browser', 'daemon-start-failed')));
+    child.on('error', () => { if (!timingOut) finish(new RuntimeFault('browser', 'daemon-start-failed')); });
+    child.on('exit', () => { if (!timingOut) finish(new RuntimeFault('browser', 'daemon-start-failed')); });
     child.on('message', (m: any) => {
+      if (timingOut) return;
       if (m.ready) finish(undefined, m.ready);
       else if (m.error) finish(new RuntimeFault(m.error.stage, m.error.code));
     });
@@ -134,8 +363,18 @@ export async function getRuntimeStatus(ref: RuntimeRef): Promise<ReadyState | nu
 }
 export async function listRuntimeInstances(scope: RuntimeScope): Promise<ReadyState[]> {
   if (!await exists(scope.stateRoot)) return []; await privateDirectory(scope.stateRoot);
-  const results = [];
-  for (const name of await readdir(scope.stateRoot)) { safeName(name); const status = await getRuntimeStatus({ scope, instance: name }); if (status) results.push(status); }
+  const results: ReadyState[] = [];
+  for (const name of await readdir(scope.stateRoot)) {
+    if (name.startsWith('.') || name.endsWith('.reclaim')) continue;
+    try {
+      safeName(name);
+      const status = await getRuntimeStatus({ scope, instance: name });
+      if (status) results.push(status);
+    } catch (error) {
+      const code = error instanceof RuntimeFault ? error.code : 'unknown-error';
+      console.error(`[playwright] skipping broken or unreachable instance "${name}": ${code}`);
+    }
+  }
   return results;
 }
 export async function sendRuntimeCommand(ref: RuntimeRef, command: Command): Promise<SafeResult> {
@@ -184,14 +423,52 @@ export async function serveRuntime(scope: RuntimeScope, options: RuntimeOptions,
   try {
     const checkCancelled = () => { if (signal?.aborted) fault('browser', 'startup-cancelled'); };
     checkCancelled();
-    await mkdir(directory, { mode: 0o700 }).catch(() => fault('profile', 'instance-in-use'));
-    acquiredState = true; await writePrivate(join(directory, 'owner.json'), { nonce, instance: options.instance });
+    const daemonSignature = await getProcessSignature(process.pid);
+    await acquireExclusiveDirectory(directory, 'profile', 'instance-in-use', async () => {
+      const owner = await readOwnerRecord(join(directory, 'owner.json'));
+      if (!owner || typeof owner.daemonPid !== 'number' || !Number.isInteger(owner.daemonPid) || owner.daemonPid <= 0) {
+        return false;
+      }
+      if (await isProcessAlive(owner.daemonPid, owner.daemonSignature)) return false;
+      if (await isSocketReachable(socket)) return false;
+      return true;
+    });
+    acquiredState = true;
+    await writePrivate(join(directory, 'owner.json'), {
+      nonce,
+      instance: options.instance,
+      daemonPid: process.pid,
+      ...(daemonSignature ? { daemonSignature } : {}),
+    });
     profile = options.profile ? join(scope.profileRoot, options.profile) : await mkdtemp(join(scope.profileRoot, 'tmp-'));
     await privateDirectory(profile);
     if (await exists(join(profile, '.pi-playwright.lock'))) fault('profile', 'profile-in-use');
     lease = join(profile, '.sdk-lease');
-    await mkdir(lease, { mode: 0o700 }).catch(() => fault('profile', 'profile-in-use')); acquiredLease = true;
-    ownership = { nonce, instance: options.instance, profile, kind: options.profile ? 'named' : 'temporary' };
+    await acquireExclusiveDirectory(lease, 'profile', 'profile-in-use', async () => {
+      const owner = await readOwnerRecord(join(lease, 'owner.json'));
+      if (!owner || typeof owner.daemonPid !== 'number' || !Number.isInteger(owner.daemonPid) || owner.daemonPid <= 0) {
+        return false;
+      }
+      if (await isProcessAlive(owner.daemonPid, owner.daemonSignature)) return false;
+      if (typeof owner.instance !== 'string') return false;
+      try {
+        safeName(owner.instance);
+        if (await isSocketReachable(socketPath({ scope, instance: owner.instance }))) return false;
+      } catch {
+        return false;
+      }
+      if (options.profile && await isSingletonLockAlive(profile)) return false;
+      return true;
+    });
+    acquiredLease = true;
+    ownership = {
+      nonce,
+      instance: options.instance,
+      profile,
+      kind: options.profile ? 'named' : 'temporary',
+      daemonPid: process.pid,
+      ...(daemonSignature ? { daemonSignature } : {}),
+    };
     await writePrivate(join(lease, 'owner.json'), ownership);
     // artifact 留给用户消费，不能在 stop 时删除截图。
     const artifactRoot = join(scope.artifactRoot, options.instance); await privateDirectory(artifactRoot);
