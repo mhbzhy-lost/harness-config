@@ -178,71 +178,6 @@ class AgySyncTest(unittest.TestCase):
         )
         self.assertIn("parent agent owns root-cause analysis", body)
 
-    def test_subagent_model_router_hook_behavior(self) -> None:
-        hook_path = ROOT / "agy/hooks/subagent-model-router.py"
-        self.assertTrue(hook_path.exists())
-
-        def run_hook(stdin_text: str) -> dict:
-            res = subprocess.run(
-                ["python3", str(hook_path)],
-                input=stdin_text,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(res.returncode, 0, msg=res.stderr)
-            return json.loads(res.stdout)
-
-        # 1. 内置 research 缺省 Model → 机械兜底 flash
-        self.assertEqual(
-            run_hook(
-                json.dumps(
-                    {"toolCall": {"name": "invoke_subagent", "args": {"TypeName": "research"}}}
-                )
-            ),
-            {"decision": "allow", "overwrite": {"Model": "flash"}},
-        )
-        # 2. 内置 research 传 inherit → 同样兜底 flash
-        self.assertEqual(
-            run_hook(
-                json.dumps(
-                    {
-                        "toolCall": {
-                            "name": "invoke_subagent",
-                            "args": {"TypeName": "research", "Model": "inherit"},
-                        }
-                    }
-                )
-            ),
-            {"decision": "allow", "overwrite": {"Model": "flash"}},
-        )
-        # 3. 显式指定 pro / flash_lite → 原样放行不覆盖
-        for explicit in ("pro", "flash_lite", "flash"):
-            self.assertEqual(
-                run_hook(
-                    json.dumps(
-                        {
-                            "toolCall": {
-                                "name": "invoke_subagent",
-                                "args": {"TypeName": "research", "Model": explicit},
-                            }
-                        }
-                    )
-                ),
-                {"decision": "allow"},
-            )
-        # 4. 其他 subagent（self / test-runner）→ 原样放行
-        self.assertEqual(
-            run_hook(
-                json.dumps(
-                    {"toolCall": {"name": "invoke_subagent", "args": {"TypeName": "self"}}}
-                )
-            ),
-            {"decision": "allow"},
-        )
-        # 5. 非法输入 → fail-open 放行
-        self.assertEqual(run_hook("not-json"), {"decision": "allow"})
-
     def test_swarm_model_guard_hook_behavior(self) -> None:
         hook_path = ROOT / "agy/hooks/swarm-model-guard.py"
         self.assertTrue(hook_path.exists())
@@ -368,6 +303,188 @@ class AgySyncTest(unittest.TestCase):
         )
         # 8. 非法 JSON → fail-open 放行
         self.assertEqual(run_hook("not-json"), {"decision": "allow"})
+
+    def test_git_commit_guard_hook_behavior(self) -> None:
+        hook_path = ROOT / "agy/hooks/git-commit-guard.py"
+        self.assertTrue(hook_path.exists())
+        self.assertTrue(os.access(hook_path, os.X_OK), msg="hook 必须可执行")
+
+        def run_hook(stdin_text: str) -> dict:
+            res = subprocess.run(
+                ["python3", str(hook_path)],
+                input=stdin_text,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            return json.loads(res.stdout)
+
+        def cmd_call(command_line: str, name: str = "run_command") -> str:
+            return json.dumps(
+                {"toolCall": {"name": name, "args": {"CommandLine": command_line}}}
+            )
+
+        def assert_allow(command_line: str) -> None:
+            self.assertEqual(
+                run_hook(cmd_call(command_line)),
+                {"decision": "allow"},
+                msg=command_line,
+            )
+
+        def assert_deny(command_line: str, reason_part: str | None = None) -> None:
+            out = run_hook(cmd_call(command_line))
+            self.assertEqual(out.get("decision"), "deny", msg=command_line)
+            self.assertTrue(out.get("reason"), msg=command_line)
+            if reason_part:
+                self.assertIn(reason_part, out["reason"], msg=command_line)
+
+        # 1. 合规提交：无 scope / 带 scope / 多 -m / 组合短参数 / 附着值 / = 形式
+        for command in (
+            'git commit -m "feat: 增加登录功能"',
+            "git commit -m 'fix(auth): 修复登录超时'",
+            "git commit -m 'feat: 增加功能' -m '补充背景说明'",
+            'git commit -am "fix: 修复崩溃"',
+            'git commit -asm "fix: 修复崩溃"',
+            "git commit -m'feat: 增加功能'",
+            "git commit --message='feat: 增加功能'",
+            "git commit --message 'feat: 增加功能'",
+        ):
+            assert_allow(command)
+        # 2. git1 / 绝对路径 / git 全局选项（含带值与 = 形式）
+        for command in (
+            'git1 commit -m "feat: 增加功能"',
+            '/usr/bin/git commit -m "feat: 增加功能"',
+            '/opt/homebrew/bin/git1 commit -m "feat: 增加功能"',
+            'git -C /repo -c user.name=x --no-pager commit -m "feat: 增加功能"',
+            'git --git-dir=/x --work-tree /y --namespace ns commit -m "feat: 增加功能"',
+            'git -p --bare --config-env=K=V --super-prefix=/p commit -m "feat: 增加功能"',
+        ):
+            assert_allow(command)
+        # 3. --help / -h / --amend --no-edit（不带 -m）放行
+        assert_allow("git commit --help")
+        assert_allow("git commit -h")
+        assert_allow("git commit --amend --no-edit")
+        # 4. 非 commit 子命令 / 非 git 命令 → 原样放行
+        for command in (
+            "git status",
+            "git push origin main",
+            "git log --oneline",
+            "ls -la",
+            'echo "git commit -m bad"',
+        ):
+            assert_allow(command)
+        # 5. 单引号内的字面反引号与 $() 允许
+        assert_allow("git commit -m 'fix: 修复 `date` 与 $(pwd) 字面量说明'")
+        # 6. 命令前缀剥离：VAR=val / env / sudo / command / nohup / time
+        assert_allow('VAR=1 env FOO=bar sudo -u me git commit -m "feat: 增加功能"')
+        assert_allow('command git commit -m "feat: 增加功能"')
+        assert_allow('nohup time git commit -m "feat: 增加功能"')
+        # 7. 复合命令 / 子 shell / 换行 / sh -c 嵌套（含组合短参数）合规放行
+        for command in (
+            "git add -u && git commit -m 'feat: 增加功能'",
+            "echo hi; git commit -m 'feat: 增加功能' | tee log",
+            "git commit -m 'feat: 增加功能' && git push",
+            "(git commit -m 'feat: 增加功能')",
+            "git status\ngit commit -m 'feat: 增加功能'",
+            'bash -lc "git commit -m \'feat: 增加功能\'"',
+            "sh -c 'git commit -m \"feat: 增加功能\"'",
+            'zsh -c "git commit -m \'feat: 增加功能\'"',
+        ):
+            assert_allow(command)
+        # 8. 非 run_command 工具 / 缺名兜底 / 非法输入 fail-open
+        self.assertEqual(
+            run_hook(cmd_call("git commit", name="read_file")),
+            {"decision": "allow"},
+        )
+        self.assertEqual(
+            run_hook(json.dumps({"toolCall": {"args": {"CommandLine": "git commit"}}})).get(
+                "decision"
+            ),
+            "deny",
+        )
+        for raw in ("not-json", "", "[1,2]", '{"toolCall": "oops"}'):
+            self.assertEqual(run_hook(raw), {"decision": "allow"}, msg=raw)
+        self.assertEqual(run_hook(cmd_call("")), {"decision": "allow"})
+        self.assertEqual(
+            run_hook(json.dumps({"toolCall": {"name": "run_command", "args": {}}})),
+            {"decision": "allow"},
+        )
+        # 9. 首行格式与 type 白名单
+        assert_deny('git commit -m "增加功能"', "格式")
+        assert_deny('git commit -m "feature: 增加功能"', "type")
+        assert_deny('git commit -m "Fix: 增加功能"', "type")
+        assert_deny('git commit -m "fix( ): 增加功能"', "scope")
+        # 10. 中文 / 长度 / 句号 / 过去时 / 零信息词
+        assert_deny('git commit -m "fix: repair login"', "中文")
+        assert_deny('git commit -m "fix: ' + "修" * 51 + '"', "50")
+        assert_allow('git commit -m "fix: ' + "修" * 50 + '"')
+        assert_deny('git commit -m "fix: 修复登录。"', "句号")
+        assert_deny('git commit -m "fix: 修复登录."', "句号")
+        assert_deny('git commit -m "fix: 已修复登录"', "过去时")
+        assert_deny('git commit -m "fix: 修复了登录"', "过去时")
+        assert_deny('git commit -m "refactor: 已重构连接层"', "过去时")
+        # 「已+非动词集」不构成过去时，不误杀
+        assert_allow('git commit -m "feat: 已读回执支持列表展示"')
+        assert_deny('git commit -m "chore: update"', "零信息")
+        assert_deny('git commit -m "chore: WIP"', "零信息")
+        assert_deny('git commit -m "chore: 修改"', "零信息")
+        assert_deny('git commit -m "chore: 更新"', "零信息")
+        # 11. AI 署名（subject 或 body）
+        assert_deny(
+            'git commit -m "feat: 增加功能" -m "Co-Authored-By: Claude <x@y>"',
+            "AI 署名",
+        )
+        assert_deny(
+            'git commit -m "feat: 增加功能" -m "Co-Authored-By: Cursor <x@y>"',
+            "AI 署名",
+        )
+        assert_deny('git commit -m "feat: 增加功能" -m "Generated with Claude Code"', "Generated")
+        assert_deny('git commit -m "feat: 增加功能" -m "Generated by Copilot"', "Generated")
+        assert_deny('git commit -m "feat: 增加功能" -m "AI-assisted"', "AI-assisted")
+        assert_deny(
+            'git commit -m "feat: 增加功能" -m "🤖 generated with some tool"',
+            "Generated",
+        )
+        assert_deny('git commit -m "feat: 增加功能" -m "generated by AI"', "Generated")
+        # 不含 AI 标识的正常 generated 说明不误杀
+        assert_allow('git commit -m "feat: 增加功能" -m "generated by protoc"')
+        assert_allow('git commit -m "feat: 增加功能" -m "generated with scripts/gen.py"')
+        # 人工署名不拦截
+        assert_allow('git commit -m "feat: 增加功能" -m "Co-Authored-By: Zhang San <z@x>"')
+        # 12. 缺省 -m / --amend 缺 --no-edit / -F 系列
+        assert_deny("git commit", "-m")
+        assert_deny("git commit -a", "-m")
+        assert_deny("git commit --amend", "-m")
+        assert_deny("git commit -F msg.txt", "-m")
+        assert_deny("git commit --file msg.txt", "-m")
+        assert_deny("git commit --file=msg.txt", "-m")
+        assert_deny("git commit -aF msg.txt", "-m")
+        assert_deny("git commit -m 'feat: 增加功能' -F msg.txt", "-m")
+        # 13. 嵌套 / 复合命令中的违规提交同样拦截
+        assert_deny('sh -c "git commit -m \'fix: repair\'"', "中文")
+        assert_deny("bash -lc 'git commit -m \"fix: repair\"'", "中文")
+        assert_deny('git add . && git commit -m "fix: repair"', "中文")
+        assert_deny('git status; git commit', "-m")
+        assert_deny('(git commit -m "fix: repair")', "中文")
+        assert_deny('sudo git commit -m "fix: repair"', "中文")
+        assert_deny('git -C /repo commit -F msg.txt', "-m")
+        # 14. 命令替换 / $'...' 绕过 → 拒绝
+        assert_deny('git commit -m "$(cat msg.txt)"', "命令替换")
+        assert_deny("git commit -m `cat msg.txt`", "命令替换")
+        assert_deny("git commit -m $'feat: 增加功能'", "$'")
+        assert_deny("git commit --message=$(cat msg.txt)", "命令替换")
+        # 非 git 相关的 shell -c 命令替换 / $'...' 不误杀
+        assert_allow('bash -c "echo $(pwd)"')
+        assert_allow('sh -c "ls $(date)"')
+        assert_allow('bash -c "echo `date`"')
+        assert_allow("bash -c $'echo hi'")
+        # git 相关的 shell -c 载荷仍拦截命令替换 / $'...' 绕过
+        assert_deny('bash -c "git commit -m \\"$(cat msg.txt)\\""', "命令替换")
+        assert_deny("sh -c \"git commit -m $'feat: 增加功能'\"", "$'")
+        # 15. 多 -m 时首条 -m 首行作为 subject；body 超长不拦截
+        assert_deny('git commit -m "fix: repair" -m "feat: 增加功能"', "中文")
+        assert_allow('git commit -m "feat: 增加功能" -m "' + "长" * 200 + '"')
 
     def test_pi_worker_session_injector_hook_behavior(self) -> None:
         hook_path = ROOT / "agy/hooks/pi-worker-session-injector.py"
@@ -872,15 +989,10 @@ class AgySyncTest(unittest.TestCase):
                 agent_link.resolve(), (ROOT / "agy/agents/test-runner.md").resolve()
             )
 
-            # 5. hooks.json 保留已有 hook 并注入内置子代理档位兜底 hook
+            # 5. hooks.json 保留已有 hook 并注入受管 hooks，不再注入已退役的路由 hook
             merged_hooks = json.loads(hooks_json.read_text(encoding="utf-8"))
             self.assertEqual(merged_hooks["my-custom-hook"], existing_hooks["my-custom-hook"])
-            router_hook = merged_hooks["harness-config-subagent-model-router"]
-            self.assertEqual(router_hook["PreToolUse"][0]["matcher"], "invoke_subagent")
-            self.assertIn(
-                str(ROOT / "agy/hooks/subagent-model-router.py"),
-                router_hook["PreToolUse"][0]["hooks"][0]["command"],
-            )
+            self.assertNotIn("harness-config-subagent-model-router", merged_hooks)
             pi_worker_hook = merged_hooks["harness-config-pi-worker-session-injector"]
             self.assertIn(
                 "pi_worker_(start|monitor)",
@@ -895,6 +1007,15 @@ class AgySyncTest(unittest.TestCase):
             self.assertIn(
                 str(ROOT / "agy/hooks/swarm-model-guard.py"),
                 swarm_hook["PreToolUse"][0]["hooks"][0]["command"],
+            )
+            commit_hook = merged_hooks["harness-config-git-commit-guard"]
+            self.assertEqual(commit_hook["PreToolUse"][0]["matcher"], "run_command")
+            self.assertIn(
+                str(ROOT / "agy/hooks/git-commit-guard.py"),
+                commit_hook["PreToolUse"][0]["hooks"][0]["command"],
+            )
+            self.assertEqual(
+                commit_hook["PreToolUse"][0]["hooks"][0].get("timeout"), 5
             )
             self.assertEqual(stat.S_IMODE(hooks_json.stat().st_mode), 0o600)
             self.assertEqual(len(list(config_dir.glob("hooks.json.bak.*"))), 1)
@@ -937,6 +1058,111 @@ class AgySyncTest(unittest.TestCase):
             self.assertEqual(len(list(config_dir.glob("hooks.json.bak.*"))), 1)
             self.assertEqual(shell_rc.read_text(encoding="utf-8"), rc_after_first)
             self.assertEqual(len(list(shell_rc.parent.glob(".zshrc.bak.*"))), 1)
+
+    def test_init_agy_removes_retired_managed_hooks_idempotently(self) -> None:
+        """已退役受管 hook 的幂等清理：--dry-run 只报告不写入，正式同步移除旧 key 且不触碰其他条目。"""
+        retired_key = "harness-config-subagent-model-router"
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "agy-config"
+            config_dir.mkdir(parents=True)
+            settings_path = Path(tmp) / "antigravity-cli" / "settings.json"
+            shell_rc = Path(tmp) / ".zshrc"
+
+            hooks_json = config_dir / "hooks.json"
+            existing_hooks = {
+                retired_key: {
+                    "PreToolUse": [
+                        {
+                            "matcher": "invoke_subagent",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": 'python3 "/old/path/subagent-model-router.py"',
+                                    "timeout": 5,
+                                }
+                            ],
+                        }
+                    ]
+                },
+                "my-custom-hook": {"PostToolUse": []},
+                "harness-config-pi-worker-session-injector": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "old",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": 'python3 "/old/path/pi-worker-session-injector.py"',
+                                    "timeout": 5,
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
+            hooks_text = json.dumps(existing_hooks, ensure_ascii=False, indent=2)
+            hooks_json.write_text(hooks_text, encoding="utf-8")
+
+            env = os.environ.copy()
+            env["AGY_CONFIG_DIR"] = str(config_dir)
+            env["AGY_SETTINGS_PATH"] = str(settings_path)
+            env["AGY_SHELL_RC"] = str(shell_rc)
+
+            def run_init(*args: str) -> subprocess.CompletedProcess:
+                result = subprocess.run(
+                    ["bash", str(ROOT / "init-agy.sh"), *args],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                )
+                return result
+
+            # 1. --dry-run 正确识别并报告将移除的退役 key，不写入任何文件
+            dry = run_init("--dry-run")
+            self.assertIn(
+                f"[dry-run] 将移除已退役受管 hook {retired_key}", dry.stdout
+            )
+            self.assertEqual(hooks_json.read_text(encoding="utf-8"), hooks_text)
+            self.assertEqual(list(config_dir.glob("hooks.json.bak.*")), [])
+
+            # 2. 正式同步：退役 key 被移除，用户自定义 hook 原样保留，其他受管 hook 正常更新
+            first = run_init()
+            self.assertIn(f"已移除退役受管 hook: {retired_key}", first.stdout)
+            merged_hooks = json.loads(hooks_json.read_text(encoding="utf-8"))
+            self.assertNotIn(retired_key, merged_hooks)
+            self.assertEqual(
+                merged_hooks["my-custom-hook"], existing_hooks["my-custom-hook"]
+            )
+            pi_worker_hook = merged_hooks["harness-config-pi-worker-session-injector"]
+            self.assertIn(
+                str(ROOT / "agy/hooks/pi-worker-session-injector.py"),
+                pi_worker_hook["PreToolUse"][0]["hooks"][0]["command"],
+            )
+            for name in (
+                "harness-config-swarm-model-guard",
+                "harness-config-git-commit-guard",
+            ):
+                self.assertIn(name, merged_hooks)
+            self.assertEqual(len(list(config_dir.glob("hooks.json.bak.*"))), 1)
+
+            # 3. 二次运行完全幂等：内容不变、不新增备份
+            second = run_init()
+            self.assertIn("hooks.json 已包含全部受管 hooks，无需写入", second.stdout)
+            self.assertEqual(
+                json.loads(hooks_json.read_text(encoding="utf-8")), merged_hooks
+            )
+            self.assertEqual(len(list(config_dir.glob("hooks.json.bak.*"))), 1)
+
+            # 4. 清理后再跑 --dry-run 不再报告移除
+            dry_again = run_init("--dry-run")
+            self.assertNotIn("将移除已退役受管 hook", dry_again.stdout)
 
     def test_init_agy_skips_regular_rule_file_without_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

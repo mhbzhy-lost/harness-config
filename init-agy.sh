@@ -5,7 +5,7 @@
 #   3. 确保 ~/.gemini/config/skills.json 的 entries 含 <仓库根>/skills（保留已有条目）
 #   4. agy/rules/*.md 逐文件软链接进 ~/.gemini/config/rules/（全局规则）
 #   5. agy/agents/*.md 逐文件软链接进 ~/.gemini/config/agents/（自定义 subagent）
-#   6. 注入受管 hooks（内置 subagent 档位兜底 / pi-worker 会话注入 / swarm 模型守卫）到 ~/.gemini/config/hooks.json（按名幂等管理）
+#   6. 注入受管 hooks（pi-worker 会话注入 / swarm 模型守卫 / git commit 规范守卫）到 ~/.gemini/config/hooks.json（按名幂等管理，并清理已退役受管 hook）
 #   7. agy/shell.zsh 注册 source 进 ~/.zshrc（标记块，幂等；提供 agyui / agyide 代理启动器）
 set -euo pipefail
 
@@ -15,9 +15,9 @@ PLUGINS_SRC="$SCRIPT_DIR/plugins"
 SKILLS_SRC="$SCRIPT_DIR/skills"
 RULES_SRC="$SCRIPT_DIR/agy/rules"
 AGENTS_SRC="$SCRIPT_DIR/agy/agents"
-HOOK_SCRIPT="$SCRIPT_DIR/agy/hooks/subagent-model-router.py"
 PI_WORKER_HOOK_SCRIPT="$SCRIPT_DIR/agy/hooks/pi-worker-session-injector.py"
 SWARM_HOOK_SCRIPT="$SCRIPT_DIR/agy/hooks/swarm-model-guard.py"
+GIT_COMMIT_HOOK_SCRIPT="$SCRIPT_DIR/agy/hooks/git-commit-guard.py"
 SHELL_SNIPPET="$SCRIPT_DIR/agy/shell.zsh"
 
 SETTINGS_TARGET="${AGY_SETTINGS_PATH:-$HOME/.gemini/antigravity-cli/settings.json}"
@@ -63,9 +63,9 @@ done
 
 command -v python3 >/dev/null 2>&1 || die "需要 python3"
 [[ -f "$SETTINGS_TEMPLATE" ]] || die "找不到 AGY 设置模板: $SETTINGS_TEMPLATE"
-[[ -f "$HOOK_SCRIPT" ]] || die "找不到 AGY hook 脚本: $HOOK_SCRIPT"
 [[ -f "$PI_WORKER_HOOK_SCRIPT" ]] || die "找不到 AGY hook 脚本: $PI_WORKER_HOOK_SCRIPT"
 [[ -f "$SWARM_HOOK_SCRIPT" ]] || die "找不到 AGY hook 脚本: $SWARM_HOOK_SCRIPT"
+[[ -f "$GIT_COMMIT_HOOK_SCRIPT" ]] || die "找不到 AGY hook 脚本: $GIT_COMMIT_HOOK_SCRIPT"
 [[ -f "$SHELL_SNIPPET" ]] || die "找不到 AGY shell 片段: $SHELL_SNIPPET"
 
 # --- 1. 深度合并 agy/settings.json ---
@@ -266,27 +266,20 @@ else
 fi
 
 # --- 6. 注入受管 AGY hooks 到 ~/.gemini/config/hooks.json ---
-AGY_SYNC_DRY_RUN="$DRY_RUN" python3 - "$HOOKS_JSON" "$HOOK_SCRIPT" "$PI_WORKER_HOOK_SCRIPT" "$SWARM_HOOK_SCRIPT" <<'PY'
+AGY_SYNC_DRY_RUN="$DRY_RUN" python3 - "$HOOKS_JSON" "$PI_WORKER_HOOK_SCRIPT" "$SWARM_HOOK_SCRIPT" "$GIT_COMMIT_HOOK_SCRIPT" <<'PY'
 import copy, json, os, sys, tempfile
 from datetime import datetime
 
-target_path, router_hook_script, pi_worker_hook_script, swarm_hook_script = sys.argv[1:5]
+(
+    target_path,
+    pi_worker_hook_script,
+    swarm_hook_script,
+    git_commit_hook_script,
+) = sys.argv[1:5]
 dry_run = os.environ.get("AGY_SYNC_DRY_RUN") == "1"
+# 已退役的受管 hook：同步时按名幂等清理，不触碰非受管条目
+retired_managed_hooks = ("harness-config-subagent-model-router",)
 managed_hooks = {
-    "harness-config-subagent-model-router": {
-        "PreToolUse": [
-            {
-                "matcher": "invoke_subagent",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": f'python3 "{router_hook_script}"',
-                        "timeout": 5,
-                    }
-                ],
-            }
-        ]
-    },
     "harness-config-pi-worker-session-injector": {
         "PreToolUse": [
             {
@@ -315,6 +308,20 @@ managed_hooks = {
             }
         ]
     },
+    "harness-config-git-commit-guard": {
+        "PreToolUse": [
+            {
+                "matcher": "run_command",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f'python3 "{git_commit_hook_script}"',
+                        "timeout": 5,
+                    }
+                ],
+            }
+        ]
+    },
 }
 
 existing = {}
@@ -330,6 +337,9 @@ if os.path.exists(target_path):
         sys.exit(f"错误: {target_path} 顶层不是 JSON 对象")
 
 merged = copy.deepcopy(existing)
+removed_retired = [name for name in retired_managed_hooks if name in merged]
+for name in removed_retired:
+    del merged[name]
 for name, spec in managed_hooks.items():
     merged[name] = spec
 
@@ -339,6 +349,8 @@ if merged == existing and os.path.exists(target_path):
 
 if dry_run:
     print(f"[dry-run] hooks.json 目标: {target_path}")
+    for name in removed_retired:
+        print(f"[dry-run] 将移除已退役受管 hook {name}")
     for name in managed_hooks:
         print(f"[dry-run] 将注入/更新 hook {name}")
     sys.exit(0)
@@ -367,6 +379,8 @@ except BaseException:
 print(f"hooks.json 已写入: {target_path}（权限 600）")
 if backup_path:
     print(f"已备份: {backup_path}")
+for name in removed_retired:
+    print(f"已移除退役受管 hook: {name}")
 PY
 
 # --- 7. 注册 agy/shell.zsh 进 ~/.zshrc ---
