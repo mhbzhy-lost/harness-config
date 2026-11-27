@@ -37,11 +37,22 @@ case "${1:-}" in
   wsl)
     shift
     [[ $# -ge 1 ]] || { usage; exit 2; }
-    if "$LAN" require >/dev/null 2>&1; then
-      if [[ "$1" == --check ]]; then exec "$WSL" status; fi
-      exec "$WSL" "$@"
-    fi
-    exec "$WSL_RELAY" "$@"
+    case "${HOME_CONNECT_LAN_STATE:-}" in
+      available)
+        if [[ "$1" == --check ]]; then exec "$WSL" status; fi
+        exec "$WSL" "$@"
+        ;;
+      unavailable)
+        exec "$WSL_RELAY" "$@"
+        ;;
+      *)
+        if "$LAN" require >/dev/null 2>&1; then
+          if [[ "$1" == --check ]]; then exec "$WSL" status; fi
+          exec "$WSL" "$@"
+        fi
+        exec "$WSL_RELAY" "$@"
+        ;;
+    esac
     ;;
   *) usage; exit 2 ;;
 esac

@@ -6,8 +6,9 @@
  * 只是挂在同一监听的两条路径上（/home、/comfyui）。配置见 host.json（部署目录内，不入库）。
  */
 
-import { createHash, randomUUID, timingSafeEqual, X509Certificate } from "node:crypto";
-import { appendFileSync, existsSync, readFileSync, statSync } from "node:fs";
+import { createHash, randomUUID, X509Certificate } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { appendFile, readFile, stat } from "node:fs/promises";
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import { homedir } from "node:os";
@@ -16,6 +17,13 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { PLUGIN_ROOT } from "./connection.ts";
+import {
+	InvalidJsonError,
+	LruSessionStore,
+	PayloadTooLargeError,
+	isAuthorizedHeader,
+	readBoundedJsonBody,
+} from "./http-guards.ts";
 import { failure, type ToolDefinition } from "./mcp.ts";
 import { COMFYUI_TOOLS, callComfyuiTool, comfyuiInstructions } from "./tools-comfyui.ts";
 import { HOME_INSTRUCTIONS, HOME_TOOLS, callHomeTool } from "./tools-home.ts";
@@ -59,9 +67,9 @@ const GROUPS: ToolGroup[] = [
 	{ path: "/comfyui", name: "comfyui", tools: COMFYUI_TOOLS, instructions: comfyuiInstructions(), call: callComfyuiTool },
 ];
 
-function audit(entry: Record<string, unknown>): void {
+async function audit(entry: Record<string, unknown>): Promise<void> {
 	try {
-		appendFileSync(AUDIT_PATH, `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`);
+		await appendFile(AUDIT_PATH, `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`);
 	} catch { /* 审计写失败不影响工具结果 */ }
 }
 
@@ -77,7 +85,7 @@ function parseJsonResult(result: ToolResult): Record<string, unknown> | undefine
 }
 
 /** 生图结果内联图片：远端客户端读不到 mac 上的 localPath，直接作为 image 内容块返回。 */
-function withImages(result: ToolResult): ToolResult {
+async function withImages(result: ToolResult): Promise<ToolResult> {
 	const payload = parseJsonResult(result);
 	if (!payload || !Array.isArray(payload.outputs)) return result;
 	const content = [...result.content];
@@ -87,12 +95,14 @@ function withImages(result: ToolResult): ToolResult {
 		const mime = MIME_BY_EXT[localPath.slice(localPath.lastIndexOf(".")).toLowerCase()];
 		if (!mime) continue;
 		try {
-			if (statSync(localPath).size > MAX_IMAGE_BYTES) {
+			const fileStat = await stat(localPath);
+			if (fileStat.size > MAX_IMAGE_BYTES) {
 				output.inline = false;
 				output.inlineNote = `超过内联上限 ${MAX_IMAGE_BYTES} 字节，未随结果返回`;
 				continue;
 			}
-			content.push({ type: "image", data: readFileSync(localPath).toString("base64"), mimeType: mime });
+			const data = await readFile(localPath);
+			content.push({ type: "image", data: data.toString("base64"), mimeType: mime });
 			output.inline = true;
 		} catch {
 			output.inline = false;
@@ -109,10 +119,10 @@ function withAccess(result: ToolResult, access: Access): ToolResult {
 	return { content: [{ type: "text", text: JSON.stringify({ ...payload, access: { via: access, lan: cfg.lanUrl, relay: cfg.relayUrl ?? null } }, null, 2) }], isError: result.isError };
 }
 
-interface Session { server: McpServer; transport: StreamableHTTPServerTransport; at: number }
-const sessions = new Map<string, Session>();
+interface Session { server: McpServer; transport: StreamableHTTPServerTransport; close: () => Promise<void> }
+const sessions = new LruSessionStore<Session>(MAX_SESSIONS);
 
-function createSession(group: ToolGroup, access: Access, onId: (id: string) => void): Session {
+async function createSession(group: ToolGroup, access: Access, onId: (id: string) => void): Promise<Session> {
 	const server = new McpServer({ name: group.name, version: "2.0.0" }, { capabilities: { tools: {} }, instructions: group.instructions });
 	server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: group.tools }));
 	server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -124,10 +134,10 @@ function createSession(group: ToolGroup, access: Access, onId: (id: string) => v
 		} catch (error) {
 			result = failure(`${name} 异常: ${(error as Error).message}`);
 		}
-		if (group.path === "/comfyui" && name === "comfyui_generate") result = withImages(result);
+		if (group.path === "/comfyui" && name === "comfyui_generate") result = await withImages(result);
 		if (group.path === "/home" && name === "home_status") result = withAccess(result, access);
 		const text = String(result.content[0]?.text ?? "");
-		audit({
+		await audit({
 			access,
 			server: group.path,
 			tool: name,
@@ -149,8 +159,14 @@ function createSession(group: ToolGroup, access: Access, onId: (id: string) => v
 		},
 		onsessionclosed: (id) => { sessions.delete(id); },
 	});
-	void server.connect(transport);
-	return { server, transport, at: Date.now() };
+	await server.connect(transport);
+	return {
+		server,
+		transport,
+		close: async () => {
+			await Promise.allSettled([transport.close(), server.close()]);
+		},
+	};
 }
 
 function exitCodeOf(text: string): number | undefined {
@@ -167,13 +183,11 @@ function groupFor(pathname: string): ToolGroup | undefined {
 }
 
 function authorized(req: IncomingMessage): boolean {
-	const given = req.headers.authorization ?? "";
-	const expected = `Bearer ${cfg.apiKey}`;
-	return given.length === expected.length && timingSafeEqual(Buffer.from(given), Buffer.from(expected));
+	return isAuthorizedHeader(req.headers.authorization, cfg.apiKey);
 }
 
-function json(res: ServerResponse, status: number, body: unknown): void {
-	res.writeHead(status, { "Content-Type": "application/json" });
+function json(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
+	res.writeHead(status, { "Content-Type": "application/json", ...extraHeaders });
 	res.end(JSON.stringify(body));
 }
 
@@ -212,7 +226,25 @@ async function handle(req: IncomingMessage, res: ServerResponse, access: Access)
 	}
 	const group = groupFor(pathname);
 	if (!group) { json(res, 404, { error: "unknown_path" }); return; }
-	if (Number(req.headers["content-length"] ?? 0) > MAX_BODY_BYTES) { json(res, 413, { error: "payload_too_large" }); return; }
+	let parsedBody: unknown;
+	if (req.method === "POST") {
+		try {
+			parsedBody = await readBoundedJsonBody(req, MAX_BODY_BYTES);
+		} catch (error) {
+			if (error instanceof PayloadTooLargeError) {
+				json(res, 413, { error: "payload_too_large" }, { Connection: "close" });
+				return;
+			}
+			if (error instanceof InvalidJsonError) {
+				json(res, 400, { error: "invalid_json" });
+				return;
+			}
+			throw error;
+		}
+	} else if (Number(req.headers["content-length"] ?? 0) > MAX_BODY_BYTES) {
+		json(res, 413, { error: "payload_too_large" }, { Connection: "close" });
+		return;
+	}
 	const id = req.headers["mcp-session-id"];
 	try {
 		let session: Session | undefined;
@@ -221,13 +253,15 @@ async function handle(req: IncomingMessage, res: ServerResponse, access: Access)
 			if (!session) { json(res, 404, { error: "unknown_session" }); return; }
 		} else {
 			if (req.method !== "POST") { json(res, 405, { error: "method_not_allowed" }); return; }
-			if (sessions.size >= MAX_SESSIONS) {
-				const oldest = [...sessions.entries()].sort((a, b) => a[1].at - b[1].at)[0]?.[0];
-				if (oldest) sessions.delete(oldest);
-			}
-			session = createSession(group, access, (newId) => sessions.set(newId, session as Session));
+			session = await createSession(group, access, (newId) => {
+				sessions.set(newId, session as Session);
+			});
 		}
-		await session.transport.handleRequest(req, res);
+		if (req.method === "POST") {
+			await session.transport.handleRequest(req, res, parsedBody);
+		} else {
+			await session.transport.handleRequest(req, res);
+		}
 	} catch (error) {
 		if (!res.headersSent) json(res, 500, { error: (error as Error).message });
 		else res.end();
@@ -252,6 +286,7 @@ httpServer.listen(cfg.port, cfg.bind, () => console.log(`home-connect 远程入�
 
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
 	process.on(signal, () => {
+		void sessions.closeAll();
 		httpServer?.close();
 		httpsServer?.close();
 		process.exit(0);

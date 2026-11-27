@@ -281,9 +281,15 @@ async function comfyuiList() {
 		}
 		return [];
 	};
+	const nodes = ["CheckpointLoaderSimple", "UNETLoader", "LoraLoader", "UpscaleModelLoader"] as const;
+	const responses = await Promise.all(
+		nodes.map(async (node) => ({
+			node,
+			...(await comfyCurl(`/object_info/${node}`, { curlTimeoutSec: 15, execTimeoutSec: 90 })),
+		})),
+	);
 	const sections: Record<string, string[]> = {};
-	for (const node of ["CheckpointLoaderSimple", "UNETLoader", "LoraLoader", "UpscaleModelLoader"]) {
-		const { result } = await comfyCurl(`/object_info/${node}`, { curlTimeoutSec: 15, execTimeoutSec: 90 });
+	for (const { node, result } of responses) {
 		if (result.code !== 0) return failure(`查询失败（ComfyUI 未运行？先 comfyui_generate 自启或 home_status 诊断）: ${result.stderr.trim()}`);
 		sections[node] = [];
 		try {

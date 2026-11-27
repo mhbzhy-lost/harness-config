@@ -88,7 +88,11 @@ CM_OPTS=(-o ControlMaster=auto -o "ControlPath=${CM_DIR}/%C" -o ControlPersist=6
 pq_filter() {
   grep -a -vE '^\*\* (WARNING: connection is not using a post-quantum key exchange algorithm|This session may be vulnerable to "store now, decrypt later" attacks\.|The server may need to be upgraded\. See https://openssh\.com/pq\.html)' || true
 }
-new_errtmp() { errtmp="$(mktemp "${TMPDIR:-/tmp}/home-mac-err.XXXXXXXX")"; printf '%s' "${errtmp}"; }
+new_errtmp() {
+  [[ -z "${errtmp:-}" ]] || rm -f "${errtmp}"
+  errtmp="$(mktemp "${TMPDIR:-/tmp}/home-mac-err.XXXXXXXX")"
+  printf '%s' "${errtmp}"
+}
 relay_ssh() {
   local rc=0
   new_errtmp >"/dev/null"
