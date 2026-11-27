@@ -98,11 +98,31 @@ export function loadOpenAIProxyConfig(
 async function defaultCreateProxyFetch(proxy: string) {
   const { fetch: undiciFetch, ProxyAgent } = await import(hostPackageEntry("undici"));
   const dispatcher = new ProxyAgent(proxy);
-  return (input: any, init: any = {}) => undiciFetch(input, { ...init, dispatcher }) as any;
+  const wrapped: any = (input: any, init: any = {}) => undiciFetch(input, { ...init, dispatcher }) as any;
+  wrapped.close = () => dispatcher.close?.();
+  return wrapped;
 }
 
 export const OAUTH_PROXY_HOSTS = ["auth.openai.com", "chatgpt.com"];
 const SCOPED_FETCH_KEY = Symbol.for("pi.openai-proxy.scopedFetch");
+const SCOPED_STATE_KEY = Symbol.for("pi.openai-proxy.scopedState");
+
+type ScopedProxyState = {
+  proxyFetch: any;
+  allowed: Set<string>;
+  proxy?: string;
+};
+
+const targetProxyClosers = new WeakMap<object, { proxyFetch: any; close?: () => unknown }>();
+
+function closeProxyHandle(close: (() => unknown) | undefined): void {
+  if (typeof close !== "function") return;
+  try {
+    void Promise.resolve(close()).catch(() => {});
+  } catch {
+    // 忽略关闭旧 ProxyAgent 时的清理异常
+  }
+}
 
 function requestUrl(input: any): URL | undefined {
   try {
@@ -120,35 +140,59 @@ function isScopedFetch(value: any): boolean {
 }
 
 /**
- * 同步安装主机白名单 fetch 包装层：供 streamSimple 前同步补回包装，消除微任务竞态。
+ * 同步安装或热更新主机白名单 fetch 包装层：通过可变委托槽切换新代理并关闭旧 ProxyAgent。
  */
 export function installScopedProxyFetch(
   proxyFetch: any,
-  { hosts = OAUTH_PROXY_HOSTS, target = globalThis as any }: any = {},
+  { hosts = OAUTH_PROXY_HOSTS, target = globalThis as any, proxy }: any = {},
 ) {
-  if (isScopedFetch(target.fetch)) return target.fetch;
-  const allowed = new Set(hosts);
+  const allowed = new Set<string>(hosts);
+  const previous = targetProxyClosers.get(target);
+  if (previous && previous.proxyFetch !== proxyFetch) {
+    closeProxyHandle(previous.close);
+  }
+  const nextClose = typeof proxyFetch?.close === "function" ? () => proxyFetch.close() : undefined;
+  targetProxyClosers.set(target, { proxyFetch, close: nextClose });
+
+  if (isScopedFetch(target.fetch)) {
+    const state = (target.fetch as any)[SCOPED_STATE_KEY] as ScopedProxyState | undefined;
+    if (state) {
+      state.proxyFetch = proxyFetch;
+      state.allowed = allowed;
+      if (proxy !== undefined) state.proxy = proxy;
+      return target.fetch;
+    }
+  }
+
+  const state: ScopedProxyState = { proxyFetch, allowed, ...(proxy !== undefined ? { proxy } : {}) };
   const original = target.fetch.bind(target);
   const scoped: any = (input: any, init: any) => {
     const url = requestUrl(input);
-    if (!url || !allowed.has(url.hostname)) return original(input, init);
-    return proxyFetch(input, init);
+    if (!url || !state.allowed.has(url.hostname)) return original(input, init);
+    return state.proxyFetch(input, init);
   };
   Object.defineProperty(scoped, SCOPED_FETCH_KEY, { value: true });
+  Object.defineProperty(scoped, SCOPED_STATE_KEY, { value: state });
   target.fetch = scoped;
   return scoped;
 }
 
 /**
- * 安装主机白名单 fetch 包装层。幂等，并能在宿主重新安装全局 fetch 后重新包住新的 fetch。
+ * 安装或按需热更新主机白名单 fetch 包装层；代理 URL 未变化时保持幂等，变更时替换委托并关闭旧 ProxyAgent。
  */
 export async function ensureScopedProxyFetch(
   proxy: string,
   { hosts = OAUTH_PROXY_HOSTS, createProxyFetch = defaultCreateProxyFetch, target = globalThis as any }: any = {},
 ) {
-  if (isScopedFetch(target.fetch)) return target.fetch;
+  if (isScopedFetch(target.fetch)) {
+    const state = (target.fetch as any)[SCOPED_STATE_KEY] as ScopedProxyState | undefined;
+    if (state && state.proxy === proxy) {
+      state.allowed = new Set<string>(hosts);
+      return target.fetch;
+    }
+  }
   const proxyFetch = await createProxyFetch(proxy);
-  return installScopedProxyFetch(proxyFetch, { hosts, target });
+  return installScopedProxyFetch(proxyFetch, { hosts, target, proxy });
 }
 
 export async function createOpenAIProxyExtension(
@@ -158,7 +202,7 @@ export async function createOpenAIProxyExtension(
   if (!validProxy(proxy)) return;
   const fetch = await createProxyFetch(proxy);
   const keepOAuthProxy = () => {
-    installScopedProxyFetch(fetch);
+    installScopedProxyFetch(fetch, { proxy });
   };
   keepOAuthProxy();
 

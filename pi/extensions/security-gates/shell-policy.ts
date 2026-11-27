@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 
 const COMMIT_TYPES = new Set(["feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore", "revert"]);
 const WRAPPERS = new Set(["sudo", "command", "env"]);
+const MAX_WRAPPER_DEPTH = 8;
 
 function isGitExecutable(value: string | undefined): boolean {
   return value === "git" || value === "git1" || Boolean(value?.endsWith("/git")) || Boolean(value?.endsWith("/git1"));
@@ -57,8 +58,13 @@ function expandTilde(token: string): string {
 }
 
 function unwrap(segment: string) {
-  let tokens = segment.trim().match(/(?:\$'[^']*'|"[^"]*"|'[^']*'|[^\s])+/g) ?? [];
-  tokens = tokens.map((token) => token.replace(/^(?:\$')?['"]|['"]$/g, ""));
+  let tokens = segment.trim().match(/(?:\$'[^']*'|"[^"\\]*(?:\\.[^"\\]*)*"|'[^']*'|[^\s])+/g) ?? [];
+  tokens = tokens.map((token) => {
+    if (token.startsWith('"') && token.endsWith('"') && token.length >= 2) {
+      return token.slice(1, -1).replace(/\\(["\\])/g, "$1");
+    }
+    return token.replace(/^(?:\$')?['"]|['"]$/g, "");
+  });
   tokens = tokens.map(expandTilde);
   const environment: string[] = [];
   while (tokens[0] && (WRAPPERS.has(tokens[0]) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0]))) {
@@ -97,7 +103,8 @@ function isSleepExecutable(value: string | undefined): boolean {
   return value === "sleep" || Boolean(value?.endsWith("/sleep"));
 }
 
-function containsSleepCommand(command: string, cwd: string): boolean {
+function containsSleepCommand(command: string, cwd: string, depth = 0): boolean {
+  if (depth >= MAX_WRAPPER_DEPTH) return true;
   for (const { tokens } of commandContext(command, cwd)) {
     if (isSleepExecutable(tokens[0])) return true;
     const executable = tokens[0]?.split("/").pop();
@@ -105,7 +112,7 @@ function containsSleepCommand(command: string, cwd: string): boolean {
     for (let index = 1; index < tokens.length; index += 1) {
       const token = tokens[index]!;
       if ((token === "-c" || (token.startsWith("-") && !token.startsWith("--") && token.endsWith("c"))) && tokens[index + 1]) {
-        if (containsSleepCommand(tokens[index + 1]!, cwd)) return true;
+        if (containsSleepCommand(tokens[index + 1]!, cwd, depth + 1)) return true;
       }
     }
   }
@@ -248,16 +255,16 @@ function checkDestructiveGit(tokens: string[]) {
   return undefined;
 }
 
-function checkShellWrapper(tokens: string[], cwd: string, workspaceRoot: string, env: Record<string, string | undefined>, skipCommitValidation: boolean): ReturnType<typeof violation> | undefined {
+function checkShellWrapper(tokens: string[], cwd: string, workspaceRoot: string, env: Record<string, string | undefined>, skipCommitValidation: boolean, depth = 0): ReturnType<typeof violation> | undefined {
   const shells = new Set(["sh", "bash", "zsh"]);
   const cmd = tokens[0]?.split("/").pop();
   if (!cmd || !shells.has(cmd)) return undefined;
   // Find -c as standalone or as combined short flag (e.g. -lc, -xc)
   for (let i = 1; i < tokens.length; i++) {
     const t = tokens[i]!;
-    if (t === "-c" && tokens[i + 1]) return checkCommands(tokens[i + 1]!, cwd, workspaceRoot, env, skipCommitValidation);
+    if (t === "-c" && tokens[i + 1]) return checkCommands(tokens[i + 1]!, cwd, workspaceRoot, env, skipCommitValidation, depth + 1);
     if (t.startsWith("-") && !t.startsWith("--") && t.endsWith("c") && tokens[i + 1]) {
-      return checkCommands(tokens[i + 1]!, cwd, workspaceRoot, env, skipCommitValidation);
+      return checkCommands(tokens[i + 1]!, cwd, workspaceRoot, env, skipCommitValidation, depth + 1);
     }
   }
   return undefined;
@@ -295,7 +302,10 @@ function validateCommit(tokens: string[]) {
   return undefined;
 }
 
-function checkCommands(command: string, cwd: string, workspaceRoot: string, env: Record<string, string | undefined>, skipCommitValidation: boolean): ReturnType<typeof violation> | undefined {
+function checkCommands(command: string, cwd: string, workspaceRoot: string, env: Record<string, string | undefined>, skipCommitValidation: boolean, depth = 0): ReturnType<typeof violation> | undefined {
+  if (depth >= MAX_WRAPPER_DEPTH) {
+    return violation("SHELL_WRAPPER_DEPTH_EXCEEDED", "嵌套 shell 包装层数超过安全上限");
+  }
   const commands = commandContext(command, cwd);
   for (const { tokens, cwd: commandCwd } of commands) {
     const rmViolation = checkRm(tokens, commandCwd, workspaceRoot, env);
@@ -304,7 +314,7 @@ function checkCommands(command: string, cwd: string, workspaceRoot: string, env:
     if (gitViolation) return gitViolation;
     const broadStagingViolation = checkBroadGitStaging(tokens);
     if (broadStagingViolation) return broadStagingViolation;
-    const wrapperViolation = checkShellWrapper(tokens, commandCwd, workspaceRoot, env, skipCommitValidation);
+    const wrapperViolation = checkShellWrapper(tokens, commandCwd, workspaceRoot, env, skipCommitValidation, depth);
     if (wrapperViolation) return wrapperViolation;
     const commitViolation = skipCommitValidation ? undefined : validateCommit(tokens);
     if (commitViolation) return commitViolation;
@@ -317,7 +327,11 @@ const SENSITIVE_BASENAME = /^(?:auth|mcp-auth)\.json$/i;
 
 export function checkSensitivePath({ toolName, input, cwd }: { toolName: string; input: any; cwd: string }) {
   if (!["read", "write", "edit"].includes(toolName)) return undefined;
-  const raw = input?.path ?? input?.filePath ?? input?.file_path ?? input?.filename;
+  const pathFields = [input?.path, input?.filePath, input?.file_path, input?.filename];
+  if (pathFields.some((value) => value !== undefined && value !== null && typeof value !== "string")) {
+    return violation("SENSITIVE_PATH_UNCERTAIN", "敏感文件工具调用路径参数非法");
+  }
+  const raw = pathFields.find((value): value is string => typeof value === "string" && value.trim() !== "");
   if (!raw) return violation("SENSITIVE_PATH_UNCERTAIN", "敏感文件工具调用缺少可信路径");
   const expanded = expandTilde(raw);
   const path = isAbsolute(expanded) ? expanded : resolve(cwd, expanded);

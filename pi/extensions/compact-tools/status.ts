@@ -1,13 +1,19 @@
 export type CompactRenderStatus = "loading" | "success" | "failure";
 export const COMPACT_STATUS_KEY = "compactToolsStatus";
+export const DEFAULT_MAX_SPINNER_LIFETIME_MS = 30 * 60 * 1000;
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
-const loadingTimers = new WeakMap<object, ReturnType<typeof setInterval>>();
+const loadingTimers = new WeakMap<object, () => void>();
+const activeCleanups = new Set<() => void>();
 
 type ThemeLike = { fg(color: string, text: string): string };
 type RenderContextLike = { state?: object; invalidate?: () => void } | undefined;
 type ResultLike = { isError?: boolean } | undefined;
 type ResultOptionsLike = { isPartial?: boolean } | undefined;
+export type SyncStatusAnimationOptions = {
+  now?: () => number;
+  maxLifetimeMs?: number;
+};
 
 export function resultStatus(result: ResultLike, options: ResultOptionsLike, context: { isError?: boolean } | undefined): CompactRenderStatus {
   return context?.isError === true || result?.isError === true
@@ -21,37 +27,65 @@ export function setRenderStatus(
   context: RenderContextLike,
   status: CompactRenderStatus,
   key = "status",
+  options?: SyncStatusAnimationOptions,
 ): void {
   if (context?.state) (context.state as Record<string, unknown>)[key] = status;
-  syncStatusAnimation(context, status);
+  syncStatusAnimation(context, status, options);
+}
+
+export function clearAllStatusAnimations(): void {
+  for (const stop of [...activeCleanups]) {
+    stop();
+  }
 }
 
 /**
- * loading 状态需要主动触发 TUI 重绘；终态到达后立即清理，不把 timer 写入 renderer state。
+ * loading 状态需要主动触发 TUI 重绘；通过 WeakRef 与最长寿命上限防止未达终态时泄漏。
  */
-export function syncStatusAnimation(context: RenderContextLike, status: CompactRenderStatus | undefined): void {
+export function syncStatusAnimation(
+  context: RenderContextLike,
+  status: CompactRenderStatus | undefined,
+  options: SyncStatusAnimationOptions = {},
+): void {
   const state = context?.state;
   if (!state) return;
-  const current = loadingTimers.get(state);
+  const currentStop = loadingTimers.get(state);
   const loading = status === undefined || status === "loading";
   if (!loading) {
-    if (current) {
-      clearInterval(current);
-      loadingTimers.delete(state);
-    }
+    currentStop?.();
     return;
   }
-  if (current || typeof context?.invalidate !== "function") return;
-  const timer = setInterval(() => {
+  if (currentStop || typeof context?.invalidate !== "function") return;
+  const now = options.now ?? Date.now;
+  const maxLifetimeMs = options.maxLifetimeMs ?? DEFAULT_MAX_SPINNER_LIFETIME_MS;
+  const startedAt = now();
+  const contextRef = new WeakRef(context as NonNullable<RenderContextLike>);
+  const stateRef = new WeakRef(state);
+  let stopped = false;
+  let timer: ReturnType<typeof setInterval>;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+    activeCleanups.delete(stop);
+    const currentState = stateRef.deref();
+    if (currentState) loadingTimers.delete(currentState);
+  };
+  timer = setInterval(() => {
+    const currentCtx = contextRef.deref();
+    if (!currentCtx || typeof currentCtx.invalidate !== "function" || now() - startedAt >= maxLifetimeMs) {
+      stop();
+      return;
+    }
     try {
-      context.invalidate!();
+      currentCtx.invalidate();
     } catch {
-      clearInterval(timer);
-      loadingTimers.delete(state);
+      stop();
     }
   }, 120);
   timer.unref?.();
-  loadingTimers.set(state, timer);
+  activeCleanups.add(stop);
+  loadingTimers.set(state, stop);
 }
 
 export function statusGlyph(theme: ThemeLike, status: CompactRenderStatus | undefined, now = Date.now()): string {

@@ -74,12 +74,15 @@ export function resolveHealthUrl(baseUrl: string, healthPath?: string): string {
 }
 
 /** status < 500 视为可用（404/401 也说明服务在应答）；网络错误/超时/5xx 不可用。 */
-async function defaultProbe(url: string): Promise<boolean> {
+export async function defaultProbe(url: string): Promise<boolean> {
+	let res: Response | undefined;
 	try {
-		const res = await fetch(url, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS), redirect: "follow" });
+		res = await fetch(url, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS), redirect: "follow" });
 		return res.status < 500;
 	} catch {
 		return false;
+	} finally {
+		await res?.body?.cancel().catch(() => {});
 	}
 }
 

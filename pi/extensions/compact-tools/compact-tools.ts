@@ -1,6 +1,7 @@
 import { SkillInvocationMessageComponent, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, sliceByColumn, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { createCompactToolRendererResolver, installCompactSkillRenderer } from "./index.ts";
+import { clearAllStatusAnimations } from "./status.ts";
 
 export default function compactTools(pi: ExtensionAPI) {
   pi.registerToolRenderer(createCompactToolRendererResolver({
@@ -12,5 +13,11 @@ export default function compactTools(pi: ExtensionAPI) {
   }));
   pi.on("session_start", (_event, ctx) => {
     installCompactSkillRenderer({ SkillInvocationMessageComponent, Text, Markdown, theme: ctx.ui.theme });
+  });
+  pi.on("session_before_switch", () => {
+    clearAllStatusAnimations();
+  });
+  pi.on("session_shutdown", () => {
+    clearAllStatusAnimations();
   });
 }

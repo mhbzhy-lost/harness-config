@@ -1,18 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { checkSensitivePath, checkShellPolicy, checkSynchronousBash } from "../pi/extensions/security-gates/shell-policy.ts";
 import { createNetworkRecoveryExtension } from "../pi/extensions/network-recovery/extension.ts";
-import { installScopedProxyFetch, loadOpenAIProxyConfig } from "../pi/extensions/openai-proxy/index.ts";
-import { createEndpointFallbackExtension } from "../pi/extensions/endpoint-fallback/index.ts";
+import { ensureScopedProxyFetch, installScopedProxyFetch, loadOpenAIProxyConfig } from "../pi/extensions/openai-proxy/index.ts";
+import { createEndpointFallbackExtension, defaultProbe } from "../pi/extensions/endpoint-fallback/index.ts";
 import { classifyPiLaunch, defaultPiSessionDir, resolveRecentSession } from "../pi/extensions/session-owner/contract.ts";
-import { prepareBashCwdExecution } from "../pi/extensions/bash-cwd/extension.ts";
+import { createBashCwdToolDefinition, createCachedBashOptions, prepareBashCwdExecution } from "../pi/extensions/bash-cwd/extension.ts";
 import { createBashAsyncController } from "../pi/extensions/bash-async/controller.ts";
 import { createToolTimingExtension } from "../pi/extensions/tool-timing/index.ts";
 import { discoverPlugins } from "../pi/extensions/agent-plugins/manifest.ts";
+import { clearAllStatusAnimations, syncStatusAnimation } from "../pi/extensions/compact-tools/status.ts";
 
 // ---- 1. security-gates ----
 
@@ -386,4 +387,144 @@ test("agent-plugins: 发现本仓全部 Agent Plugins v1 插件的技能与 MCP 
   } finally {
     rmSync(agentDir, { recursive: true, force: true });
   }
+});
+
+// ---- 9. Task 4 稳定性与性能回归测试 ----
+
+test("compact-tools: orphaned loading timer stops on maxLifetime expiry and clearAllStatusAnimations", async () => {
+  let nowMs = 1000;
+  let invalidations = 0;
+  const ctx = {
+    state: {},
+    invalidate() { invalidations += 1; },
+  };
+  syncStatusAnimation(ctx, "loading", { now: () => nowMs, maxLifetimeMs: 250 });
+  await new Promise((r) => setTimeout(r, 150));
+  assert.ok(invalidations >= 1, `loading 期间应触发 invalidate，实际 ${invalidations}`);
+
+  // 推进时钟超过 maxLifetimeMs，下一次 tick 后应自动停止
+  nowMs += 300;
+  await new Promise((r) => setTimeout(r, 160));
+  const afterExpiry = invalidations;
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(invalidations, afterExpiry, "超过 maxLifetimeMs 后不应再继续重绘");
+
+  // 启动第二个 timer 并验证 clearAllStatusAnimations() 立即清理，且 compact-tools.ts 已挂接生命周期清理
+  let secondInvalidations = 0;
+  const ctx2 = { state: {}, invalidate() { secondInvalidations += 1; } };
+  syncStatusAnimation(ctx2, "loading", { now: () => nowMs, maxLifetimeMs: 60_000 });
+  clearAllStatusAnimations();
+  const afterClear = secondInvalidations;
+  await new Promise((r) => setTimeout(r, 180));
+  assert.equal(secondInvalidations, afterClear, "clearAllStatusAnimations 后不应再触发重绘");
+
+  const entrySource = readFileSync(join(process.cwd(), "pi/extensions/compact-tools/compact-tools.ts"), "utf8");
+  assert.match(entrySource, /session_shutdown/);
+  assert.match(entrySource, /session_before_switch/);
+  assert.match(entrySource, /clearAllStatusAnimations/);
+});
+
+test("security-gates: nested sh -c exceeding depth limit is blocked and non-string sensitive path fails closed", () => {
+  const cwd = process.cwd();
+  let nested = "echo ok";
+  for (let i = 0; i < 10; i += 1) {
+    nested = `sh -c "${nested.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  }
+  const blocked = checkShellPolicy({ command: nested, cwd, workspaceRoot: cwd });
+  assert.equal(blocked?.block, true, "超过递归深度上限的嵌套 sh -c 必须被保守拦截");
+  assert.equal(checkSynchronousBash(nested, cwd)?.code, "SYNC_BASH_SLEEP");
+
+  const shallow = 'sh -c "sh -c \\"echo ok\\""';
+  assert.equal(checkShellPolicy({ command: shallow, cwd, workspaceRoot: cwd }), undefined);
+
+  for (const badInput of [{ path: 123 }, { path: null }, { filePath: { bad: true } }, { filename: [] }]) {
+    const res = checkSensitivePath({ toolName: "read", input: badInput, cwd });
+    assert.equal(res?.code, "SENSITIVE_PATH_UNCERTAIN", `非字符串路径 ${JSON.stringify(badInput)} 应 fail-closed`);
+  }
+});
+
+test("endpoint-fallback: defaultProbe cancels response body after checking status", async () => {
+  const originalFetch = globalThis.fetch;
+  let cancelCalls = 0;
+  globalThis.fetch = async () => ({
+    status: 200,
+    body: {
+      async cancel() { cancelCalls += 1; },
+    },
+  });
+  try {
+    const ok = await defaultProbe("http://127.0.0.1:9999/health");
+    assert.equal(ok, true);
+    assert.equal(cancelCalls, 1, "探活后应调用一次 res.body.cancel()");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("openai-proxy: re-applying proxy config updates delegate target and closes previous ProxyAgent", async () => {
+  const target = { fetch: () => "direct" };
+  const closed = [];
+  const routed = [];
+  const createProxyFetch = async (proxyUrl) => {
+    const fn = (url) => {
+      routed.push([proxyUrl, url]);
+      return `via:${proxyUrl}`;
+    };
+    fn.close = async () => { closed.push(proxyUrl); };
+    return fn;
+  };
+
+  await ensureScopedProxyFetch("http://127.0.0.1:8001", { createProxyFetch, target });
+  assert.equal(target.fetch("https://auth.openai.com/token"), "via:http://127.0.0.1:8001");
+  assert.deepEqual(closed, []);
+
+  await ensureScopedProxyFetch("http://127.0.0.1:8002", { createProxyFetch, target });
+  assert.deepEqual(closed, ["http://127.0.0.1:8001"], "切换代理时应关闭旧 ProxyAgent");
+  assert.equal(target.fetch("https://chatgpt.com/backend-api/codex"), "via:http://127.0.0.1:8002");
+  assert.equal(target.fetch("https://example.com/other"), "direct");
+  assert.deepEqual(routed, [
+    ["http://127.0.0.1:8001", "https://auth.openai.com/token"],
+    ["http://127.0.0.1:8002", "https://chatgpt.com/backend-api/codex"],
+  ]);
+});
+
+test("bash-cwd: createCachedBashOptions caches lookup per (cwd, projectTrusted)", async () => {
+  let calls = 0;
+  let nowMs = 1000;
+  const baseGet = (ctx) => {
+    calls += 1;
+    return { cwd: ctx.cwd, trusted: ctx.isProjectTrusted?.() === true, calls };
+  };
+  const cachedGet = createCachedBashOptions(baseGet, { ttlMs: 5000, now: () => nowMs });
+  const ctxA = { cwd: "/repo/a", isProjectTrusted: () => true };
+  const ctxAUntrusted = { cwd: "/repo/a", isProjectTrusted: () => false };
+
+  const first = cachedGet(ctxA);
+  const second = cachedGet(ctxA);
+  assert.equal(calls, 1, "同一 (cwd, projectTrusted) 连续查询应命中缓存");
+  assert.deepEqual(second, first);
+
+  const untrusted = cachedGet(ctxAUntrusted);
+  assert.equal(calls, 2, "projectTrusted 变化应区分缓存键");
+  assert.equal(untrusted.trusted, false);
+
+  nowMs += 6000;
+  cachedGet(ctxA);
+  assert.equal(calls, 3, "TTL 过期后应重新查询");
+
+  // 验证 createBashCwdToolDefinition 执行期同样命中缓存
+  let toolCalls = 0;
+  const tool = createBashCwdToolDefinition({
+    workspaceRoot: "/repo/a",
+    createBashToolDefinition: (_cwd, opts) => ({
+      execute: async () => opts,
+    }),
+    getBashOptions: () => {
+      toolCalls += 1;
+      return { shellPath: "/bin/zsh" };
+    },
+  });
+  await tool.execute("1", { command: "pwd" }, undefined, undefined, ctxA);
+  await tool.execute("2", { command: "ls" }, undefined, undefined, ctxA);
+  assert.equal(toolCalls, 1, "bash-cwd 工具连续执行应复用缓存配置");
 });
