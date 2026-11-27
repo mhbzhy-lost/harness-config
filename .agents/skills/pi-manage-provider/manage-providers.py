@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Manage non-sensitive Pi provider/model definitions and securely enter credentials."""
 
+import errno
+import fcntl
 import getpass
 import json
 import os
@@ -68,24 +70,33 @@ def _models_lock():
     directory = get_agent_dir()
     directory.mkdir(parents=True, exist_ok=True)
     lock = directory / ".models.json.lock"
-    deadline = time.monotonic() + 10
-    while True:
-        try:
-            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            break
-        except FileExistsError:
-            if time.monotonic() >= deadline:
-                raise RuntimeError("models.json is busy; no changes were written")
-            time.sleep(0.05)
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        os.write(fd, str(os.getpid()).encode())
+        os.chmod(lock, 0o600)
+    except OSError:
+        pass
+    deadline = time.monotonic() + 10
+    locked = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("models.json is busy; no changes were written") from error
+                time.sleep(0.05)
         yield
     finally:
+        if locked:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
         os.close(fd)
-        try:
-            os.unlink(lock)
-        except FileNotFoundError:
-            pass
 
 
 def load_models_json():
@@ -107,8 +118,13 @@ def load_auth_json():
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
 
-def save_auth_json(auth):
+def _save_auth_json(auth):
     _atomic_write(get_agent_dir() / "auth.json", _json_text(auth), 0o600)
+
+
+def save_auth_json(auth):
+    with _models_lock():
+        _save_auth_json(auth)
 
 
 def _update_models(change):
@@ -198,28 +214,28 @@ def cmd_add_provider(args):
 def cmd_remove_provider(args):
     if args.confirm != args.name:
         raise ValueError("removal requires --confirm with the exact provider name")
-    # Validate before changing auth, then roll it back if models replacement fails.
-    config = load_models_json()
-    if args.name not in config.get("providers", {}):
-        raise ValueError(f"provider '{args.name}' not found")
-    auth_path = get_agent_dir() / "auth.json"
-    old_auth_text = auth_path.read_text(encoding="utf-8") if auth_path.exists() else None
-    auth = load_auth_json()
-    had_auth = args.name in auth
-    if had_auth:
-        del auth[args.name]
-        save_auth_json(auth)
-    try:
-        def change(current):
-            del current["providers"][args.name]
-
-        _update_models(change)
-    except BaseException as error:
-        if had_auth and old_auth_text is not None:
-            _atomic_write(auth_path, old_auth_text, 0o600)
-        raise RuntimeError(
-            f"provider removal failed; auth rollback {'completed' if had_auth else 'not needed'}: {error}"
-        ) from error
+    with _models_lock():
+        # Validate and mutate auth + models inside a single lock; roll back auth if models replacement fails.
+        config = load_models_json()
+        providers = config.get("providers", {})
+        if args.name not in providers:
+            raise ValueError(f"provider '{args.name}' not found")
+        auth_path = get_agent_dir() / "auth.json"
+        old_auth_text = auth_path.read_text(encoding="utf-8") if auth_path.exists() else None
+        auth = load_auth_json()
+        had_auth = args.name in auth
+        if had_auth:
+            del auth[args.name]
+            _save_auth_json(auth)
+        try:
+            del providers[args.name]
+            _save_models_json(config)
+        except BaseException as error:
+            if had_auth and old_auth_text is not None:
+                _atomic_write(auth_path, old_auth_text, 0o600)
+            raise RuntimeError(
+                f"provider removal failed; auth rollback {'completed' if had_auth else 'not needed'}: {error}"
+            ) from error
     print(f"Removed provider '{args.name}'" + (" (credential entry also removed)" if had_auth else ""))
 
 
@@ -289,9 +305,10 @@ def _read_key_from_tty():
 
 def cmd_set_key(args):
     key = _read_key_from_tty()
-    auth = load_auth_json()
-    auth[args.provider] = {"type": "api_key", "key": key}
-    save_auth_json(auth)
+    with _models_lock():
+        auth = load_auth_json()
+        auth[args.provider] = {"type": "api_key", "key": key}
+        _save_auth_json(auth)
     print(f"Updated credential for provider '{args.provider}'")
 
 

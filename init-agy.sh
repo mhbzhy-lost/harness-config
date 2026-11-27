@@ -267,7 +267,7 @@ fi
 
 # --- 6. 注入受管 AGY hooks 到 ~/.gemini/config/hooks.json ---
 AGY_SYNC_DRY_RUN="$DRY_RUN" python3 - "$HOOKS_JSON" "$PI_WORKER_HOOK_SCRIPT" "$SWARM_HOOK_SCRIPT" "$GIT_COMMIT_HOOK_SCRIPT" <<'PY'
-import copy, json, os, sys, tempfile
+import copy, json, os, shlex, sys, tempfile
 from datetime import datetime
 
 (
@@ -279,6 +279,22 @@ from datetime import datetime
 dry_run = os.environ.get("AGY_SYNC_DRY_RUN") == "1"
 # 已退役的受管 hook：同步时按名幂等清理，不触碰非受管条目
 retired_managed_hooks = ("harness-config-subagent-model-router",)
+pi_worker_fast_cmd = (
+    'body=$(cat); '
+    'case "$body" in '
+    '*pi_worker_start*|*pi_worker_monitor*) '
+    f'printf \'%s\\n\' "$body" | python3 {shlex.quote(pi_worker_hook_script)} ;; '
+    '*) printf \'{"decision":"allow"}\\n\' ;; '
+    'esac'
+)
+git_commit_fast_cmd = (
+    'body=$(cat); '
+    'case "$body" in '
+    '*git*|*\\\\*|*"\'"*) '
+    f'printf \'%s\\n\' "$body" | python3 {shlex.quote(git_commit_hook_script)} ;; '
+    '*) printf \'{"decision":"allow"}\\n\' ;; '
+    'esac'
+)
 managed_hooks = {
     "harness-config-pi-worker-session-injector": {
         "PreToolUse": [
@@ -287,7 +303,7 @@ managed_hooks = {
                 "hooks": [
                     {
                         "type": "command",
-                        "command": f'python3 "{pi_worker_hook_script}"',
+                        "command": f"sh -c {shlex.quote(pi_worker_fast_cmd)}",
                         "timeout": 5,
                     }
                 ],
@@ -301,7 +317,7 @@ managed_hooks = {
                 "hooks": [
                     {
                         "type": "command",
-                        "command": f'python3 "{swarm_hook_script}"',
+                        "command": f"python3 {shlex.quote(swarm_hook_script)}",
                         "timeout": 5,
                     }
                 ],
@@ -315,7 +331,7 @@ managed_hooks = {
                 "hooks": [
                     {
                         "type": "command",
-                        "command": f'python3 "{git_commit_hook_script}"',
+                        "command": f"sh -c {shlex.quote(git_commit_fast_cmd)}",
                         "timeout": 5,
                     }
                 ],

@@ -267,12 +267,138 @@ class PiManageProviderTest(unittest.TestCase):
                 mod.save_models_json({"providers": {"demo": {"baseUrl": "https://example.invalid", "api": "openai-completions", "models": []}}})
                 mod.save_auth_json({"demo": {"type": "api_key", "key": "fake-key"}})
                 args = SimpleNamespace(name="demo", confirm="demo")
-                with mock.patch.object(mod, "_update_models", side_effect=OSError("disk full")):
+                with mock.patch.object(mod, "_save_models_json", side_effect=OSError("disk full")):
                     with self.assertRaises(RuntimeError):
                         mod.cmd_remove_provider(args)
                 auth = json.loads((agent_dir / "auth.json").read_text(encoding="utf-8"))
                 self.assertEqual(auth, {"demo": {"type": "api_key", "key": "fake-key"}})
                 self.assertEqual(stat.S_IMODE((agent_dir / "auth.json").stat().st_mode), 0o600)
+
+    def test_models_lock_uses_flock_and_recovers_after_crash(self) -> None:
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            agent_dir = Path(tmp)
+            lock_path = agent_dir / ".models.json.lock"
+            lock_path.write_text("999999", encoding="utf-8")
+
+            env = os.environ.copy()
+            env["PI_CODING_AGENT_DIR"] = str(agent_dir)
+            env.pop("PI_AGENT_DIR", None)
+
+            # 即使存在崩溃遗留的 .models.json.lock 文件，flock 也能立即获取锁而不阻塞
+            probe = (
+                "import importlib.util, pathlib\n"
+                f"spec = importlib.util.spec_from_file_location('m', {str(SCRIPT)!r})\n"
+                "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+                "with m._models_lock():\n"
+                "    print('LOCKED')\n"
+            )
+            res = subprocess.run(
+                ["python3", "-c", probe],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=2,
+                check=False,
+            )
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            self.assertIn("LOCKED", res.stdout)
+            # 持久锁文件不 unlink，权限 0600
+            self.assertTrue(lock_path.exists())
+            self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
+
+            # 验证跨进程 flock 真实互斥
+            holder_script = (
+                "import importlib.util, time\n"
+                f"spec = importlib.util.spec_from_file_location('m', {str(SCRIPT)!r})\n"
+                "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+                "with m._models_lock():\n"
+                "    print('HELD', flush=True)\n"
+                "    time.sleep(0.45)\n"
+            )
+            holder = subprocess.Popen(
+                ["python3", "-u", "-c", holder_script],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert holder.stdout is not None
+                line = holder.stdout.readline().strip()
+                self.assertEqual(line, "HELD")
+                t0 = __import__("time").monotonic()
+                with mock.patch.dict(os.environ, {"PI_CODING_AGENT_DIR": str(agent_dir)}):
+                    with mod._models_lock():
+                        elapsed = __import__("time").monotonic() - t0
+                self.assertGreaterEqual(elapsed, 0.3)
+            finally:
+                holder.wait(timeout=5)
+                if holder.stdout:
+                    holder.stdout.close()
+                if holder.stderr:
+                    holder.stderr.close()
+
+    def test_remove_provider_and_set_key_serialize_auth_json(self) -> None:
+        import fcntl
+
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            agent_dir = Path(tmp)
+            lock_path = agent_dir / ".models.json.lock"
+            with mock.patch.dict(os.environ, {"PI_CODING_AGENT_DIR": str(agent_dir)}):
+                mod.save_models_json(
+                    {
+                        "providers": {
+                            "demo": {
+                                "baseUrl": "https://example.invalid",
+                                "api": "openai-completions",
+                                "models": [],
+                            }
+                        }
+                    }
+                )
+                mod.save_auth_json({"demo": {"type": "api_key", "key": "old-key"}})
+
+                events: list[str] = []
+
+                def fake_tty():
+                    # 读 TTY 时不应持有锁
+                    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    finally:
+                        os.close(fd)
+                    events.append("tty_unlocked")
+                    return "new-secret"
+
+                orig_save_auth = mod._save_auth_json if hasattr(mod, "_save_auth_json") else mod.save_auth_json
+
+                def spy_save_auth(auth):
+                    # 写 auth.json 时必须已持有锁（另一 fd 非阻塞抢锁应失败）
+                    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                    try:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    finally:
+                        os.close(fd)
+                    events.append("auth_locked")
+                    return orig_save_auth(auth)
+
+                with mock.patch.object(mod, "_read_key_from_tty", side_effect=fake_tty):
+                    patch_target = "_save_auth_json" if hasattr(mod, "_save_auth_json") else "save_auth_json"
+                    with mock.patch.object(mod, patch_target, side_effect=spy_save_auth):
+                        mod.cmd_set_key(SimpleNamespace(provider="demo"))
+
+                self.assertEqual(events, ["tty_unlocked", "auth_locked"])
+                self.assertEqual(mod.load_auth_json()["demo"]["key"], "new-secret")
+
+                # cmd_remove_provider 必须在单次 _models_lock() 内完成（不嵌套调用 _update_models）
+                with mock.patch.object(mod, "_update_models", side_effect=AssertionError("nested lock")):
+                    mod.cmd_remove_provider(SimpleNamespace(name="demo", confirm="demo"))
+                self.assertNotIn("demo", mod.load_models_json()["providers"])
+                self.assertNotIn("demo", mod.load_auth_json())
 
 
 if __name__ == "__main__":
