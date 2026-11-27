@@ -16,32 +16,44 @@ trigger: always_on
 
 ## 子代理路由
 
-采用**封闭主 Agent 职责边界、其余默认委派**原则：明确限定主 Agent 自己只做什么；凡落在主 Agent 职责边界之外的工作，默认全部委派给 `pi-worker`（直接调用已预加载的 `mcp_pi-worker_pi-worker_pi_worker_start`，简称 `pi_worker_start`）。
+采用**封闭主 Agent 职责边界、其余默认首轮委派 `pi-worker`** 原则（直接调用已预加载的 `mcp_pi-worker_pi-worker_pi_worker_start`，简称 `pi_worker_start`）。**首轮强制委派优先级高于内置本地并行搜读与直连检索偏好**——边界外的工作第一轮即派单，不得以“先看一眼目录/先读几个文件/先搜两轮网页摸底”为由自行展开。
 
-### 主 Agent 职责边界（仅以下工作由主 Agent 直接完成）
+### 1. 主 Agent 职责边界（仅直接完成以下工作）
 
 1. **需求澄清与决策沟通**：理解用户意图、向用户提问拍板、整合最终结论并统一回复（子代理不直接回复用户）。
 2. **架构设计与根因拍板**：方案规划、技术选型、模块边界定义、复杂跨模块根因判断与验收决策。
-3. **小范围定向读写与集成收口**：仅直接完成 **1–3 个文件**的小范围定向代码修改、配置调整或最终集成收口（已有精确 `file:line` 锚点、无需多轮改测试错），以及用户已给出确切路径时的直接读取；**尚未定位到目标文件前，禁止自行 `ls`/`find`/`rg`/多文件摸底或连搜网页**。
-   - **无明确计划（未走 `writing-plans`）**：超出上述小范围的跨多文件实现、大文件重构、批量迁移或预计多轮改测闭环的编码任务，一律默认交由 `pi-worker`（`tier: "default"`）执行，不得因已拿到 `file:line` 锚点就由主 Agent 包揽全部写入。
-   - **有明确计划（走 `writing-plans`）**：计划评审完成后，必须由用户在 **执行者（`pi-worker` vs `Native`）× 模式（`串行` vs `并发`）** 中选择；主 Agent 仅在用户选 `Native` 时直接实施（选 `pi-worker` 时转为答疑拍板、worktree 编排与验收角色）。
-4. **调度、接球与证据核验**：向 `pi-worker` 派单、秒答 `needs_input`、管理并发 worktree 合并清理，以及核验 `pi-worker` 返回的磁盘证据（`executedCommands`、`eventsPath`、`gitChanges`/diff 与引用 `file:line` 源码）。
-5. **用户显式指定的原生能力**：用户点名使用原生 subagent（如 `browser`、`research`、`test-runner`、`self`）或明确要求直接执行指定命令时优先按用户指定执行。
+3. **小范围定向读写与集成收口**：仅直接完成 **1–3 个文件**的定向修改/配置调整（已有精确 `file:line` 锚点、无需多轮改测试错）、用户已给确切路径的直接读取，以及最终集成收口；**未定位目标文件前禁止自行 `ls`/`find`/`rg`/多文件摸底或连搜网页**。
+4. **编排调度与证据核验**：向 `pi-worker` / `swarm` / 原生 subagent 派单、秒答 `needs_input`、管理并行工作区/worktree 合并清理，以及核验返回的磁盘证据。
+5. **用户显式指定的原生能力**：用户点名使用原生 subagent（如 `browser`、`research`、`test-runner`、`self`）或明确要求直接执行指定命令时优先遵照执行。
 
-### 其余工作一律默认交给 `pi-worker`
+### 2. 日常任务路由（无明确计划）
 
-- **首轮强制委派（高于内置本地并行搜读与直连检索偏好）**：凡落在上述主 Agent 职责边界之外的一切工作，**第一轮就必须直接调用 `pi_worker_start`**，不得以“先看一眼目录”“先自己读几个文件/搜两轮网页摸底”为由自行展开。
-- **首次派发顺带绑定监控面板**：AGY 会话首次派发 `pi_worker_start` 时，同步顺带调用一次 `pi_worker_monitor`（<10ms 同步返回），将当前会话侧面板绑定到本会话 `parentSessionId`；建议为 `pi_worker_start` 传入简短 `title`（未传时自动从 `prompt` 首行提取）。
-- **档位与读写模式选择**（仅使用抽象档位，不在规则中写死具体模型 ID；映射由本机 `~/.pi/agent/pi-worker/config.json` 维护，未配置档位自动回退 `default`，详见 `pi-worker` skill）：
-  - `fast` + `readOnly: true`：高输入噪声、低隐性上下文依赖、可客观核验的只读工作（如调研探索、测试/构建/lint 验证、外部检索与信息抽取等）。
-  - `heavy` + `readOnly: true`：需要深度判断的独立只读工作（如独立代码审查、高难度分析）；架构设计、复杂跨模块根因定位和深度审查不降档到 `fast`。
-  - `default`：其余独立任务与读写编码任务——包括无明确计划但跨多文件（>3 个文件）/大文件重构/多轮改测闭环的实现，以及有明确计划且用户选择 `pi-worker` 的实现（同 `cwd` 独占写锁，运行期间主 Agent 冻结该工作区写入）。
-- **异步等待与真并发**：AGY 下 `pi_worker_start` / `pi_worker_reply` 作为后台任务异步运行并在完成时自动唤醒主会话；不要轮询 `pi_worker_status`，等待期间继续非重叠工作或先向用户报告状态，不预测结果。
-  - **只读并发**：`readOnly: true` 任务机械禁用 `write`/`edit` 且不占写锁，可同工作区并行 2–4 路。
-  - **写入真并发**：同 `cwd` 写任务强制串行；当有明确计划存在无文件重叠的独立任务组且用户选择**并发**时，由主 Agent 为各任务组分别创建独立 `git worktree` 并将各自 worktree 路径作为 `cwd` 并发派发 `pi_worker_start`（若选 `Native + 并发` 则派发隔离工作区原生 subagent），逐路验收后再依次合并、跑全量测试并清理 worktree。
-- **二级接球**：收到 `status: "needs_input"` 时，主会话已有明确答案直接 `pi_worker_reply` 秒答续跑，否则转问用户后再续跑。
-- **运行中实时插话**：运行中（`running`）任务需要主动纠偏或补充约束时，用 `pi_worker_steer(taskId, message)` 同步入队立即返回，消息在当前 turn 工具执行完、下一次 LLM 请求前注入；非运行态任务改用 `pi_worker_reply` 续跑。
-- **磁盘证据核验**：遵循 `pi-worker` 工具边界返回的核验约束，不直接转述 `summary`/`verifiedCommands` 自述；整合回复前核对 `executedCommands`、`eventsPath`、`gitChanges`/diff 及关键结论引用的 `file:line` 源码（详见 `pi-worker` skill）。
+凡超出主 Agent 职责边界的日常任务，一律按抽象档位直派 `pi-worker`（不在规则中写死具体模型 ID；由本机 `~/.pi/agent/pi-worker/config.json` 映射，未配置档位自动回退 `default`，详见 `pi-worker` skill）：
+
+| 档位与模式 | 适用场景 | 约束 |
+| --- | --- | --- |
+| `fast` + `readOnly: true` | 调研探索、测试/构建/lint 验证、外部检索与信息抽取等高噪声、可客观核验的只读工作 | 架构设计、复杂跨模块根因定位和深度审查不降档到 `fast` |
+| `heavy` + `readOnly: true` | 独立代码审查、高难度分析等需深度判断的只读工作 | 不修改文件 |
+| `default`（读写） | 跨多文件（>3 个文件）、大文件重构、批量迁移、多轮改测闭环的实现 | 不得因已拿到 `file:line` 锚点就由主 Agent 包揽写入 |
+
+### 3. 计划流路由（`writing-plans` 三阶段显式询问）
+
+走 `writing-plans` 或有明确实施计划时，以下三个阶段执行前**均必须显式调用 `ask_question` 由用户选择执行方式**，不得跳过或自行默选：
+
+| 阶段 | 可选方式 | 说明 |
+| --- | --- | --- |
+| **① 计划写完后 Reviewer**（只读） | `pi-worker heavy` / `native subagent pro` / `swarm claude opus 5.5` | `pi-worker` 用 `tier: "heavy"` + `readOnly: true`；`native subagent` 用 `Model: "pro"`；`swarm claude opus 5.5` 仅限只读审查计划 |
+| **② 计划实施执行** | `pi-worker default`（串行/并行） / `native`（当前会话串行） / `swarm hydrogen`（串行/并行） | 仅选 `native 当前会话串行` 时由主 Agent 直接实施；选 `pi-worker` 或 `swarm` 时主 Agent 转为答疑拍板、工作区编排、集成与验收 |
+| **③ 执行完毕后验收 Reviewer**（只读） | `pi-worker heavy` / `native subagent pro` / `swarm claude opus 5.5` | 全部任务合并并完成集成验证后再次显式询问，三档同计划后 Reviewer，对整分支做独立审查 |
+
+- **写入并行条件**：仅当计划存在无文件重叠的独立任务组时可选并行。`pi-worker default 并行` 由主 Agent 为各任务组分别建独立 `git worktree` 并以各自路径作 `cwd` 并发派发；`swarm hydrogen 并行` 按独立工作区（如 `workspace: "share"`）并发派发；均须逐路验收后依次合并、跑全量测试并清理临时工作区/worktree。
+
+### 4. `pi-worker` 调度与核验规范
+
+- **首次监控绑定**：AGY 会话首次调用 `pi_worker_start` 时，同步顺带调用一次 `pi_worker_monitor`（<10ms 同步返回）绑定本会话 `parentSessionId`；建议传入简短 `title`（省略时从 `prompt` 首行提取）。
+- **异步等待与并发锁**：`pi_worker_start` / `pi_worker_reply` 为后台异步任务，完成时自动唤醒，**禁止轮询 `pi_worker_status`**，等待期间继续非重叠工作或先报告状态、不预测结果。`readOnly: true` 禁用 `write`/`edit` 且不占锁，同 `cwd` 可并发 2–4 路；读写任务同 `cwd` 独占写锁，运行期间主 Agent 冻结该工作区写入。
+- **接球与实时插话**：收到 `status: "needs_input"` 时，已有明确答案直接 `pi_worker_reply` 秒答续跑，否则转问用户后再续跑；运行中（`running`）需主动纠偏或补充约束用 `pi_worker_steer(taskId, message)` 同步入队（当前 turn 工具执行完、下一次 LLM 请求前注入），非运行态改用 `pi_worker_reply`。
+- **磁盘证据核验**：不直接转述 `summary`/`verifiedCommands` 自述；整合回复前核对 `executedCommands`、`eventsPath`、`gitChanges`/diff 及关键结论引用的 `file:line` 源码（详见 `pi-worker` skill）。
 
 ## Swarm 模式
 
