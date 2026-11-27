@@ -40,7 +40,7 @@ class PiSyncTest(unittest.TestCase):
         pkgs = data.get("packages")
         self.assertIsInstance(pkgs, list)
         self.assertIn("npm:@arhen/pi-core-ask@1.1.0", pkgs)
-        self.assertIn("git:github.com/mhbzhy-lost/pi-dcp@v1.0.0", pkgs)
+        self.assertIn("git:github.com/mhbzhy-lost/pi-dcp@v1.0.1", pkgs)
         for pkg in pkgs:
             self.assertIsInstance(pkg, str)
             self.assertTrue(
@@ -148,7 +148,7 @@ class PiSyncTest(unittest.TestCase):
                 merged["packages"],
                 [
                     "../../.r2c/integrations/pi-adapter",
-                    "git:github.com/mhbzhy-lost/pi-dcp@v1.0.0",
+                    "git:github.com/mhbzhy-lost/pi-dcp@v1.0.1",
                     "npm:@arhen/pi-core-ask@1.1.0",
                 ],
             )
