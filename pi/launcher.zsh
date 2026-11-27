@@ -22,10 +22,28 @@ if [[ -z "$real_bin" || ! -e "$real_bin" || "${real_bin:A}" == "$launcher_path" 
 fi
 real_bin=${real_bin:A}
 
+node_heap_mb=""
+heap_diagnostic_dir=""
+
 _exec_pi() {
+  local -a heap_flags=()
+  if [[ -n "${node_heap_mb:-}" && -n "${heap_diagnostic_dir:-}" ]]; then
+    heap_flags=(
+      "--max-old-space-size=${node_heap_mb}"
+      "--heapsnapshot-near-heap-limit=2"
+      "--diagnostic-dir=${heap_diagnostic_dir}"
+    )
+  fi
   case "$real_bin" in
-    *.js|*.mjs|*.cjs) exec "$node_bin" "$real_bin" "$@" ;;
-    *) exec "$real_bin" "$@" ;;
+    *.js|*.mjs|*.cjs) exec "$node_bin" "${heap_flags[@]}" "$real_bin" "$@" ;;
+    *)
+      local first_line=""
+      IFS= read -r first_line < "$real_bin" || true
+      if [[ "$first_line" == '#!'*node* ]]; then
+        exec "$node_bin" "${heap_flags[@]}" "$real_bin" "$@"
+      fi
+      exec "$real_bin" "$@"
+      ;;
   esac
 }
 
@@ -113,11 +131,13 @@ fi
 
 export PI_SESSION_OWNER_ID="$owner_id"
 
-# 为长生命周期 Pi 进程保留充足堆内存与近 OOM 诊断快照
+# 为长生命周期 Pi 进程保留充足堆内存与近 OOM 诊断快照（仅直传 Pi 主进程，不通过 NODE_OPTIONS 泄漏给下游子进程）
 heap_diagnostic_dir="${${PI_HEAP_DIAGNOSTIC_DIR:-${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/diagnostics/heap}:a}"
 if mkdir -p "$heap_diagnostic_dir" && chmod 700 "$heap_diagnostic_dir"; then
   node_heap_mb="${PI_NODE_MAX_OLD_SPACE_SIZE:-8192}"
-  export NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=${node_heap_mb} --heapsnapshot-near-heap-limit=2 --diagnostic-dir=${heap_diagnostic_dir}"
+else
+  heap_diagnostic_dir=""
+  node_heap_mb=""
 fi
 
 cleanup; trap - EXIT HUP INT TERM

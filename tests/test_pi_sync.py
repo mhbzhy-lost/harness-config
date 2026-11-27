@@ -1,5 +1,6 @@
 import json
 import os
+import pty
 import stat
 import subprocess
 import tempfile
@@ -265,6 +266,90 @@ class PiSyncTest(unittest.TestCase):
             )
             self.assertEqual(ver.returncode, 0, msg=f"stderr:\n{ver.stderr}")
             self.assertIn("FAKE_PI:--version", ver.stdout)
+            self.assertFalse(registry.exists())
+
+    def test_launcher_node_script_receives_heap_flags_with_spaces_without_leaking_node_options(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp).resolve()
+            diag_dir = tmp_path / "diag with spaces" / "heap"
+            out_file = tmp_path / "fake-pi-output.json"
+            fake_pi = tmp_path / "fake-pi"
+            fake_pi.write_text(
+                "#!/usr/bin/env node\n"
+                "const { spawnSync } = require('node:child_process');\n"
+                "const { writeFileSync } = require('node:fs');\n"
+                "const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(process.env.NODE_OPTIONS || \"\")'], { encoding: 'utf8' });\n"
+                "writeFileSync(process.env.FAKE_PI_OUT, JSON.stringify({\n"
+                "  execArgv: process.execArgv,\n"
+                "  argv: process.argv.slice(2),\n"
+                "  childNodeOptions: child.stdout,\n"
+                "  ownNodeOptions: process.env.NODE_OPTIONS || '',\n"
+                "}));\n",
+                encoding="utf-8",
+            )
+            fake_pi.chmod(0o755)
+
+            registry = tmp_path / "registry"
+            env = os.environ.copy()
+            env.pop("NODE_OPTIONS", None)
+            env["PI_REAL_BIN"] = str(fake_pi)
+            env["PI_SESSION_OWNER_REGISTRY"] = str(registry)
+            env["PI_HEAP_DIAGNOSTIC_DIR"] = str(diag_dir)
+            env["FAKE_PI_OUT"] = str(out_file)
+
+            master_fd, slave_fd = pty.openpty()
+            try:
+                res = subprocess.run(
+                    ["zsh", str(ROOT / "pi/launcher.zsh")],
+                    cwd=tmp_path,
+                    env=env,
+                    stdin=slave_fd,
+                    stdout=slave_fd,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+            finally:
+                os.close(slave_fd)
+                os.close(master_fd)
+
+            self.assertEqual(res.returncode, 0, msg=f"stderr:\n{res.stderr}")
+            self.assertTrue(out_file.is_file(), msg=f"fake-pi 未输出文件; stderr:\n{res.stderr}")
+            info = json.loads(out_file.read_text(encoding="utf-8"))
+            self.assertIn("--max-old-space-size=8192", info["execArgv"])
+            self.assertIn("--heapsnapshot-near-heap-limit=2", info["execArgv"])
+            self.assertIn(f"--diagnostic-dir={diag_dir}", info["execArgv"])
+            self.assertEqual(info["ownNodeOptions"], "")
+            self.assertEqual(info["childNodeOptions"], "")
+
+    def test_launcher_node_script_bypass_version_succeeds_under_no_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp).resolve()
+            fake_pi = tmp_path / "fake-pi"
+            fake_pi.write_text(
+                "#!/usr/bin/env node\n"
+                "console.log('FAKE_NODE_PI:' + process.argv.slice(2).join(' '));\n",
+                encoding="utf-8",
+            )
+            fake_pi.chmod(0o755)
+
+            registry = tmp_path / "registry"
+            env = os.environ.copy()
+            env.pop("NODE_OPTIONS", None)
+            env["PI_REAL_BIN"] = str(fake_pi)
+            env["PI_SESSION_OWNER_REGISTRY"] = str(registry)
+
+            res = subprocess.run(
+                ["zsh", str(ROOT / "pi/launcher.zsh"), "--version"],
+                cwd=tmp_path,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(res.returncode, 0, msg=f"stderr:\n{res.stderr}")
+            self.assertNotIn("parameter not set", res.stderr)
+            self.assertIn("FAKE_NODE_PI:--version", res.stdout)
             self.assertFalse(registry.exists())
 
     def test_pi_docs_skill_exists_and_init_links_local_package_docs(self) -> None:

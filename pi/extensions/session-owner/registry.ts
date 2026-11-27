@@ -46,11 +46,18 @@ export type ProcessOwnerRecord = Readonly<{
 
 export type ForkSource = Readonly<{ cwd: string; sessionFile: string; sessionId: string }>;
 
+export type RegistryStoreHooks = Readonly<{
+  sleepMs?: (ms: number) => void;
+  onGuardAttempt?: () => void;
+}>;
+
 export type RegistryStore = Readonly<{
   root: string;
   guardTimeoutMs: number;
   uid?: () => number | undefined;
   ownershipUid?: (path: string, observedUid: number) => number;
+  sleepMs?: (ms: number) => void;
+  onGuardAttempt?: () => void;
 }>;
 export type LaunchReservation =
   | { kind: "new"; rejectSelecting?: boolean }
@@ -108,9 +115,24 @@ const GUARD_PROTOCOL = "pi-session-owner.guard.v1";
 const OWNER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{7,159}$/;
 // 事务 nonce 只由 registry 自己 randomUUID() 生成；receipt 中的 nonce 必须仍是 UUID 形态。
 const RESERVATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const RECLAIM_STALE_MS = 5000;
+const SLEEP_WAIT_ARRAY = new Int32Array(new SharedArrayBuffer(4));
 
-export function createRegistryStore(root = join(process.env.XDG_RUNTIME_DIR ?? process.env.TMPDIR ?? "/tmp", `pi-session-owner-${process.getuid?.() ?? 0}`), guardTimeoutMs = 250): RegistryStore {
-  return Object.freeze({ root: resolve(root), guardTimeoutMs });
+function defaultSleepMs(ms: number): void {
+  if (ms > 0) Atomics.wait(SLEEP_WAIT_ARRAY, 0, 0, ms);
+}
+
+export function createRegistryStore(
+  root = join(process.env.XDG_RUNTIME_DIR ?? process.env.TMPDIR ?? "/tmp", `pi-session-owner-${process.getuid?.() ?? 0}`),
+  guardTimeoutMs = 250,
+  hooks?: RegistryStoreHooks,
+): RegistryStore {
+  return Object.freeze({
+    root: resolve(root),
+    guardTimeoutMs,
+    ...(hooks?.sleepMs ? { sleepMs: hooks.sleepMs } : {}),
+    ...(hooks?.onGuardAttempt ? { onGuardAttempt: hooks.onGuardAttempt } : {}),
+  });
 }
 
 function unavailable(message: string, cause?: unknown, details?: unknown): Error {
@@ -145,7 +167,9 @@ function ensureRoot(store: RegistryStore): void {
   if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o777) !== 0o700 || checkedUid(store, store.root, info.uid) !== callerUid(store)) throw unavailable("registry root must be a caller-owned 0700 directory");
 }
 
-function privateJson(store: RegistryStore, path: string, label: string): unknown {
+type PrivateJsonWithStat = Readonly<{ value: unknown; dev: number; ino: number; mtimeMs: number }>;
+
+function privateJsonWithStat(store: RegistryStore, path: string, label: string): PrivateJsonWithStat {
   const before = lstatSync(path);
   if (!before.isFile() || before.isSymbolicLink() || (before.mode & 0o777) !== 0o600 || checkedUid(store, path, before.uid) !== callerUid(store)) throw unavailable(`${label} must be a caller-owned 0600 regular file`);
   let fd: number | undefined;
@@ -154,7 +178,6 @@ function privateJson(store: RegistryStore, path: string, label: string): unknown
     const opened = fstatSync(fd);
     if (!opened.isFile() || (opened.mode & 0o777) !== 0o600 || checkedUid(store, path, opened.uid) !== callerUid(store)) throw unavailable(`${label} must be a caller-owned 0600 regular file`);
     if (opened.dev !== before.dev || opened.ino !== before.ino) throw unavailable(`${label} changed while opening`);
-    let content = "";
     const buffer = Buffer.alloc(opened.size);
     let offset = 0;
     while (offset < buffer.length) {
@@ -162,9 +185,13 @@ function privateJson(store: RegistryStore, path: string, label: string): unknown
       if (bytes === 0) break;
       offset += bytes;
     }
-    content = buffer.toString("utf8", 0, offset);
-    return JSON.parse(content);
+    const content = buffer.toString("utf8", 0, offset);
+    return { value: JSON.parse(content), dev: opened.dev, ino: opened.ino, mtimeMs: opened.mtimeMs };
   } finally { if (fd !== undefined) closeSync(fd); }
+}
+
+function privateJson(store: RegistryStore, path: string, label: string): unknown {
+  return privateJsonWithStat(store, path, label).value;
 }
 
 function writePrivate(path: string, value: unknown): void {
@@ -217,47 +244,106 @@ function guardSnapshot(store: RegistryStore): Record<string, unknown> {
   }
 }
 
+function releaseGuardFile(store: RegistryStore, path: string, guard: Guard, label: string): void {
+  try {
+    const observed = privateJson(store, path, label) as { protocol?: unknown; pid?: unknown; token?: unknown } | null;
+    if (observed?.protocol === GUARD_PROTOCOL && observed.pid === guard.pid && observed.token === guard.token) unlinkSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw unavailable(`cannot release ${label}`, error, guardSnapshot(store));
+  }
+}
+
+/**
+ * 通过 `.guard.reclaim` 互斥锁安全回收已死 PID 的陈旧 `.guard`，
+ * 持锁期间重读核验 dev/ino/token/pid 未变后再删除，避免 ABA 误删新活锁。
+ */
+function tryReclaimDeadGuard(store: RegistryStore, observed: PrivateJsonWithStat): boolean {
+  const path = guardPath(store);
+  const reclaim = `${path}.reclaim`;
+  const reclaimOwner = { protocol: GUARD_PROTOCOL, pid: process.pid, token: randomUUID() };
+  try {
+    publishExclusivePrivate(reclaim, reclaimOwner);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
+    try {
+      const staleReclaim = privateJsonWithStat(store, reclaim, "registry guard reclaim");
+      const rv = staleReclaim.value as { protocol?: unknown; pid?: unknown } | null;
+      if (rv?.protocol === GUARD_PROTOCOL && isDead(rv.pid) && Date.now() - staleReclaim.mtimeMs > RECLAIM_STALE_MS) {
+        unlinkSync(reclaim);
+      }
+    } catch { /* ignore ENOENT or transient race */ }
+    return false;
+  }
+  try {
+    const current = privateJsonWithStat(store, path, "registry guard");
+    const cv = current.value as { protocol?: unknown; pid?: unknown; token?: unknown } | null;
+    const ov = observed.value as { protocol?: unknown; pid?: unknown; token?: unknown };
+    if (
+      current.dev === observed.dev
+      && current.ino === observed.ino
+      && cv?.protocol === GUARD_PROTOCOL
+      && cv.pid === ov.pid
+      && cv.token === ov.token
+      && isDead(cv.pid)
+    ) {
+      unlinkSync(path);
+      return true;
+    }
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  } finally {
+    releaseGuardFile(store, reclaim, reclaimOwner, "registry guard reclaim");
+  }
+}
+
 function acquireGuard(store: RegistryStore): Guard {
   ensureRoot(store);
   const guard = { protocol: GUARD_PROTOCOL, pid: process.pid, token: randomUUID() };
   const deadline = Date.now() + store.guardTimeoutMs;
+  let backoffMs = 5;
   for (;;) {
+    store.onGuardAttempt?.();
     try { publishExclusivePrivate(guardPath(store), guard); return { pid: guard.pid, token: guard.token }; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw unavailable("cannot create registry guard", error, guardSnapshot(store));
     }
-    let observed: any;
-    try { observed = privateJson(store, guardPath(store), "registry guard"); }
+    let observed: PrivateJsonWithStat;
+    try { observed = privateJsonWithStat(store, guardPath(store), "registry guard"); }
     catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       // guard在原子替换窗口内可能已经被另一合法owner发布；只对这个精确竞态重读，
       // malformed、权限、owner、类型和symlink异常仍然fail closed。
       if ((code === "ENOENT" || (error as Error).message === "registry guard changed while opening") && Date.now() < deadline) continue;
+      if (code === "ENOENT") throw busy("registry guard is held; inspect and remove .guard manually after verifying its owner");
       throw unavailable("registry guard is invalid", error, guardSnapshot(store));
     }
-    // 共享 guard 陈旧或损坏时只能人工确认后恢复，当前进程绝不能删除它。
-    if (Date.now() >= deadline) throw busy("registry guard is held; inspect and remove .guard manually after verifying its owner");
+    const ov = observed.value as { protocol?: unknown; pid?: unknown; token?: unknown } | null;
+    if (ov?.protocol === GUARD_PROTOCOL && typeof ov.token === "string" && isDead(ov.pid) && tryReclaimDeadGuard(store, observed)) {
+      try {
+        store.onGuardAttempt?.();
+        publishExclusivePrivate(guardPath(store), guard);
+        return { pid: guard.pid, token: guard.token };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw unavailable("cannot create registry guard", error, guardSnapshot(store));
+      }
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) throw busy("registry guard is held; inspect and remove .guard manually after verifying its owner");
+    const jitter = Math.floor(Math.random() * Math.max(1, Math.floor(backoffMs / 2)));
+    const delayMs = Math.min(remainingMs, backoffMs + jitter);
+    (store.sleepMs ?? defaultSleepMs)(delayMs);
+    backoffMs = Math.min(backoffMs * 2, 40);
   }
 }
 
 function releaseGuard(store: RegistryStore, guard: Guard): void {
-  try {
-    const observed: any = privateJson(store, guardPath(store), "registry guard");
-    if (observed?.protocol === GUARD_PROTOCOL && observed.pid === guard.pid && observed.token === guard.token) unlinkSync(guardPath(store));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw unavailable("cannot release registry guard", error, guardSnapshot(store));
-  }
+  releaseGuardFile(store, guardPath(store), guard, "registry guard");
 }
 
 function withGuard<T>(store: RegistryStore, operation: () => T): T {
   const guard = acquireGuard(store);
   try { return operation(); }
-  finally { releaseGuard(store, guard); }
-}
-
-async function withGuardAsync<T>(store: RegistryStore, operation: () => Promise<T>): Promise<T> {
-  const guard = acquireGuard(store);
-  try { return await operation(); }
   finally { releaseGuard(store, guard); }
 }
 
@@ -454,9 +540,9 @@ function conflict(records: readonly ProcessOwnerRecord[], reservation: LaunchRes
 
 export async function prepareLaunch(input: PrepareLaunchInput): Promise<PrepareLaunchResult> {
   try {
-    return await withGuardAsync(input.store, async () => {
-      const reservation = input.resolveReservation ? await input.resolveReservation() : input.reservation;
-      if (!reservation) throw unavailable("launch reservation is unavailable");
+    const reservation = input.resolveReservation ? await input.resolveReservation() : input.reservation;
+    if (!reservation) throw unavailable("launch reservation is unavailable");
+    return withGuard(input.store, () => {
       const records = recordsLocked(input.store);
       const existing = conflict(records, reservation);
       if (existing) {

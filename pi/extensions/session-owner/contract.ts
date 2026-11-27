@@ -228,9 +228,13 @@ export function readSessionHeaderBytes(path: string): Buffer {
   const fd = openSync(path, "r");
   try {
     const buffer = Buffer.allocUnsafe(MAX_SESSION_HEADER_BYTES);
-    for (let offset = 0; offset < buffer.length; offset += 1) {
-      if (readSync(fd, buffer, offset, 1, offset) === 0) return buffer.subarray(0, offset);
-      if (buffer[offset] === 10) return buffer.subarray(0, offset + 1);
+    let total = 0;
+    while (total < buffer.length) {
+      const bytes = readSync(fd, buffer, total, buffer.length - total, total);
+      if (bytes === 0) return buffer.subarray(0, total);
+      const newlineOffset = buffer.subarray(total, total + bytes).indexOf(10);
+      if (newlineOffset >= 0) return buffer.subarray(0, total + newlineOffset + 1);
+      total += bytes;
     }
     return buffer;
   } finally { closeSync(fd); }
