@@ -1,4 +1,9 @@
-import { extractTextFromContent, readSteerEntries, truncateTail, writeOutcomeFile } from "./protocol.ts";
+import {
+  extractTextFromContent,
+  readSteerEntriesFromOffset,
+  truncateTail,
+  writeOutcomeFile,
+} from "./protocol.ts";
 import type { WorkerOutcome } from "./protocol.ts";
 
 export interface PiExtensionContextLike {
@@ -74,6 +79,7 @@ export function registerPiWorkerExtension(
   let abortOnTurnEnd = false;
   let forcedErrorExitCode = false;
   let steerTimer: NodeJS.Timeout | null = null;
+  let steerOffset = 0;
   const consumedSteerIds = new Set<string>();
 
   const clearSteerTimer = (): void => {
@@ -84,14 +90,16 @@ export function registerPiWorkerExtension(
   };
 
   /**
-   * 消费未读 steer 队列条目：按 id 去重保证每条至多注入一次；
+   * 消费未读 steer 队列条目：按字节偏移增量读取并按 id 去重保证每条至多注入一次；
    * 已写终态（worker_finish / worker_ask_parent / worker_report_blocked）后不再注入。
    * 返回本次是否注入了新消息。
    */
   const consumeSteers = (): boolean => {
     if (!steerFile || terminalWritten || !pi.sendUserMessage) return false;
+    const { entries, nextOffset } = readSteerEntriesFromOffset(steerFile, steerOffset);
+    steerOffset = nextOffset;
     let injected = false;
-    for (const entry of readSteerEntries(steerFile)) {
+    for (const entry of entries) {
       if (consumedSteerIds.has(entry.id)) continue;
       // 先标记后注入：即使注入异常也保证至多消费一次
       consumedSteerIds.add(entry.id);
@@ -107,7 +115,7 @@ export function registerPiWorkerExtension(
 
   const hasUnconsumedSteers = (): boolean => {
     if (!steerFile || terminalWritten) return false;
-    return readSteerEntries(steerFile).some((entry) => !consumedSteerIds.has(entry.id));
+    return readSteerEntriesFromOffset(steerFile, steerOffset).entries.some((entry) => !consumedSteerIds.has(entry.id));
   };
 
   const clearForcedErrorExitCode = (): void => {

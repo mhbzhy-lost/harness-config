@@ -401,16 +401,53 @@ function makeProgressEmitter(progressToken: unknown): ((ev: FormattedStreamEvent
   };
 }
 
-// 会话标题懒补齐（仅 AGY 模式）：进程内内存缓存，任意失败静默 fail-open，绝不阻塞工具调用。
+// 会话标题懒补齐（仅 AGY 模式）：进程内 LRU 缓存，任意失败静默 fail-open，绝不阻塞工具调用。
 // 注意：多会话共享同一 MCP server 进程，这里只缓存“会话 ID → 标题”映射，严禁引入进程级 lastScope 状态。
-const conversationTitleCache = new Map<string, string | null>();
+const TITLE_CACHE_MAX_ENTRIES = 256;
+const TITLE_CACHE_HIT_TTL_MS = 30 * 60 * 1000;
+const TITLE_CACHE_MISS_TTL_MS = (() => {
+  const raw = Number(process.env.PI_WORKER_TITLE_MISS_TTL_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : 15_000;
+})();
+
+interface TitleCacheEntry {
+  value: string | null;
+  expiresAt: number;
+}
+
+const conversationTitleCache = new Map<string, TitleCacheEntry>();
+
+function getCachedConversationTitle(key: string): string | null | undefined {
+  const entry = conversationTitleCache.get(key);
+  if (!entry) return undefined;
+  if (Date.now() >= entry.expiresAt) {
+    conversationTitleCache.delete(key);
+    return undefined;
+  }
+  conversationTitleCache.delete(key);
+  conversationTitleCache.set(key, entry);
+  return entry.value;
+}
+
+function setCachedConversationTitle(key: string, value: string | null): void {
+  if (conversationTitleCache.has(key)) {
+    conversationTitleCache.delete(key);
+  }
+  while (conversationTitleCache.size >= TITLE_CACHE_MAX_ENTRIES) {
+    const oldestKey = conversationTitleCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    conversationTitleCache.delete(oldestKey);
+  }
+  const ttl = value !== null ? TITLE_CACHE_HIT_TTL_MS : TITLE_CACHE_MISS_TTL_MS;
+  conversationTitleCache.set(key, { value, expiresAt: Date.now() + ttl });
+}
 
 async function fetchConversationTitle(parentSessionId: string): Promise<string | null> {
   if (!agyMode || !parentSessionId) return null;
   const address = process.env.ANTIGRAVITY_LS_ADDRESS?.trim();
   const csrfToken = process.env.ANTIGRAVITY_CSRF_TOKEN?.trim();
   if (!address || !csrfToken) return null;
-  const cached = conversationTitleCache.get(parentSessionId);
+  const cached = getCachedConversationTitle(parentSessionId);
   if (cached !== undefined) return cached;
   let title: string | null = null;
   try {
@@ -440,7 +477,7 @@ async function fetchConversationTitle(parentSessionId: string): Promise<string |
   } catch {
     // 超时/网络/解析异常一律静默降级
   }
-  conversationTitleCache.set(parentSessionId, title);
+  setCachedConversationTitle(parentSessionId, title);
   return title;
 }
 

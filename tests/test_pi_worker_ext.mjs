@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { readOutcomeFile, appendSteerEntry } from "../plugins/pi-worker/src/protocol.ts";
+import { readOutcomeFile, appendSteerEntry, readSteerEntriesFromOffset } from "../plugins/pi-worker/src/protocol.ts";
 import piWorkerExtension, { registerPiWorkerExtension } from "../plugins/pi-worker/src/worker-ext.ts";
 
 function createMockPi({ withSendUserMessage = false } = {}) {
@@ -377,6 +377,51 @@ test("test_agent_end_handles_natural_done_and_sets_exit_code_on_error_stop_reaso
     }, {});
     assert.deepEqual(exitHistory, [1, 0]);
     assert.equal(readOutcomeFile(retryFile)?.status, "done");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_read_steer_entries_from_offset_consumes_complete_lines_and_resets_on_truncate", async () => {
+  const { statSync, writeFileSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-steer-offset-"));
+  try {
+    const steerPath = join(dir, "steer.jsonl");
+    assert.deepEqual(readSteerEntriesFromOffset(steerPath, 0), { entries: [], nextOffset: 0 });
+
+    const line1 = `${JSON.stringify({ id: "s1", message: "第一条指令", createdAt: "t1" })}\n`;
+    const line2Full = `${JSON.stringify({ id: "s2", message: "第二条中文指令", createdAt: "t2" })}\n`;
+    const halfCut = Math.floor(line2Full.length / 2);
+    writeFileSync(steerPath, line1 + line2Full.slice(0, halfCut), "utf8");
+
+    const r1 = readSteerEntriesFromOffset(steerPath, 0);
+    assert.equal(r1.entries.length, 1);
+    assert.equal(r1.entries[0].id, "s1");
+    assert.equal(r1.nextOffset, Buffer.byteLength(line1, "utf8"));
+
+    // 再次读取未补全的半行：不消费、不推进 nextOffset
+    const r2 = readSteerEntriesFromOffset(steerPath, r1.nextOffset);
+    assert.deepEqual(r2, { entries: [], nextOffset: r1.nextOffset });
+
+    // 补全第二行后继续增量读取
+    writeFileSync(steerPath, line1 + line2Full, "utf8");
+    const r3 = readSteerEntriesFromOffset(steerPath, r1.nextOffset);
+    assert.equal(r3.entries.length, 1);
+    assert.equal(r3.entries[0].id, "s2");
+    assert.equal(r3.entries[0].message, "第二条中文指令");
+    assert.equal(r3.nextOffset, statSync(steerPath).size);
+
+    // 无变化时零增量返回
+    const r4 = readSteerEntriesFromOffset(steerPath, r3.nextOffset);
+    assert.deepEqual(r4, { entries: [], nextOffset: r3.nextOffset });
+
+    // 文件被截断短于 offset 时自动归零重读
+    const line3 = `${JSON.stringify({ id: "s3", message: "截断后新条目", createdAt: "t3" })}\n`;
+    writeFileSync(steerPath, line3, "utf8");
+    const r5 = readSteerEntriesFromOffset(steerPath, r3.nextOffset + 100);
+    assert.equal(r5.entries.length, 1);
+    assert.equal(r5.entries[0].id, "s3");
+    assert.equal(r5.nextOffset, Buffer.byteLength(line3, "utf8"));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

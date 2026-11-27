@@ -874,3 +874,103 @@ test("test_mcp_steer_tool_standard_and_agy_app_only_with_eager_config", async ()
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("test_mcp_conversation_title_cache_short_miss_ttl_and_lru_capacity", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-mcp-title-lru-"));
+  let client;
+  let lsServer;
+  try {
+    const fakePi = createFakePiForMcp(dir, join(dir, "rounds.txt"), join(dir, "sleep.pid"));
+    const hits = new Map();
+    let flakyShouldFail = true;
+
+    lsServer = createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        const parsed = JSON.parse(body || "{}");
+        const id = String(parsed.conversationId ?? "");
+        hits.set(id, (hits.get(id) ?? 0) + 1);
+        res.setHeader("Content-Type", "application/json");
+        if (id === "conv-flaky" && flakyShouldFail) {
+          res.statusCode = 500;
+          res.end(JSON.stringify({ error: "transient" }));
+          return;
+        }
+        res.end(JSON.stringify({ annotations: { title: `标题:${id}` } }));
+      });
+    });
+    await new Promise((r) => lsServer.listen(0, "127.0.0.1", r));
+
+    client = startMcpClient({
+      PI_WORKER_BIN: fakePi,
+      PI_WORKER_STATE_DIR: join(dir, "state"),
+      PI_WORKER_AGY: "1",
+      ANTIGRAVITY_LS_ADDRESS: `127.0.0.1:${lsServer.address().port}`,
+      ANTIGRAVITY_CSRF_TOKEN: "test-csrf",
+      PI_WORKER_TITLE_MISS_TTL_MS: "80",
+    });
+
+    // 1. 瞬态失败返回 null 后在短 TTL 内走缓存，TTL 到期后可重新获取成功
+    const m1 = (await client.request("tools/call", {
+      name: "pi_worker_monitor",
+      arguments: { parentSessionId: "conv-flaky" },
+    })).result.structuredContent;
+    assert.equal(m1.scope.parentSessionTitle, null);
+    assert.equal(hits.get("conv-flaky"), 1);
+
+    const m2 = (await client.request("tools/call", {
+      name: "pi_worker_monitor",
+      arguments: { parentSessionId: "conv-flaky" },
+    })).result.structuredContent;
+    assert.equal(m2.scope.parentSessionTitle, null);
+    assert.equal(hits.get("conv-flaky"), 1);
+
+    flakyShouldFail = false;
+    await new Promise((r) => setTimeout(r, 120));
+    const m3 = (await client.request("tools/call", {
+      name: "pi_worker_monitor",
+      arguments: { parentSessionId: "conv-flaky" },
+    })).result.structuredContent;
+    assert.equal(m3.scope.parentSessionTitle, "标题:conv-flaky");
+    assert.equal(hits.get("conv-flaky"), 2);
+
+    // 2. LRU 容量上限 256：写满 256 项，刷新 conv-lru-0 后插入第 257 项，仅淘汰最久未用的 conv-lru-1
+    for (let i = 0; i < 255; i += 1) {
+      await client.request("tools/call", {
+        name: "pi_worker_monitor",
+        arguments: { parentSessionId: `conv-lru-${i}` },
+      });
+    }
+    assert.equal(hits.get("conv-lru-0"), 1);
+    await client.request("tools/call", {
+      name: "pi_worker_monitor",
+      arguments: { parentSessionId: "conv-flaky" },
+    });
+    await client.request("tools/call", {
+      name: "pi_worker_monitor",
+      arguments: { parentSessionId: "conv-lru-0" },
+    });
+    assert.equal(hits.get("conv-flaky"), 2);
+    assert.equal(hits.get("conv-lru-0"), 1);
+
+    await client.request("tools/call", {
+      name: "pi_worker_monitor",
+      arguments: { parentSessionId: "conv-lru-255" },
+    });
+    await client.request("tools/call", {
+      name: "pi_worker_monitor",
+      arguments: { parentSessionId: "conv-lru-0" },
+    });
+    assert.equal(hits.get("conv-lru-0"), 1);
+    await client.request("tools/call", {
+      name: "pi_worker_monitor",
+      arguments: { parentSessionId: "conv-lru-1" },
+    });
+    assert.equal(hits.get("conv-lru-1"), 2);
+  } finally {
+    if (client) await client.close().catch(() => {});
+    if (lsServer) await new Promise((r) => lsServer.close(r));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

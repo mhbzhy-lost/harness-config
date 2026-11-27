@@ -80,6 +80,11 @@ const STREAMDOWN_CONTROLS = {
 } as const;
 
 const LINK_SAFETY = { enabled: false } as const;
+const MAX_UI_EVENTS = 2000;
+
+function sliceUiEventsWindow<T>(list: readonly T[], maxEvents = MAX_UI_EVENTS): T[] {
+  return list.length > maxEvents ? list.slice(list.length - maxEvents) : (list as T[]);
+}
 
 function fmtTime(iso?: string): string {
   return iso && iso.length >= 19 ? iso.slice(11, 19) : iso || "";
@@ -502,9 +507,9 @@ function MonitorApp() {
       hasMore = payload.stream.hasMore;
       const incomingEvents = payload.stream.events;
       if (streamReset) {
-        setEvents(incomingEvents);
+        setEvents(sliceUiEventsWindow(incomingEvents));
       } else if (incomingEvents.length > 0) {
-        setEvents((prev) => [...prev, ...incomingEvents]);
+        setEvents((prev) => sliceUiEventsWindow([...prev, ...incomingEvents]));
       }
     } else if (shouldReset) {
       setEvents([]);

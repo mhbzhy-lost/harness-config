@@ -11,6 +11,7 @@ import {
   statSync,
   unlinkSync,
 } from "node:fs";
+import type { WriteStream } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -88,6 +89,8 @@ const MAX_EXECUTED_COMMANDS = 50;
 const MAX_EXECUTED_COMMAND_PREVIEW_CHARS = 300;
 const MAX_STDERR_CHARS = 16 * 1024;
 const CANCEL_GRACE_MS = 3000;
+const PIPE_DRAIN_GRACE_MS = 1500;
+const STREAM_END_TIMEOUT_MS = 1000;
 const GIT_STATUS_TIMEOUT_MS = 2000;
 const MAX_GIT_STATUS_LINES = 50;
 
@@ -159,6 +162,8 @@ export interface PiWorkerRunnerOptions {
   env?: NodeJS.ProcessEnv;
   piBinary?: string;
   collectGitChanges?: (cwd: string) => Promise<string[]>;
+  pipeDrainGraceMs?: number;
+  streamEndTimeoutMs?: number;
 }
 
 interface ActiveExecution {
@@ -170,6 +175,7 @@ interface ActiveExecution {
   settled: Promise<TaskRecord>;
   waiters: Set<(record: TaskRecord) => void>;
   onProgress?: (event: FormattedStreamEvent) => void;
+  emitSteerEvent?: (input: { message: string; source?: "agent" | "app"; timestamp?: string }) => Promise<FormattedStreamEvent>;
 }
 
 export function isNestedWorkerEnv(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -325,11 +331,122 @@ async function waitUntilPidExits(pid: number, timeoutMs: number): Promise<boolea
   return !defaultIsPidAlive(pid);
 }
 
+function endStreamWithTimeout(stream: WriteStream, timeoutMs: number): Promise<void> {
+  if (stream.destroyed || stream.writableEnded) return Promise.resolve();
+  return new Promise<void>((resolveDone) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolveDone();
+    };
+    const timer = setTimeout(() => {
+      try { stream.destroy(); } catch { /* 忽略 */ }
+      finish();
+    }, timeoutMs);
+    timer.unref?.();
+    stream.once("error", finish);
+    stream.once("close", finish);
+    try {
+      stream.end(finish);
+    } catch {
+      finish();
+    }
+  });
+}
+
+function stripDiagnosticNodeOptions(raw: string | undefined): string | undefined {
+  if (!raw || !raw.trim()) return undefined;
+  const tokens: string[] = [];
+  let current = "";
+  let inToken = false;
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i];
+    if (escaped) {
+      current += ch;
+      inToken = true;
+      escaped = false;
+      continue;
+    }
+    if (quote === "'") {
+      if (ch === "'") {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      inToken = true;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') {
+        quote = null;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else {
+        current += ch;
+      }
+      inToken = true;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      inToken = true;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      inToken = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (inToken) {
+        tokens.push(current);
+        current = "";
+        inToken = false;
+      }
+      continue;
+    }
+    current += ch;
+    inToken = true;
+  }
+  if (escaped) current += "\\";
+  if (inToken) tokens.push(current);
+
+  const kept: string[] = [];
+  for (let i = 0; i < tokens.length; i += 1) {
+    const tok = tokens[i];
+    if (
+      tok === "--heapsnapshot-near-heap-limit"
+      || tok === "--diagnostic-dir"
+    ) {
+      // 空格分隔参数形式（如 --diagnostic-dir /tmp/dir）一并跳过其值
+      if (i + 1 < tokens.length && !tokens[i + 1].startsWith("-")) {
+        i += 1;
+      }
+      continue;
+    }
+    if (
+      tok.startsWith("--heapsnapshot-near-heap-limit=")
+      || tok.startsWith("--diagnostic-dir=")
+    ) {
+      continue;
+    }
+    kept.push(/[\s"'\\]/.test(tok) ? `"${tok.replace(/([\\"])/g, "\\$1")}"` : tok);
+  }
+  return kept.length > 0 ? kept.join(" ") : undefined;
+}
+
 export class PiWorkerRunner {
   readonly store: TaskStore;
   private readonly baseEnv: NodeJS.ProcessEnv;
   private readonly explicitPiBinary?: string;
   private readonly collectGitChangesFn: (cwd: string) => Promise<string[]>;
+  private readonly pipeDrainGraceMs: number;
+  private readonly streamEndTimeoutMs: number;
   private readonly active = new Map<string, ActiveExecution>();
   private readonly inFlight = new Set<string>();
   private shutdownPromise: Promise<void> | null = null;
@@ -339,6 +456,8 @@ export class PiWorkerRunner {
     this.store = options.store ?? new TaskStore(undefined);
     this.explicitPiBinary = options.piBinary;
     this.collectGitChangesFn = options.collectGitChanges ?? collectGitChanges;
+    this.pipeDrainGraceMs = options.pipeDrainGraceMs ?? PIPE_DRAIN_GRACE_MS;
+    this.streamEndTimeoutMs = options.streamEndTimeoutMs ?? STREAM_END_TIMEOUT_MS;
   }
 
   private assertNotNested(): void {
@@ -383,6 +502,12 @@ export class PiWorkerRunner {
     };
     delete childEnv.PI_SESSION_OWNER_ID;
     delete childEnv.PI_WORKER_AGY;
+    const sanitizedNodeOpts = stripDiagnosticNodeOptions(childEnv.NODE_OPTIONS);
+    if (sanitizedNodeOpts) {
+      childEnv.NODE_OPTIONS = sanitizedNodeOpts;
+    } else {
+      delete childEnv.NODE_OPTIONS;
+    }
     return childEnv;
   }
 
@@ -430,31 +555,54 @@ export class PiWorkerRunner {
     const now = new Date().toISOString();
     record.status = "running";
     record.pid = child.pid ?? null;
+    const pidSig = child.pid ? this.store.getProcessSignature(child.pid) : null;
+    if (pidSig) {
+      record.pidSignature = pidSig;
+    } else {
+      delete record.pidSignature;
+    }
     record.updatedAt = now;
     record.lastActivityAt = now;
 
-    this.inFlight.add(record.taskId);
-    this.store.save(record);
-
+    let logStream: WriteStream | null = null;
+    let eventsStream: WriteStream | null = null;
+    let execState: ActiveExecution;
     let resolveSettled!: (finalRecord: TaskRecord) => void;
-    const settled = new Promise<TaskRecord>((r) => { resolveSettled = r; });
 
-    const execState: ActiveExecution = {
-      record,
-      child,
-      cancelled: false,
-      finalizing: false,
-      killTimer: null,
-      settled,
-      waiters: new Set(),
-      ...(onProgress ? { onProgress } : {}),
-    };
-    this.active.set(record.taskId, execState);
+    try {
+      this.inFlight.add(record.taskId);
+      this.store.save(record);
 
-    const logStream = createWriteStream(record.logPath, { flags: "a", mode: 0o600 });
-    logStream.on("error", () => { /* 日志写入失败不阻塞主流程 */ });
-    const eventsStream = createWriteStream(record.eventsPath, { flags: "a", mode: 0o600 });
-    eventsStream.on("error", () => { /* 进度流写入失败不阻塞主流程 */ });
+      const settled = new Promise<TaskRecord>((r) => { resolveSettled = r; });
+
+      execState = {
+        record,
+        child,
+        cancelled: false,
+        finalizing: false,
+        killTimer: null,
+        settled,
+        waiters: new Set(),
+        ...(onProgress ? { onProgress } : {}),
+      };
+      this.active.set(record.taskId, execState);
+
+      logStream = createWriteStream(record.logPath, { flags: "a", mode: 0o600 });
+      logStream.on("error", () => { /* 日志写入失败不阻塞主流程 */ });
+      eventsStream = createWriteStream(record.eventsPath, { flags: "a", mode: 0o600 });
+      eventsStream.on("error", () => { /* 进度流写入失败不阻塞主流程 */ });
+    } catch (err) {
+      signalProcessGroup(child, "SIGKILL");
+      try { logStream?.destroy(); } catch { /* 忽略 */ }
+      try { eventsStream?.destroy(); } catch { /* 忽略 */ }
+      this.active.delete(record.taskId);
+      this.inFlight.delete(record.taskId);
+      if (holdsWriteLock) this.store.releaseCwdLock(record.cwd, record.taskId);
+      throw err;
+    }
+
+    const activeLogStream = logStream;
+    const activeEventsStream = eventsStream;
     const eventFormatter = createEventFormatter({ round: record.roundCount });
     const pendingBashCommands = new Map<string, { command: string; startSeq: number }>();
     const compactCommandPreview = (text: string): string => {
@@ -464,7 +612,7 @@ export class PiWorkerRunner {
     };
     const recordFormattedEvents = (formatted: FormattedStreamEvent[]): void => {
       for (const item of formatted) {
-        eventsStream.write(`${JSON.stringify(item)}\n`);
+        activeEventsStream.write(`${JSON.stringify(item)}\n`);
         if (item.kind === "tool_start" && item.toolName === "bash") {
           const key = item.toolCallId ?? "bash";
           pendingBashCommands.set(key, {
@@ -492,6 +640,25 @@ export class PiWorkerRunner {
       }
     };
 
+    execState.emitSteerEvent = async (input) => {
+      if (activeEventsStream.destroyed || activeEventsStream.writableEnded) {
+        const fallbackEv = appendSteerEvent(record.eventsPath, {
+          round: record.roundCount,
+          message: input.message,
+          source: input.source,
+          timestamp: input.timestamp,
+        });
+        try { onProgress?.(fallbackEv); } catch { /* 进度通知异常不阻塞主流程 */ }
+        return fallbackEv;
+      }
+      const ev = eventFormatter.emitSteer(input.message, input.source, input.timestamp);
+      await new Promise<void>((resolveWrite) => {
+        activeEventsStream.write(`${JSON.stringify(ev)}\n`, () => resolveWrite());
+      });
+      try { onProgress?.(ev); } catch { /* 进度通知异常不阻塞主流程 */ }
+      return ev;
+    };
+
     let lastAssistantText = "";
     let lastStopReason: string | null = null;
     let lastErrorMessage: string | null = null;
@@ -502,7 +669,7 @@ export class PiWorkerRunner {
 
     const lineSplitter = createLineSplitter((line) => {
       if (!line.trim()) return;
-      logStream.write(`${line}\n`);
+      activeLogStream.write(`${line}\n`);
       recordFormattedEvents(eventFormatter.feedRawLine(line));
 
       const assistant = extractAssistantMessage(line);
@@ -545,12 +712,12 @@ export class PiWorkerRunner {
     });
 
     child.stdin?.on("error", () => {
-      // 子进程提前退出触发 EPIPE 时忽略，由 close 统一处理
+      // 子进程提前退出触发 EPIPE 时忽略，由 close/exit 统一处理
     });
     try {
       child.stdin?.end(promptText, "utf8");
     } catch {
-      // 忽略同步写入错误，由 close 统一处理
+      // 忽略同步写入错误，由 close/exit 统一处理
     }
 
     child.on("error", (err) => {
@@ -563,90 +730,114 @@ export class PiWorkerRunner {
         execState.killTimer = null;
       }
 
-      lineSplitter.flush();
-      recordFormattedEvents(eventFormatter.flush());
-      await new Promise<void>((done) => {
-        logStream.end(() => done());
-      });
+      try {
+        lineSplitter.flush();
+        recordFormattedEvents(eventFormatter.flush());
+        await endStreamWithTimeout(activeLogStream, this.streamEndTimeoutMs);
 
-      const endedAt = new Date().toISOString();
-      record.pid = null;
-      record.exitCode = exitCode;
-      record.updatedAt = endedAt;
-      record.lastActivityAt = endedAt;
+        const endedAt = new Date().toISOString();
+        record.pid = null;
+        delete record.pidSignature;
+        record.exitCode = exitCode;
+        record.updatedAt = endedAt;
+        record.lastActivityAt = endedAt;
 
-      const outcome = readOutcomeFile(record.outcomePath);
+        const outcome = readOutcomeFile(record.outcomePath);
 
-      if (execState.cancelled) {
-        record.status = "cancelled";
-        record.error = "cancelled by user";
-      } else if (spawnError) {
-        record.status = "failed";
-        record.error = `spawn error: ${spawnError.message}`;
-      } else if (outcome) {
-        record.status = outcome.status;
-        record.summary = outcome.summary || null;
-        record.question = outcome.question;
-        record.options = outcome.options;
-        record.verifiedCommands = outcome.verifiedCommands;
-        record.stopReason = outcome.stopReason ?? lastStopReason;
-        record.error = outcome.error;
-      } else if (exitCode !== 0) {
-        record.status = "failed";
-        record.stopReason = lastStopReason;
-        const detail = truncateTail(stderrBuf.trim(), 4000);
-        record.error = detail || (signal ? `terminated by ${signal}` : `pi exited with code ${exitCode}`);
-      } else if (
-        lastStopReason === "error"
-        || lastStopReason === "aborted"
-        || sawRetryFailed
-        || sawAgentAborted
-      ) {
-        record.status = "failed";
-        record.stopReason = lastStopReason;
-        record.error = lastErrorMessage ?? lastStopReason ?? "agent execution failed";
-      } else {
-        record.status = "done";
-        record.stopReason = lastStopReason;
-        record.summary = lastAssistantText ? truncateTail(lastAssistantText.trim(), 4000) : "";
-        record.question = null;
-        record.options = [];
-        record.verifiedCommands = [];
-        record.error = null;
+        if (execState.cancelled) {
+          record.status = "cancelled";
+          record.error = "cancelled by user";
+        } else if (spawnError) {
+          record.status = "failed";
+          record.error = `spawn error: ${spawnError.message}`;
+        } else if (outcome) {
+          record.status = outcome.status;
+          record.summary = outcome.summary || null;
+          record.question = outcome.question;
+          record.options = outcome.options;
+          record.verifiedCommands = outcome.verifiedCommands;
+          record.stopReason = outcome.stopReason ?? lastStopReason;
+          record.error = outcome.error;
+        } else if (exitCode !== 0) {
+          record.status = "failed";
+          record.stopReason = lastStopReason;
+          const detail = truncateTail(stderrBuf.trim(), 4000);
+          record.error = detail || (signal ? `terminated by ${signal}` : `pi exited with code ${exitCode}`);
+        } else if (
+          lastStopReason === "error"
+          || lastStopReason === "aborted"
+          || sawRetryFailed
+          || sawAgentAborted
+        ) {
+          record.status = "failed";
+          record.stopReason = lastStopReason;
+          record.error = lastErrorMessage ?? lastStopReason ?? "agent execution failed";
+        } else {
+          record.status = "done";
+          record.stopReason = lastStopReason;
+          record.summary = lastAssistantText ? truncateTail(lastAssistantText.trim(), 4000) : "";
+          record.question = null;
+          record.options = [];
+          record.verifiedCommands = [];
+          record.error = null;
+        }
+
+        recordFormattedEvents([
+          eventFormatter.emitStatus(
+            record.status,
+            record.question ?? record.error ?? record.summary ?? undefined,
+          ),
+        ]);
+        await endStreamWithTimeout(activeEventsStream, this.streamEndTimeoutMs);
+
+        record.gitChanges = await this.collectGitChangesFn(record.cwd);
+        tightenSessionPermissions(record.sessionDir, record.taskId);
+
+        // 终态一次性原子落盘后再释放锁与 inFlight 保护，消除 orphan_process 竞态
+        this.store.save(record);
+      } finally {
+        if (holdsWriteLock) this.store.releaseCwdLock(record.cwd, record.taskId);
+        this.active.delete(record.taskId);
+        this.inFlight.delete(record.taskId);
+
+        for (const notify of execState.waiters) {
+          notify(record);
+        }
+        execState.waiters.clear();
+        resolveSettled(record);
       }
-
-      recordFormattedEvents([
-        eventFormatter.emitStatus(
-          record.status,
-          record.question ?? record.error ?? record.summary ?? undefined,
-        ),
-      ]);
-      await new Promise<void>((done) => {
-        eventsStream.end(() => done());
-      });
-
-      record.gitChanges = await this.collectGitChangesFn(record.cwd);
-      tightenSessionPermissions(record.sessionDir, record.taskId);
-
-      // 终态一次性原子落盘后再释放锁与 inFlight 保护，消除 orphan_process 竞态
-      this.store.save(record);
-      if (holdsWriteLock) this.store.releaseCwdLock(record.cwd, record.taskId);
-      this.active.delete(record.taskId);
-      this.inFlight.delete(record.taskId);
-
-      for (const notify of execState.waiters) {
-        notify(record);
-      }
-      execState.waiters.clear();
-      resolveSettled(record);
     };
 
     let finalized = false;
-    child.on("close", (code, signal) => {
+    let drainGraceTimer: NodeJS.Timeout | null = null;
+    const triggerFinalize = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (drainGraceTimer) {
+        clearTimeout(drainGraceTimer);
+        drainGraceTimer = null;
+      }
       if (finalized) return;
       finalized = true;
       execState.finalizing = true;
       void finalize(code, signal);
+    };
+
+    child.on("exit", (code, signal) => {
+      if (finalized || drainGraceTimer) return;
+      drainGraceTimer = setTimeout(() => {
+        drainGraceTimer = null;
+        if (finalized) return;
+        // 先清杀继承管道的残留孙进程组（防止释锁后继续写入工作区），再销毁管道收尾
+        signalProcessGroup(child, "SIGKILL");
+        try { child.stdin?.destroy(); } catch { /* 忽略 */ }
+        try { child.stdout?.destroy(); } catch { /* 忽略 */ }
+        try { child.stderr?.destroy(); } catch { /* 忽略 */ }
+        triggerFinalize(code, signal);
+      }, this.pipeDrainGraceMs);
+      drainGraceTimer.unref?.();
+    });
+
+    child.on("close", (code, signal) => {
+      triggerFinalize(code, signal);
     });
 
     return execState;
@@ -855,19 +1046,20 @@ export class PiWorkerRunner {
     const steerId = randomUUID();
     const queuedAt = new Date().toISOString();
     appendSteerEntry(snapshot.steerPath, { id: steerId, message, createdAt: queuedAt, source });
-    const ev = appendSteerEvent(snapshot.eventsPath, {
-      round: snapshot.roundCount,
-      message,
-      source,
-      timestamp: queuedAt,
-    });
 
     const active = this.active.get(snapshot.taskId);
-    if (active) {
+    if (active && !active.finalizing && active.emitSteerEvent) {
+      await active.emitSteerEvent({ message, source, timestamp: queuedAt });
       active.record.lastActivityAt = queuedAt;
       active.record.updatedAt = queuedAt;
       this.store.save(active.record);
-      try { active.onProgress?.(ev); } catch { /* 进度通知异常不阻塞入队 */ }
+    } else {
+      appendSteerEvent(snapshot.eventsPath, {
+        round: snapshot.roundCount,
+        message,
+        source,
+        timestamp: queuedAt,
+      });
     }
 
     return { taskId: snapshot.taskId, steerId, queued: true, status: "running", message, queuedAt, source };
@@ -906,8 +1098,24 @@ export class PiWorkerRunner {
     }
 
     if (existing.status === "running" && existing.pid !== null) {
-      // 跨进程运行的 detached 任务：发 SIGTERM 并等待真正退出，超时再发 SIGKILL，确认已死才释放 cwd 锁
+      // 跨进程运行的 detached 任务：若记录含 pidSignature，先核验进程启动时间防止 PID 复用误杀无关进程组
       const targetPid = existing.pid;
+      if (existing.pidSignature) {
+        const actualSig = this.store.getProcessSignature(targetPid);
+        if (actualSig !== existing.pidSignature) {
+          const updated: TaskRecord = {
+            ...existing,
+            status: "cancelled",
+            pid: null,
+            error: "cancelled by user",
+            updatedAt: new Date().toISOString(),
+          };
+          delete updated.pidSignature;
+          this.store.save(updated);
+          this.store.releaseCwdLock(updated.cwd, updated.taskId);
+          return { task: updated, wasRunning: false };
+        }
+      }
       try { process.kill(-targetPid, "SIGTERM"); } catch {
         try { process.kill(targetPid, "SIGTERM"); } catch { /* 忽略 */ }
       }
@@ -928,6 +1136,7 @@ export class PiWorkerRunner {
         error: "cancelled by user",
         updatedAt: new Date().toISOString(),
       };
+      delete updated.pidSignature;
       this.store.save(updated);
       this.store.releaseCwdLock(updated.cwd, updated.taskId);
       return { task: updated, wasRunning: true };

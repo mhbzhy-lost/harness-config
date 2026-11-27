@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1030,6 +1031,204 @@ test("test_launch_round_clears_stale_steer_queue_before_reply", async () => {
     const second = await runner.reply({ taskId: first.taskId, reply: "A", waitSeconds: 5 });
     assert.equal(second.status, "done");
     assert.deepEqual(readSteerEntries(first.steerPath), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_launch_round_save_failure_rolls_back_child_process_and_releases_lock", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-save-fail-"));
+  try {
+    const stateDir = join(dir, "state");
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const fakePi = createFakePi(dir, join(dir, "invocations.jsonl"));
+    const store = new TaskStore(stateDir);
+    store.save = () => {
+      throw new Error("simulated disk full");
+    };
+    const runner = new PiWorkerRunner({
+      store,
+      piBinary: fakePi,
+      env: cleanEnv({ FAKE_PI_SCENARIO: "sleep" }),
+    });
+
+    await assert.rejects(
+      () => runner.start({ cwd: workDir, prompt: "should rollback", waitSeconds: 0 }),
+      /simulated disk full/,
+    );
+
+    // 写锁必须已被释放（locks 目录无残留 .lock）
+    const lockFiles = readdirSync(join(stateDir, "locks")).filter((n) => n.endsWith(".lock"));
+    assert.deepEqual(lockFiles, []);
+    // 同一 cwd 可立即由正常 runner 启动，无残留冲突
+    const okRunner = new PiWorkerRunner({
+      store: new TaskStore(stateDir),
+      piBinary: fakePi,
+      env: cleanEnv({ FAKE_PI_SCENARIO: "two-round" }),
+    });
+    const started = await okRunner.start({ cwd: workDir, prompt: "after rollback", waitSeconds: 5 });
+    assert.equal(started.status, "needs_input");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_exit_with_grandchild_holding_stdio_kills_pgid_and_releases_lock_after_grace", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-grandchild-"));
+  try {
+    const stateDir = join(dir, "state");
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const grandchildPidFile = join(dir, "grandchild.pid");
+    const scriptPath = join(dir, "fake-pi-grandchild.mjs");
+    writeFileSync(scriptPath, `#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+for await (const _chunk of process.stdin) {}
+const gc = spawn("sleep", ["20"], { stdio: "inherit" });
+writeFileSync(${JSON.stringify(grandchildPidFile)}, String(gc.pid), "utf8");
+writeFileSync(process.env.PI_WORKER_OUTCOME_FILE, JSON.stringify({
+  status: "done",
+  summary: "main exited while grandchild held stdio",
+  question: null,
+  options: [],
+  verifiedCommands: [],
+  stopReason: null,
+  error: null,
+}), { mode: 0o600 });
+process.exit(0);
+`, { mode: 0o755 });
+    chmodSync(scriptPath, 0o755);
+
+    const store = new TaskStore(stateDir);
+    const runner = new PiWorkerRunner({
+      store,
+      piBinary: scriptPath,
+      pipeDrainGraceMs: 150,
+      env: cleanEnv(),
+    });
+
+    const t0 = Date.now();
+    const settled = await runner.start({
+      cwd: workDir,
+      prompt: "spawn grandchild",
+      waitUntilSettled: true,
+    });
+    const elapsedMs = Date.now() - t0;
+    assert.equal(settled.status, "done");
+    assert.ok(elapsedMs < 3000, `expected grace timeout to settle quickly, took ${elapsedMs}ms`);
+
+    // 孙进程组必须已被 SIGKILL 清理，且 cwd 写锁已释放
+    const gcPid = Number(readFileSync(grandchildPidFile, "utf8").trim());
+    assert.ok(Number.isSafeInteger(gcPid) && gcPid > 0);
+    assert.throws(() => process.kill(gcPid, 0));
+    const lockFiles = readdirSync(join(stateDir, "locks")).filter((n) => n.endsWith(".lock"));
+    assert.deepEqual(lockFiles, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_cross_process_cancel_skips_signal_when_pid_signature_mismatches", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-xproc-sig-"));
+  let dummy;
+  try {
+    const stateDir = join(dir, "state");
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    dummy = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    assert.ok(dummy.pid && dummy.pid > 0);
+
+    const store = new TaskStore(stateDir);
+    const taskId = "55555555-5555-4555-8555-555555555555";
+    const paths = store.allocateTaskPaths(taskId);
+    const now = new Date().toISOString();
+    store.acquireCwdLock(workDir, { taskId, ownerPid: 99999999 });
+    store.save({
+      taskId,
+      cwd: workDir,
+      sessionDir: paths.sessionDir,
+      logPath: paths.logPath,
+      eventsPath: paths.eventsPath,
+      outcomePath: paths.outcomePath,
+      steerPath: paths.steerPath,
+      status: "running",
+      pid: dummy.pid,
+      pidSignature: "Mon Jan 01 00:00:00 1990",
+      excludeTools: [],
+      createdAt: now,
+      updatedAt: now,
+      lastActivityAt: now,
+      turnCount: 0,
+      roundCount: 1,
+      lastTool: null,
+      recentEvents: [],
+      summary: null,
+      question: null,
+      options: [],
+      verifiedCommands: [],
+      executedCommands: [],
+      stopReason: null,
+      exitCode: null,
+      error: null,
+      gitChanges: [],
+    });
+
+    const runner = new PiWorkerRunner({ store, env: cleanEnv() });
+    const res = await runner.cancel({ taskId });
+    assert.equal(res.task.status, "cancelled");
+    assert.equal(res.task.pid, null);
+    // 无关进程组不得被误杀
+    assert.doesNotThrow(() => process.kill(dummy.pid, 0));
+    const lockFiles = readdirSync(join(stateDir, "locks")).filter((n) => n.endsWith(".lock"));
+    assert.deepEqual(lockFiles, []);
+  } finally {
+    if (dummy?.pid) {
+      try { dummy.kill("SIGKILL"); } catch {}
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_build_child_env_strips_diagnostic_node_options", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-node-opts-"));
+  try {
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const outFile = join(dir, "child-node-opts.txt");
+    const scriptPath = join(dir, "fake-pi-opts.mjs");
+    writeFileSync(scriptPath, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+for await (const _chunk of process.stdin) {}
+writeFileSync(${JSON.stringify(outFile)}, process.env.NODE_OPTIONS ?? "__UNSET__", "utf8");
+writeFileSync(process.env.PI_WORKER_OUTCOME_FILE, JSON.stringify({
+  status: "done",
+  summary: "ok",
+  question: null,
+  options: [],
+  verifiedCommands: [],
+  stopReason: null,
+  error: null,
+}), { mode: 0o600 });
+process.exit(0);
+`, { mode: 0o755 });
+    chmodSync(scriptPath, 0o755);
+
+    const runner = new PiWorkerRunner({
+      store: new TaskStore(join(dir, "state")),
+      piBinary: scriptPath,
+      env: cleanEnv({
+        NODE_OPTIONS: '--max-old-space-size=4096 --heapsnapshot-near-heap-limit=2 --diagnostic-dir="/tmp/my diag dir" --enable-source-maps',
+      }),
+    });
+    const rec = await runner.start({ cwd: workDir, prompt: "check opts", waitUntilSettled: true });
+    assert.equal(rec.status, "done");
+    const childOpts = readFileSync(outFile, "utf8");
+    assert.doesNotMatch(childOpts, /--heapsnapshot-near-heap-limit/);
+    assert.doesNotMatch(childOpts, /--diagnostic-dir/);
+    assert.match(childOpts, /--max-old-space-size=4096/);
+    assert.match(childOpts, /--enable-source-maps/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { mkdtempSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
   TaskStore,
+  getProcessSignature,
   groupTasksByParentSession,
   loadWorkerConfig,
   loadWorkerDefaultConfig,
@@ -459,6 +462,177 @@ test("test_title_and_parent_session_title_storage_summary_and_group_aggregation"
     const byKey = new Map(groups.map((g) => [g.groupKey, g]));
     assert.equal(byKey.get("session:sess-t").parentSessionTitle, "新会话标题");
     assert.equal(byKey.get("session:sess-legacy").parentSessionTitle, null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_cwd_lock_reclaim_mutex_protects_concurrent_reclaim_and_corrupt_grace_period", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-reclaim-"));
+  try {
+    const store = new TaskStore(dir);
+    store.ensureDirs();
+
+    // 1. 0 字节损坏锁在 2s 宽限期内不得误删；超过 2s 后经 .reclaim 互斥安全回收
+    const corruptCwd = "/repo/corrupt";
+    const corruptHash = createHash("sha256").update(corruptCwd).digest("hex");
+    const corruptLockPath = join(dir, "locks", `${corruptHash}.lock`);
+    writeFileSync(corruptLockPath, "", { mode: 0o600 });
+
+    const freshConflict = store.acquireCwdLock(corruptCwd, {
+      taskId: "11111111-1111-4111-8111-111111111111",
+      ownerPid: process.pid,
+    });
+    assert.ok("conflictTaskId" in freshConflict, "fresh 0-byte lock within 2s grace must not be deleted");
+    assert.equal(statSync(corruptLockPath).size, 0);
+
+    const threeSecAgo = (Date.now() - 3000) / 1000;
+    utimesSync(corruptLockPath, threeSecAgo, threeSecAgo);
+    const reclaimedCorrupt = store.acquireCwdLock(corruptCwd, {
+      taskId: "11111111-1111-4111-8111-111111111111",
+      ownerPid: process.pid,
+    });
+    assert.ok("lockPath" in reclaimedCorrupt, "corrupt lock older than 2s must be reclaimed");
+    assert.equal(readdirSync(join(dir, "locks")).some((n) => n.endsWith(".reclaim")), false);
+    store.releaseCwdLock(corruptCwd, "11111111-1111-4111-8111-111111111111");
+
+    // 2. 并发回收陈旧锁：4 个独立子进程同时抢锁，恰好 1 个成功、其余均看到胜者为 conflict，无 ABA 误删新活锁
+    const sharedCwd = "/repo/concurrent-reclaim";
+    const sharedHash = createHash("sha256").update(sharedCwd).digest("hex");
+    const sharedLockPath = join(dir, "locks", `${sharedHash}.lock`);
+    const deadTaskId = "99999999-9999-4999-8999-999999999999";
+    store.save(makeRecord(store, { taskId: deadTaskId, cwd: sharedCwd, status: "running", pid: 99999999 }));
+    writeFileSync(sharedLockPath, JSON.stringify({
+      taskId: deadTaskId,
+      ownerPid: 99999999,
+      cwd: sharedCwd,
+      acquiredAt: new Date().toISOString(),
+      token: "stale-token",
+    }) + "\n", { mode: 0o600 });
+
+    const storeUrl = new URL("../plugins/pi-worker/src/store.ts", import.meta.url).href;
+    const workerCode = `
+      import { TaskStore } from ${JSON.stringify(storeUrl)};
+      const store = new TaskStore(process.env.TEST_STATE_DIR);
+      const res = store.acquireCwdLock(process.env.TEST_CWD, {
+        taskId: process.env.TEST_TASK_ID,
+        ownerPid: process.pid,
+      });
+      process.stdout.write(JSON.stringify({ ...res, pid: process.pid, taskId: process.env.TEST_TASK_ID }) + "\\n");
+      if ("lockPath" in res) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    `;
+
+    const results = await Promise.all(
+      [1, 2, 3, 4].map((idx) => new Promise((resolveDone, rejectDone) => {
+        const taskId = `aaaaaaaa-aaaa-4aaa-8aaa-00000000000${idx}`;
+        const child = spawn(process.execPath, ["--input-type=module", "-e", workerCode], {
+          env: {
+            ...process.env,
+            TEST_STATE_DIR: dir,
+            TEST_CWD: sharedCwd,
+            TEST_TASK_ID: taskId,
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let out = "";
+        let err = "";
+        child.stdout.on("data", (d) => { out += d.toString("utf8"); });
+        child.stderr.on("data", (d) => { err += d.toString("utf8"); });
+        child.once("close", (code) => {
+          if (code !== 0) {
+            rejectDone(new Error(`child ${idx} exited ${code}: ${err}`));
+            return;
+          }
+          resolveDone(JSON.parse(out.trim()));
+        });
+      })),
+    );
+
+    const winners = results.filter((r) => "lockPath" in r);
+    const losers = results.filter((r) => "conflictTaskId" in r);
+    assert.equal(winners.length, 1, `expected exactly 1 winner, got ${JSON.stringify(results)}`);
+    assert.equal(losers.length, 3);
+    for (const loser of losers) {
+      assert.equal(loser.conflictTaskId, winners[0].taskId);
+    }
+    assert.equal(store.load(deadTaskId)?.status, "failed");
+    assert.equal(store.load(deadTaskId)?.error, "orphan_process");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_cwd_lock_reclaims_when_owner_signature_mismatches_on_pid_reuse", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-sig-"));
+  try {
+    const mySig = getProcessSignature(process.pid);
+    assert.ok(typeof mySig === "string" && mySig.length > 0, "getProcessSignature must return lstart for live pid");
+    assert.equal(getProcessSignature(99999999), null);
+
+    let activeSig = "Mon Jan 01 00:00:00 2024";
+    const storeA = new TaskStore(dir, {
+      isPidAlive: () => true,
+      getProcessSignature: () => activeSig,
+    });
+    const idA = "11111111-1111-4111-8111-111111111111";
+    const idB = "22222222-2222-4222-8222-222222222222";
+    storeA.save(makeRecord(storeA, { taskId: idA, cwd: "/repo/pid-reuse", status: "running", pid: 7777 }));
+
+    const lockA = storeA.acquireCwdLock("/repo/pid-reuse", { taskId: idA, ownerPid: 7777 });
+    assert.ok("lockPath" in lockA);
+
+    // 同一 PID 存活但 lstart 指纹已变化 -> 判定为 PID 复用并安全回收
+    activeSig = "Tue Feb 02 00:00:00 2024";
+    const lockB = storeA.acquireCwdLock("/repo/pid-reuse", { taskId: idB, ownerPid: 8888 });
+    assert.ok("lockPath" in lockB, "mismatched ownerSignature must trigger stale lock reclaim");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_list_caches_terminal_records_by_ino_mtime_size", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-list-cache-"));
+  try {
+    const store = new TaskStore(dir, { isPidAlive: () => true });
+    const idDone1 = "11111111-1111-4111-8111-111111111111";
+    const idDone2 = "22222222-2222-4222-8222-222222222222";
+    const idRun = "33333333-3333-4333-8333-333333333333";
+
+    store.save(makeRecord(store, { taskId: idDone1, status: "done", pid: null, updatedAt: "2026-11-25T08:00:00.000Z" }));
+    store.save(makeRecord(store, { taskId: idDone2, status: "cancelled", pid: null, updatedAt: "2026-11-25T09:00:00.000Z" }));
+    store.save(makeRecord(store, { taskId: idRun, status: "running", pid: 12345, updatedAt: "2026-11-25T10:00:00.000Z" }));
+
+    const loadCalls = [];
+    const origLoad = store.load.bind(store);
+    store.load = (taskId, options) => {
+      loadCalls.push(taskId);
+      return origLoad(taskId, options);
+    };
+
+    const first = store.list();
+    assert.equal(first.length, 3);
+    assert.equal(loadCalls.length, 3);
+
+    // 再次 list：两个终态任务命中 (ino, mtimeMs, size) 缓存，仅 running 任务调用 load
+    loadCalls.length = 0;
+    const second = store.list();
+    assert.equal(second.length, 3);
+    assert.deepEqual(loadCalls, [idRun]);
+
+    // 更新其中一个终态任务（变更 ino/mtimeMs/size）后，该任务与 running 任务重读，另一终态仍命中缓存
+    store.save(makeRecord(store, {
+      taskId: idDone1,
+      status: "done",
+      pid: null,
+      summary: "updated",
+      updatedAt: "2026-11-25T11:00:00.000Z",
+    }));
+    loadCalls.length = 0;
+    const third = store.list();
+    assert.equal(third.length, 3);
+    assert.deepEqual(loadCalls.sort(), [idDone1, idRun].sort());
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

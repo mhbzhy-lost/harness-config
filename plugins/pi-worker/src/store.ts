@@ -1,13 +1,14 @@
+import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
-  closeSync,
-  constants,
+  linkSync,
+  lstatSync,
   mkdirSync,
-  openSync,
   readFileSync,
   readdirSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -45,6 +46,7 @@ export interface TaskRecord {
   steerPath: string;
   status: TaskStatus;
   pid: number | null;
+  pidSignature?: string;
   tier?: WorkerTier;
   readOnly?: boolean;
   model?: string;
@@ -118,6 +120,7 @@ export type CwdLockResult =
 
 export interface TaskStoreOptions {
   isPidAlive?: (pid: number) => boolean;
+  getProcessSignature?: (pid: number) => string | null;
 }
 
 export interface StoreReadOptions {
@@ -344,9 +347,34 @@ interface LockPayload {
   ownerPid: number;
   cwd: string;
   acquiredAt: string;
+  token?: string;
+  ownerSignature?: string;
 }
 
 const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{1,127}$/;
+const CORRUPT_LOCK_GRACE_MS = 2000;
+const RECLAIM_LOCK_GRACE_MS = 5000;
+
+export function getProcessSignature(pid: number): string | null {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try {
+    const out = execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
+      env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+      encoding: "utf8",
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const normalized = out.replace(/\s+/g, " ").trim();
+    return normalized.length > 0 ? normalized : null;
+  } catch {
+    return null;
+  }
+}
+
+function sleepSyncMs(ms: number): void {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
 
 export function defaultIsPidAlive(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
@@ -471,10 +499,13 @@ export function groupTasksByParentSession(tasks: readonly TaskSummary[]): TaskSe
 export class TaskStore {
   readonly stateDir: string;
   private readonly isPidAlive: (pid: number) => boolean;
+  readonly getProcessSignature: (pid: number) => string | null;
+  private readonly listCache = new Map<string, { ino: number; mtimeMs: number; size: number; record: TaskRecord }>();
 
   constructor(stateDir: string = resolveStateDir(), options: TaskStoreOptions = {}) {
     this.stateDir = resolve(stateDir);
     this.isPidAlive = options.isPidAlive ?? defaultIsPidAlive;
+    this.getProcessSignature = options.getProcessSignature ?? getProcessSignature;
   }
 
   get configPath(): string {
@@ -535,6 +566,10 @@ export class TaskStore {
           ownerPid: parsed.ownerPid,
           cwd: parsed.cwd,
           acquiredAt: typeof parsed.acquiredAt === "string" ? parsed.acquiredAt : "",
+          ...(typeof parsed.token === "string" && parsed.token ? { token: parsed.token } : {}),
+          ...(typeof parsed.ownerSignature === "string" && parsed.ownerSignature
+            ? { ownerSignature: parsed.ownerSignature }
+            : {}),
         };
       }
       return null;
@@ -543,21 +578,72 @@ export class TaskStore {
     }
   }
 
-  private createLockExclusive(lockPath: string, payload: LockPayload): boolean {
-    let fd: number;
+  private createLockExclusive(lockPath: string, payload: unknown): boolean {
+    const dir = dirname(lockPath);
+    const tmpPath = join(dir, `.lock-${process.pid}-${randomBytes(6).toString("hex")}.tmp`);
     try {
-      fd = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
-      throw err;
-    }
-    try {
-      writeFileSync(fd, `${JSON.stringify(payload)}\n`, "utf8");
+      writeFileSync(tmpPath, `${JSON.stringify(payload)}\n`, { encoding: "utf8", mode: 0o600 });
+      chmodSync(tmpPath, 0o600);
+      try {
+        linkSync(tmpPath, lockPath);
+        return true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+        throw err;
+      }
     } finally {
-      closeSync(fd);
+      try { unlinkSync(tmpPath); } catch { /* 清理失败忽略 */ }
     }
-    chmodSync(lockPath, 0o600);
+  }
+
+  private isOwnerAlive(
+    pid: number,
+    expectedSignature?: string,
+    inFlightTaskIds?: ReadonlySet<string>,
+    taskId?: string,
+  ): boolean {
+    if (taskId && (inFlightTaskIds?.has(taskId) ?? false)) return true;
+    if (!this.isPidAlive(pid)) return false;
+    if (expectedSignature) {
+      const actualSignature = this.getProcessSignature(pid);
+      if (actualSignature !== null && actualSignature !== expectedSignature) {
+        return false;
+      }
+    }
     return true;
+  }
+
+  private tryAcquireReclaimMutex(reclaimPath: string): boolean {
+    const ownerSig = this.getProcessSignature(process.pid);
+    const reclaimPayload = {
+      pid: process.pid,
+      acquiredAt: new Date().toISOString(),
+      token: randomBytes(8).toString("hex"),
+      ...(ownerSig ? { ownerSignature: ownerSig } : {}),
+    };
+    if (this.createLockExclusive(reclaimPath, reclaimPayload)) {
+      return true;
+    }
+    let st: ReturnType<typeof lstatSync>;
+    try {
+      st = lstatSync(reclaimPath);
+    } catch {
+      return this.createLockExclusive(reclaimPath, reclaimPayload);
+    }
+    let reclaimOwner: { pid?: unknown; ownerSignature?: unknown } | null = null;
+    try {
+      reclaimOwner = JSON.parse(readFileSync(reclaimPath, "utf8")) as { pid?: unknown; ownerSignature?: unknown };
+    } catch {
+      reclaimOwner = null;
+    }
+    const reclaimPid = typeof reclaimOwner?.pid === "number" ? reclaimOwner.pid : 0;
+    const reclaimSig = typeof reclaimOwner?.ownerSignature === "string" ? reclaimOwner.ownerSignature : undefined;
+    const reclaimAlive = reclaimPid > 0 && this.isOwnerAlive(reclaimPid, reclaimSig);
+    if (!reclaimAlive && Date.now() - st.mtimeMs > RECLAIM_LOCK_GRACE_MS) {
+      try { unlinkSync(reclaimPath); } catch { /* 已被并发清理 */ }
+      return this.createLockExclusive(reclaimPath, reclaimPayload);
+    }
+    return false;
   }
 
   acquireCwdLock(
@@ -568,41 +654,112 @@ export class TaskStore {
     const validId = validateTaskId(owner.taskId);
     this.ensureDirs();
     const lockPath = this.lockPathForCwd(canonicalCwd);
+    const reclaimPath = `${lockPath}.reclaim`;
+    const ownerSig = this.getProcessSignature(owner.ownerPid);
     const payload: LockPayload = {
       taskId: validId,
       ownerPid: owner.ownerPid,
       cwd: canonicalCwd,
       acquiredAt: new Date().toISOString(),
+      token: randomBytes(12).toString("hex"),
+      ...(ownerSig ? { ownerSignature: ownerSig } : {}),
     };
 
-    if (this.createLockExclusive(lockPath, payload)) {
-      return { lockPath };
-    }
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      if (this.createLockExclusive(lockPath, payload)) {
+        return { lockPath };
+      }
 
-    const existing = this.readLockPayload(lockPath);
-    if (existing) {
-      const inFlight = options.inFlightTaskIds?.has(existing.taskId) ?? false;
-      const ownerAlive = inFlight || this.isPidAlive(existing.ownerPid);
-      if (ownerAlive) {
-        return { conflictTaskId: existing.taskId, ownerPid: existing.ownerPid };
+      let lockStat: ReturnType<typeof lstatSync>;
+      try {
+        lockStat = lstatSync(lockPath);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw err;
       }
-      // 即使原 MCP ownerPid 已死，仍须核查 detached worker 子进程是否仍在运行
-      const stale = TASK_ID_RE.test(existing.taskId) ? this.readRawTask(existing.taskId) : null;
-      if (stale && stale.status === "running" && stale.pid !== null && this.isPidAlive(stale.pid)) {
-        return { conflictTaskId: stale.taskId, ownerPid: stale.pid };
-      }
-      // 宿主与 worker 进程均已死：回收陈旧锁并校正旧任务记录
-      try { unlinkSync(lockPath); } catch { /* 已被并发清理 */ }
-      if (stale && stale.status === "running") {
-        this.markOrphanFailed(stale);
-      }
-    } else {
-      // 锁文件损坏：删除后重试
-      try { unlinkSync(lockPath); } catch { /* 忽略 */ }
-    }
 
-    if (this.createLockExclusive(lockPath, payload)) {
-      return { lockPath };
+      const existing = this.readLockPayload(lockPath);
+      if (existing) {
+        if (this.isOwnerAlive(existing.ownerPid, existing.ownerSignature, options.inFlightTaskIds, existing.taskId)) {
+          return { conflictTaskId: existing.taskId, ownerPid: existing.ownerPid };
+        }
+        // 即使原 MCP ownerPid 已死，仍须核查 detached worker 子进程是否仍在运行
+        const stale = TASK_ID_RE.test(existing.taskId) ? this.readRawTask(existing.taskId) : null;
+        const stalePidSig = stale
+          ? (stale.pidSignature ?? (stale.pid === existing.ownerPid ? existing.ownerSignature : undefined))
+          : undefined;
+        if (stale && stale.status === "running" && stale.pid !== null && this.isOwnerAlive(stale.pid, stalePidSig)) {
+          return { conflictTaskId: stale.taskId, ownerPid: stale.pid };
+        }
+        if (!existing.token && Date.now() - lockStat.mtimeMs <= CORRUPT_LOCK_GRACE_MS) {
+          return { conflictTaskId: existing.taskId, ownerPid: existing.ownerPid };
+        }
+      } else if (Date.now() - lockStat.mtimeMs <= CORRUPT_LOCK_GRACE_MS) {
+        // 0 字节/损坏锁在 2s 宽限期内不回收，避免误删外部非原子写半截锁
+        return { conflictTaskId: "unknown", ownerPid: 0 };
+      }
+
+      if (!this.tryAcquireReclaimMutex(reclaimPath)) {
+        sleepSyncMs(20);
+        continue;
+      }
+
+      try {
+        let curStat: ReturnType<typeof lstatSync> | null = null;
+        try {
+          curStat = lstatSync(lockPath);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        }
+        if (curStat) {
+          const curPayload = this.readLockPayload(lockPath);
+          const sameInode = curStat.ino === lockStat.ino;
+          let canUnlink = false;
+          let orphanToMark: TaskRecord | null = null;
+
+          if (sameInode && existing && curPayload && curPayload.token === existing.token) {
+            const ownerAlive = this.isOwnerAlive(
+              curPayload.ownerPid,
+              curPayload.ownerSignature,
+              options.inFlightTaskIds,
+              curPayload.taskId,
+            );
+            const curStale = TASK_ID_RE.test(curPayload.taskId) ? this.readRawTask(curPayload.taskId) : null;
+            const curStalePidSig = curStale
+              ? (curStale.pidSignature ?? (curStale.pid === curPayload.ownerPid ? curPayload.ownerSignature : undefined))
+              : undefined;
+            const childAlive = Boolean(
+              curStale
+              && curStale.status === "running"
+              && curStale.pid !== null
+              && this.isOwnerAlive(curStale.pid, curStalePidSig),
+            );
+            const tokenGraceOk = Boolean(curPayload.token) || Date.now() - curStat.mtimeMs > CORRUPT_LOCK_GRACE_MS;
+            if (!ownerAlive && !childAlive && tokenGraceOk) {
+              canUnlink = true;
+              if (curStale && curStale.status === "running") {
+                orphanToMark = curStale;
+              }
+            }
+          } else if (sameInode && !existing && !curPayload && Date.now() - curStat.mtimeMs > CORRUPT_LOCK_GRACE_MS) {
+            canUnlink = true;
+          }
+
+          if (canUnlink) {
+            try { unlinkSync(lockPath); } catch { /* 已被并发清理 */ }
+            if (orphanToMark) {
+              this.markOrphanFailed(orphanToMark);
+            }
+          }
+        }
+      } finally {
+        try { unlinkSync(reclaimPath); } catch { /* 清理失败忽略 */ }
+      }
+
+      if (this.createLockExclusive(lockPath, payload)) {
+        return { lockPath };
+      }
+      sleepSyncMs(10);
     }
 
     const contender = this.readLockPayload(lockPath);
@@ -686,15 +843,61 @@ export class TaskStore {
     try {
       entries = readdirSync(tasksDir).filter((name) => name.endsWith(".json"));
     } catch {
+      this.listCache.clear();
       return [];
+    }
+
+    const present = new Set(entries);
+    for (const cachedFile of this.listCache.keys()) {
+      if (!present.has(cachedFile)) this.listCache.delete(cachedFile);
     }
 
     const records: TaskRecord[] = [];
     for (const file of entries) {
       const taskId = file.slice(0, -5);
       if (!TASK_ID_RE.test(taskId)) continue;
-      const loaded = this.load(taskId, options);
-      if (!loaded) continue;
+      const taskFile = join(tasksDir, file);
+      let st: ReturnType<typeof statSync>;
+      try {
+        st = statSync(taskFile);
+      } catch {
+        this.listCache.delete(file);
+        continue;
+      }
+
+      const cached = this.listCache.get(file);
+      let loaded: TaskRecord | null;
+      if (
+        cached
+        && cached.record.status !== "running"
+        && cached.ino === st.ino
+        && cached.mtimeMs === st.mtimeMs
+        && cached.size === st.size
+      ) {
+        loaded = cached.record;
+      } else {
+        loaded = this.load(taskId, options);
+        if (!loaded) {
+          this.listCache.delete(file);
+          continue;
+        }
+        if (loaded.status !== "running") {
+          try {
+            const afterStat = statSync(taskFile);
+            this.listCache.set(file, {
+              ino: afterStat.ino,
+              mtimeMs: afterStat.mtimeMs,
+              size: afterStat.size,
+              record: loaded,
+            });
+          } catch {
+            this.listCache.delete(file);
+          }
+        } else {
+          this.listCache.delete(file);
+        }
+      }
+
       if (filter.status && loaded.status !== filter.status) continue;
       if (filter.cwd && loaded.cwd !== filter.cwd) continue;
       if (filter.parentSessionId && loaded.parentSessionId !== filter.parentSessionId) continue;

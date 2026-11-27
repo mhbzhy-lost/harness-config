@@ -1,5 +1,17 @@
 import { randomBytes } from "node:crypto";
-import { appendFileSync, chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  chmodSync,
+  closeSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
@@ -231,14 +243,7 @@ export function appendSteerEntry(steerPath: string, entry: SteerQueueEntry): voi
   chmodSync(steerPath, 0o600);
 }
 
-/** 读取 steer 队列全部合法条目；文件不存在返回空数组，损坏行逐行跳过容错。 */
-export function readSteerEntries(steerPath: string): SteerQueueEntry[] {
-  let raw: string;
-  try {
-    raw = readFileSync(steerPath, "utf8");
-  } catch {
-    return [];
-  }
+function parseSteerLines(raw: string): SteerQueueEntry[] {
   const entries: SteerQueueEntry[] = [];
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
@@ -262,6 +267,66 @@ export function readSteerEntries(steerPath: string): SteerQueueEntry[] {
     }
   }
   return entries;
+}
+
+/** 读取 steer 队列全部合法条目；文件不存在返回空数组，损坏行逐行跳过容错。 */
+export function readSteerEntries(steerPath: string): SteerQueueEntry[] {
+  let raw: string;
+  try {
+    raw = readFileSync(steerPath, "utf8");
+  } catch {
+    return [];
+  }
+  return parseSteerLines(raw);
+}
+
+/**
+ * 从指定字节偏移增量读取 steer 队列：
+ * - 文件大小未变时零读取返回；
+ * - 文件被截断（size < offset）时自动归零重读；
+ * - 仅消费到最后一个换行符 `\n`，末尾半行留待下一轮。
+ */
+export function readSteerEntriesFromOffset(
+  steerPath: string,
+  offset = 0,
+): { entries: SteerQueueEntry[]; nextOffset: number } {
+  let startOffset = Number.isFinite(offset) && offset >= 0 ? Math.trunc(offset) : 0;
+  let fd: number;
+  try {
+    fd = openSync(steerPath, "r");
+  } catch {
+    return { entries: [], nextOffset: 0 };
+  }
+  try {
+    const fileSize = fstatSync(fd).size;
+    if (startOffset > fileSize) startOffset = 0;
+    if (startOffset === fileSize) {
+      return { entries: [], nextOffset: startOffset };
+    }
+    const toRead = fileSize - startOffset;
+    const buf = Buffer.allocUnsafe(toRead);
+    let filled = 0;
+    while (filled < toRead) {
+      const n = readSync(fd, buf, filled, toRead - filled, startOffset + filled);
+      if (n <= 0) break;
+      filled += n;
+    }
+    if (filled <= 0) {
+      return { entries: [], nextOffset: startOffset };
+    }
+    const slice = buf.subarray(0, filled);
+    const lastNl = slice.lastIndexOf(0x0a);
+    if (lastNl < 0) {
+      return { entries: [], nextOffset: startOffset };
+    }
+    const text = slice.subarray(0, lastNl).toString("utf8");
+    return {
+      entries: parseSteerLines(text),
+      nextOffset: startOffset + lastNl + 1,
+    };
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function normalizeStringArray(value: unknown): string[] {

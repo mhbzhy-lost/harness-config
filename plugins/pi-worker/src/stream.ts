@@ -167,6 +167,7 @@ function parseJsonLine(rawLine: string): Record<string, unknown> | null {
 export function createEventFormatter(options: EventFormatterOptions = {}): {
   feedRawLine(rawLine: string): FormattedStreamEvent[];
   emitStatus(status: string, detail?: string): FormattedStreamEvent;
+  emitSteer(message: string, source?: "agent" | "app", timestamp?: string): FormattedStreamEvent;
   flush(): FormattedStreamEvent[];
 } {
   const thinkingThrottleMs = options.thinkingThrottleMs ?? DEFAULT_THINKING_THROTTLE_MS;
@@ -424,6 +425,11 @@ export function createEventFormatter(options: EventFormatterOptions = {}): {
         ...(cleaned ? { detail: cleaned } : {}),
         ...(status === "failed" ? { isError: true } : {}),
       });
+    },
+
+    emitSteer(message: string, source?: "agent" | "app", timestamp?: string): FormattedStreamEvent {
+      seq += 1;
+      return createSteerEvent({ seq, round, message, source, timestamp });
     },
 
     flush(): FormattedStreamEvent[] {

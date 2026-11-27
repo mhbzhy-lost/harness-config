@@ -412,3 +412,10 @@ test("test_monitor_html_contains_running_steer_bar_markers", () => {
   assert.ok(html.includes("🧭"), "monitor.html missing steer compass icon");
   assert.ok(html.includes("Shift+Enter"), "monitor.html missing steer input hint");
 });
+
+test("test_app_tsx_and_monitor_html_enforce_ui_event_window_and_memo", () => {
+  const appSource = readFileSync(join(ROOT, "plugins", "pi-worker", "ui-src", "app.tsx"), "utf8");
+  assert.match(appSource, /MAX_UI_EVENTS\s*=\s*2000/);
+  assert.match(appSource, /useMemo\(\s*\(\)\s*=>\s*reduceTimelineItems\(events,\s*isRunning\)/);
+  assert.match(appSource, /slice\(/);
+});
