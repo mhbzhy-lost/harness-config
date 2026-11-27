@@ -9,8 +9,9 @@ import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { request as httpsRequest, Agent as HttpsAgent, type RequestOptions } from "node:https";
-import { request as httpRequest } from "node:http";
-import { connect as tlsConnect } from "node:tls";
+import { request as httpRequest, type ClientRequest, type IncomingHttpHeaders } from "node:http";
+import { isIP, type Socket } from "node:net";
+import { connect as tlsConnect, type TLSSocket } from "node:tls";
 
 export type SearchAction = "search" | "fetch";
 export type SearchProvider = "deepseek" | "exa";
@@ -18,9 +19,10 @@ export type ProviderResult = { provider: SearchProvider; data: Record<string, un
 
 const MAX_RESPONSE_BYTES = 1 << 20;
 const REQUEST_TIMEOUT_MS = 30_000;
+const IDLE_SOCKET_TIMEOUT_MS = 30_000;
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 
-class ProviderFailure extends Error {
+export class ProviderFailure extends Error {
   readonly provider: SearchProvider;
 
   constructor(provider: SearchProvider, message: string) {
@@ -91,10 +93,21 @@ function exaProxyPort(): number | undefined {
 /** 经本地 HTTP 代理的 CONNECT 隧道完成 TLS 握手，把得到的 TLSSocket 交给 node:https 复用完整 HTTP/1.1 实现。 */
 class ProxyTunnelAgent extends HttpsAgent {
   private readonly proxyPort: number;
+  private readonly ca?: string | Buffer;
+  private readonly timeoutMs: number;
+  private readonly onDestroy?: () => void;
 
-  constructor(proxyPort: number) {
-    super();
+  constructor(proxyPort: number, options?: { ca?: string | Buffer; timeoutMs?: number; onDestroy?: () => void }) {
+    super({ keepAlive: true, maxSockets: 8, timeout: IDLE_SOCKET_TIMEOUT_MS });
     this.proxyPort = proxyPort;
+    this.ca = options?.ca;
+    this.timeoutMs = options?.timeoutMs ?? REQUEST_TIMEOUT_MS;
+    this.onDestroy = options?.onDestroy;
+  }
+
+  override destroy(): void {
+    this.onDestroy?.();
+    super.destroy();
   }
 
   override createConnection(options: RequestOptions, callback: (error: Error | null, socket?: unknown) => void): void {
@@ -104,45 +117,166 @@ class ProxyTunnelAgent extends HttpsAgent {
       callback(new ProviderFailure("exa", "代理隧道目标无效"));
       return;
     }
-    const connect = httpRequest({
+
+    let settled = false;
+    let connectReq: ClientRequest | undefined;
+    let rawSocket: Socket | undefined;
+    let tlsSocket: TLSSocket | undefined;
+    let onTlsError: ((error: Error) => void) | undefined;
+    let onTlsClose: (() => void) | undefined;
+
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadlineTimer);
+      tlsSocket?.destroy();
+      rawSocket?.destroy();
+      connectReq?.destroy();
+      callback(error);
+    };
+
+    const succeed = (tls: TLSSocket) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadlineTimer);
+      if (onTlsError) tls.removeListener("error", onTlsError);
+      if (onTlsClose) tls.removeListener("close", onTlsClose);
+      tls.setTimeout(0);
+      callback(null, tls);
+    };
+
+    const deadlineTimer = setTimeout(() => {
+      fail(new ProviderFailure("exa", "代理隧道超时"));
+    }, this.timeoutMs);
+
+    connectReq = httpRequest({
       host: "127.0.0.1",
       port: this.proxyPort,
       method: "CONNECT",
       path: `${host}:${port}`,
-      timeout: REQUEST_TIMEOUT_MS,
+      timeout: this.timeoutMs,
     });
-    connect.once("connect", (response, socket) => {
-      if (response.statusCode !== 200) {
+    connectReq.once("connect", (response, socket) => {
+      rawSocket = socket;
+      if (settled) {
         socket.destroy();
-        callback(new ProviderFailure("exa", `代理 CONNECT 失败：HTTP ${response.statusCode ?? 0}`));
         return;
       }
-      const tls = tlsConnect({ socket, servername: host });
-      tls.once("secureConnect", () => callback(null, tls));
-      tls.once("error", (error: Error) => callback(new ProviderFailure("exa", `代理隧道 TLS 握手失败：${error.name}`)));
+      if (response.statusCode !== 200) {
+        fail(new ProviderFailure("exa", `代理 CONNECT 失败：HTTP ${response.statusCode ?? 0}`));
+        return;
+      }
+      try {
+        tlsSocket = tlsConnect({
+          socket,
+          ...(isIP(host) === 0 ? { servername: host } : {}),
+          ...(this.ca !== undefined ? { ca: this.ca } : {}),
+        });
+      } catch (error) {
+        const name = error instanceof Error ? error.name : "Error";
+        fail(new ProviderFailure("exa", `代理隧道 TLS 握手失败：${name}`));
+        return;
+      }
+      onTlsError = (error: Error) => fail(new ProviderFailure("exa", `代理隧道 TLS 握手失败：${error.name}`));
+      onTlsClose = () => fail(new ProviderFailure("exa", "代理隧道 TLS 连接提前关闭"));
+      tlsSocket.once("secureConnect", () => succeed(tlsSocket!));
+      tlsSocket.once("error", onTlsError);
+      tlsSocket.once("close", onTlsClose);
+      tlsSocket.setTimeout(this.timeoutMs, () => fail(new ProviderFailure("exa", "代理隧道 TLS 握手超时")));
     });
-    connect.once("timeout", () => {
-      connect.destroy();
-      callback(new ProviderFailure("exa", "代理 CONNECT 超时"));
-    });
-    connect.once("error", (error: Error) => callback(new ProviderFailure("exa", `代理 CONNECT 失败：${error.name}`)));
-    connect.end();
+    connectReq.once("timeout", () => fail(new ProviderFailure("exa", "代理 CONNECT 超时")));
+    connectReq.once("error", (error: Error) => fail(new ProviderFailure("exa", `代理 CONNECT 失败：${error.name}`)));
+    connectReq.end();
   }
 }
 
-interface HttpResponse {
+const proxyAgentPool = new Map<string, ProxyTunnelAgent>();
+
+/** 按端口复用代理隧道 Agent；传入测试自定义 ca/timeoutMs 时不污染默认缓存池。 */
+export function getProxyTunnelAgent(proxyPort: number, options?: { ca?: string | Buffer; timeoutMs?: number }): ProxyTunnelAgent {
+  if (options?.ca !== undefined || options?.timeoutMs !== undefined) {
+    return new ProxyTunnelAgent(proxyPort, options);
+  }
+  const key = String(proxyPort);
+  let agent = proxyAgentPool.get(key);
+  if (!agent) {
+    agent = new ProxyTunnelAgent(proxyPort, {
+      onDestroy: () => {
+        if (proxyAgentPool.get(key) === agent) proxyAgentPool.delete(key);
+      },
+    });
+    proxyAgentPool.set(key, agent);
+  }
+  return agent;
+}
+
+export interface HttpResponse {
   status: number;
   headers: { get(name: string): string | null };
-  bytes(): Promise<Uint8Array>;
+  body: Uint8Array;
+}
+
+export interface PostJsonOptions {
+  timeoutMs?: number;
+  ca?: string | Buffer;
+  proxyPort?: number;
+}
+
+function toHeaderReader(headers: IncomingHttpHeaders): { get(name: string): string | null } {
+  return {
+    get(name: string): string | null {
+      const value = headers[name.toLowerCase()];
+      if (Array.isArray(value)) return value.join(", ");
+      return typeof value === "string" ? value : null;
+    },
+  };
+}
+
+async function readFetchBody(response: Response, provider: SearchProvider): Promise<Uint8Array> {
+  if (!response.body) return new Uint8Array(0);
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      total += value.byteLength;
+      if (total > MAX_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => {});
+        throw new ProviderFailure(provider, `${provider} 响应超过 ${MAX_RESPONSE_BYTES} 字节限制`);
+      }
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return merged;
 }
 
 /** 统一 POST JSON：直连用全局 fetch；配代理端口时对 https 目标走隧道。 */
-async function postJson(provider: SearchProvider, url: string, payload: Record<string, unknown>, headers: Record<string, string>): Promise<HttpResponse> {
-  const proxyPort = provider === "exa" ? exaProxyPort() : undefined;
+export async function postJson(
+  provider: SearchProvider,
+  url: string,
+  payload: Record<string, unknown>,
+  headers: Record<string, string>,
+  options?: PostJsonOptions,
+): Promise<HttpResponse> {
+  const proxyPort = options?.proxyPort ?? (provider === "exa" ? exaProxyPort() : undefined);
+  const timeoutMs = options?.timeoutMs ?? REQUEST_TIMEOUT_MS;
   const parsed = new URL(url);
   if (parsed.protocol !== "https:") throw new ProviderFailure(provider, "仅支持 https 端点");
+  const bodyText = JSON.stringify(payload);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     if (proxyPort === undefined) {
       const response = await fetch(url, {
@@ -150,56 +284,91 @@ async function postJson(provider: SearchProvider, url: string, payload: Record<s
         redirect: "manual",
         signal: controller.signal,
         headers,
-        body: JSON.stringify(payload),
+        body: bodyText,
       });
-      return {
-        status: response.status,
-        headers: response.headers,
-        async bytes() {
-          const buffer = new Uint8Array(await response.arrayBuffer());
-          if (buffer.byteLength > MAX_RESPONSE_BYTES) throw new ProviderFailure(provider, `${provider} 响应超过 ${MAX_RESPONSE_BYTES} 字节限制`);
-          return buffer;
-        },
-      };
+      if (response.status < 200 || response.status >= 300) {
+        await response.body?.cancel().catch(() => {});
+        return { status: response.status, headers: response.headers, body: new Uint8Array(0) };
+      }
+      const body = await readFetchBody(response, provider);
+      return { status: response.status, headers: response.headers, body };
     }
+    const agent = getProxyTunnelAgent(proxyPort, { ca: options?.ca, timeoutMs });
     return await new Promise<HttpResponse>((resolve, reject) => {
-      const request = httpsRequest(parsed, {
+      let settled = false;
+      let request: ClientRequest;
+      const finishError = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        controller.signal.removeEventListener("abort", onAbort);
+        reject(error);
+      };
+      const finishOk = (res: HttpResponse) => {
+        if (settled) return;
+        settled = true;
+        controller.signal.removeEventListener("abort", onAbort);
+        resolve(res);
+      };
+      const onAbort = () => {
+        request?.destroy();
+        finishError(new ProviderFailure(provider, `${provider} 请求超时`));
+      };
+      if (controller.signal.aborted) {
+        finishError(new ProviderFailure(provider, `${provider} 请求超时`));
+        return;
+      }
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+
+      request = httpsRequest(parsed, {
         method: "POST",
-        agent: new ProxyTunnelAgent(proxyPort),
-        headers: { ...headers, "Content-Length": String(Buffer.byteLength(JSON.stringify(payload))) },
+        agent,
+        headers: { ...headers, "Content-Length": String(Buffer.byteLength(bodyText)) },
       }, (response) => {
+        const status = response.statusCode ?? 0;
+        const headerReader = toHeaderReader(response.headers);
+        if (status < 200 || status >= 300) {
+          response.destroy();
+          finishOk({ status, headers: headerReader, body: new Uint8Array(0) });
+          return;
+        }
         const chunks: Buffer[] = [];
         let total = 0;
-        response.once("error", () => reject(new ProviderFailure(provider, `${provider} 响应流中断`)));
+        let ended = false;
+        response.once("error", () => finishError(new ProviderFailure(provider, `${provider} 响应流中断`)));
+        response.once("aborted", () => {
+          if (!ended) finishError(new ProviderFailure(provider, `${provider} 响应流中断`));
+        });
+        response.once("close", () => {
+          if (!ended && !response.complete) finishError(new ProviderFailure(provider, `${provider} 响应流中断`));
+        });
         response.on("data", (chunk: Buffer) => {
           total += chunk.byteLength;
           if (total > MAX_RESPONSE_BYTES) {
             response.destroy();
-            reject(new ProviderFailure(provider, `${provider} 响应超过 ${MAX_RESPONSE_BYTES} 字节限制`));
+            finishError(new ProviderFailure(provider, `${provider} 响应超过 ${MAX_RESPONSE_BYTES} 字节限制`));
             return;
           }
           chunks.push(chunk);
         });
-        response.once("end", () => resolve({
-          status: response.statusCode ?? 0,
-          headers: response.headers,
-          async bytes() { return new Uint8Array(Buffer.concat(chunks)); },
-        }));
+        response.once("end", () => {
+          ended = true;
+          finishOk({ status, headers: headerReader, body: new Uint8Array(Buffer.concat(chunks)) });
+        });
       });
-      request.once("timeout", () => {
+      request.setTimeout(timeoutMs, () => {
         request.destroy();
-        reject(new ProviderFailure(provider, `${provider} 请求超时`));
+        finishError(new ProviderFailure(provider, `${provider} 请求超时`));
       });
-      request.setTimeout(REQUEST_TIMEOUT_MS);
       request.once("error", (error: Error) => {
-        if (error.name === "AbortError") reject(new ProviderFailure(provider, `${provider} 请求超时`));
-        else reject(new ProviderFailure(provider, `${provider} 请求失败`));
+        if (error instanceof ProviderFailure) finishError(error);
+        else if (controller.signal.aborted || error.name === "AbortError") finishError(new ProviderFailure(provider, `${provider} 请求超时`));
+        else finishError(new ProviderFailure(provider, `${provider} 请求失败`));
       });
-      request.end(JSON.stringify(payload));
+      request.end(bodyText);
     });
   } catch (error) {
     if (error instanceof ProviderFailure) throw error;
-    if (error instanceof Error && error.name === "AbortError") throw new ProviderFailure(provider, `${provider} 请求超时`);
+    if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) throw new ProviderFailure(provider, `${provider} 请求超时`);
     throw new ProviderFailure(provider, `${provider} 请求失败`);
   } finally {
     clearTimeout(timer);
@@ -223,9 +392,8 @@ async function requestProvider(provider: SearchProvider, action: SearchAction, i
   const response = await postJson(provider, url, payload, { Accept: "application/json", "Content-Type": "application/json", ...authHeaders });
   if (response.status >= 300 && response.status < 400) throw new ProviderFailure(provider, `${provider} 请求重定向被阻断`);
   if (response.status < 200 || response.status >= 300) throw new ProviderFailure(provider, `${provider} ${action} 失败：HTTP ${response.status} ${statusCategory(response.status, action, provider)}${safeRequestId(response.headers, provider)}`);
-  const bytes = await response.bytes();
   let parsed: unknown;
-  try { parsed = JSON.parse(new TextDecoder().decode(bytes)); } catch { throw new ProviderFailure(provider, `${provider} 响应不是合法 JSON`); }
+  try { parsed = JSON.parse(new TextDecoder().decode(response.body)); } catch { throw new ProviderFailure(provider, `${provider} 响应不是合法 JSON`); }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new ProviderFailure(provider, `${provider} 响应不是 JSON 对象`);
   return parsed as Record<string, unknown>;
 }
