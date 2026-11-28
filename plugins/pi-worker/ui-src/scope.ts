@@ -177,6 +177,84 @@ export function buildSnapshotScopeArgs(
   return {};
 }
 
+/** 对话面判定：按 AGY MCP Apps 契约，左侧栏 global 视图无所属对话，不提供 message / updateModelContext */
+export function isConversationSurface(hostCapabilities: unknown): boolean {
+  if (!hostCapabilities || typeof hostCapabilities !== "object") return false;
+  const caps = hostCapabilities as { message?: unknown; updateModelContext?: unknown };
+  return Boolean(caps.message || caps.updateModelContext);
+}
+
+export interface ToolResultScopeDecision {
+  nextScope: MonitorScope;
+  /** 是否应用这份 payload 的任务列表与事件流 */
+  acceptPayload: boolean;
+  /** payload 无作用域但本地已锁定会话：忽略 payload 并按已锁定会话重拉 */
+  preservePreviousSession: boolean;
+}
+
+/**
+ * ontoolresult 作用域决策：
+ * - 入参带 parentSessionId → 锁定该会话（同会话且服务端无标题时保留已锁定标题）；
+ * - 入参无 parentSessionId 但本地已锁定 → 拒绝降级回 all；
+ * - 两者均空：对话面 fail-closed 清空，global 视图允许全量。
+ */
+export function mergeToolResultScope(
+  prevScope: MonitorScope,
+  incomingScope: MonitorScope | null | undefined,
+  inConversationSurface: boolean,
+): ToolResultScopeDecision {
+  const incomingPid = incomingScope?.parentSessionId ?? null;
+  if (incomingPid) {
+    const title = incomingScope?.parentSessionTitle?.trim()
+      ?? (prevScope.parentSessionId === incomingPid ? prevScope.parentSessionTitle : null);
+    return {
+      nextScope: {
+        parentSessionId: incomingPid,
+        parentSessionTitle: title || null,
+        cwd: incomingScope?.cwd ?? null,
+      },
+      acceptPayload: true,
+      preservePreviousSession: false,
+    };
+  }
+  if (prevScope.parentSessionId) {
+    return { nextScope: prevScope, acceptPayload: false, preservePreviousSession: true };
+  }
+  if (inConversationSurface) {
+    return { nextScope: EMPTY_SCOPE, acceptPayload: false, preservePreviousSession: false };
+  }
+  return {
+    nextScope: incomingScope ?? EMPTY_SCOPE,
+    acceptPayload: true,
+    preservePreviousSession: false,
+  };
+}
+
+/** ontoolinput 是否允许立刻抢跑快照：对话面必须已有会话 id，否则等待 ontoolresult */
+export function shouldPollOnToolInput(
+  parsed: ParsedToolInput,
+  prevScope: MonitorScope,
+  inConversationSurface: boolean,
+): boolean {
+  if (inConversationSurface) {
+    return Boolean(parsed.scope.parentSessionId || prevScope.parentSessionId);
+  }
+  return true;
+}
+
+/** 发快照前的最后一道闸：对话面仅允许带 parentSessionId 的 session 模式 */
+export function canFetchSnapshot(mode: ScopeMode, scope: MonitorScope, inConversationSurface: boolean): boolean {
+  if (inConversationSurface) {
+    return mode === "session" && Boolean(scope.parentSessionId);
+  }
+  return true;
+}
+
+/** 连接后 600ms 兜底快照仅用于 global 视图 */
+export function shouldScheduleInitialFallback(inConversationSurface: boolean): boolean {
+  return !inConversationSurface;
+}
+
 /** 自动聚焦：优先最新运行中任务，否则列表首个（列表已按活跃倒序） */
 export function pickAutoFocusTaskId(tasks: readonly ScopeTaskLike[]): string | null {
   return tasks.find((t) => t.status === "running")?.taskId ?? tasks[0]?.taskId ?? null;

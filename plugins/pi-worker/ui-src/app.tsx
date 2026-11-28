@@ -12,14 +12,19 @@ import {
   EMPTY_SCOPE,
   INITIAL_FALLBACK_MS,
   buildSnapshotScopeArgs,
+  canFetchSnapshot,
   fallbackGroupTasks,
   formatGroupLabel,
   formatSessionBadge,
   formatTaskOptionLabel,
+  isConversationSurface,
   isSessionLocked,
+  mergeToolResultScope,
   parseToolInputScope,
   resolvePollDelayMs,
   resolveScopeMode,
+  shouldPollOnToolInput,
+  shouldScheduleInitialFallback,
   shortDir,
 } from "./scope.ts";
 import type { MonitorScope, ScopeGroupLike, ScopeMode, ScopeTaskLike } from "./scope.ts";
@@ -365,6 +370,8 @@ function MonitorApp() {
   const [steerSending, setSteerSending] = useState(false);
   const [steerNotice, setSteerNotice] = useState<string | null>(null);
   const [steerError, setSteerError] = useState<string | null>(null);
+  // 是否处于对话内侧面板：连接就绪前按 fail-closed 视为 true，禁止无作用域全量快照
+  const [inConversationSurface, setInConversationSurface] = useState(true);
 
   const appRef = useRef<McpApp | null>(null);
   const offsetRef = useRef(0);
@@ -376,6 +383,13 @@ function MonitorApp() {
   const pollTimerRef = useRef<number | null>(null);
   const receivedToolEventRef = useRef(false);
   const fallbackTimerRef = useRef<number | null>(null);
+  const inConversationSurfaceRef = useRef(true);
+
+  const syncConversationSurface = useCallback(() => {
+    const next = isConversationSurface(appRef.current?.getHostCapabilities());
+    inConversationSurfaceRef.current = next;
+    setInConversationSurface(next);
+  }, []);
 
   const { scrollRef, contentRef, isAtBottom, scrollToBottom } = useStickToBottom({
     resize: "instant",
@@ -407,6 +421,12 @@ function MonitorApp() {
     const targetId = selectedTaskIdRef.current;
     const mode = scopeModeRef.current;
     const scope = initialScopeRef.current;
+
+    // 最后一道闸：对话面未绑定会话时绝不发出无过滤快照（含手动刷新与各类回调）
+    if (!canFetchSnapshot(mode, scope, inConversationSurfaceRef.current)) {
+      setLoadingInitial(false);
+      return;
+    }
 
     const filterArgs = buildSnapshotScopeArgs(mode, scope);
 
@@ -457,16 +477,34 @@ function MonitorApp() {
 
   applyPayloadRef.current = (payload: MonitorPayload, resetStream: boolean, fromToolResult = false): boolean => {
     setLoadingInitial(false);
-    if (fromToolResult && payload.scope) {
+    if (fromToolResult) {
+      const decision = mergeToolResultScope(initialScopeRef.current, payload.scope, inConversationSurfaceRef.current);
+      if (decision.preservePreviousSession) {
+        // 宿主重载/重放 {} 返回的无作用域全量 payload：不得覆盖已锁定会话与当前列表，按锁定会话重拉
+        initialScopeRef.current = decision.nextScope;
+        void pollSnapshot(false);
+        return false;
+      }
+      if (!decision.acceptPayload) {
+        // 对话面尚未绑定会话：fail-closed，不展示任何其他会话任务
+        initialScopeRef.current = decision.nextScope;
+        setInitialScope(decision.nextScope);
+        scopeModeRef.current = resolveScopeMode(decision.nextScope);
+        setScopeMode(scopeModeRef.current);
+        setSelectedGroupKey(null);
+        currentTaskIdRef.current = null;
+        setCurrentTask(null);
+        selectedTaskIdRef.current = null;
+        setSelectedTaskId(null);
+        setTasks([]);
+        setGroups([]);
+        setEvents([]);
+        offsetRef.current = 0;
+        setLoadingInitial(false);
+        return false;
+      }
       const prevScope = initialScopeRef.current;
-      const incomingPid = payload.scope.parentSessionId ?? null;
-      const nextScope: MonitorScope = {
-        parentSessionId: incomingPid,
-        // 服务端未解析出标题时，保留 ontoolinput 已锁定的同会话标题
-        parentSessionTitle: payload.scope.parentSessionTitle
-          ?? (prevScope.parentSessionId === incomingPid ? prevScope.parentSessionTitle : null),
-        cwd: payload.scope.cwd ?? null,
-      };
+      const nextScope = decision.nextScope;
       initialScopeRef.current = nextScope;
       setInitialScope(nextScope);
       const nextMode = resolveScopeMode(nextScope);
@@ -527,30 +565,42 @@ function MonitorApp() {
         // 首屏竞态修复：立即解析工具入参并锁定作用域，取消无作用域兜底快照
         receivedToolEventRef.current = true;
         clearFallback();
+        syncConversationSurface();
         const parsed = parseToolInputScope(params);
-        if (parsed.scope.parentSessionId || parsed.scope.cwd) {
+        const prevScope = initialScopeRef.current;
+        if (parsed.scope.parentSessionId) {
           initialScopeRef.current = parsed.scope;
           setInitialScope(parsed.scope);
-          const nextMode = resolveScopeMode(parsed.scope);
-          scopeModeRef.current = nextMode;
-          setScopeMode(nextMode);
+          scopeModeRef.current = "session";
+          setScopeMode("session");
+          setSelectedGroupKey(null);
+        } else if (!inConversationSurfaceRef.current && !prevScope.parentSessionId && parsed.scope.cwd) {
+          // 仅 global 视图且未锁定会话时可按 cwd 收窄；绝不用空入参覆盖已锁定的会话
+          initialScopeRef.current = parsed.scope;
+          setInitialScope(parsed.scope);
+          scopeModeRef.current = resolveScopeMode(parsed.scope);
+          setScopeMode(scopeModeRef.current);
           setSelectedGroupKey(null);
         }
         if (parsed.taskId) {
           selectedTaskIdRef.current = parsed.taskId;
           setSelectedTaskId(parsed.taskId);
         }
-        if (!currentTaskIdRef.current) {
-          setLoadingInitial(true);
-        }
         requestEpochRef.current += 1;
         offsetRef.current = 0;
         clearPoll();
-        void pollSnapshot(true);
+        if (shouldPollOnToolInput(parsed, initialScopeRef.current, inConversationSurfaceRef.current)) {
+          setLoadingInitial(true);
+          void pollSnapshot(true);
+        } else if (!currentTaskIdRef.current) {
+          // 对话面收到空 {} / 流式入参：仅置 loading，等待 ontoolresult 决策
+          setLoadingInitial(true);
+        }
       };
       createdApp.ontoolresult = (result) => {
         receivedToolEventRef.current = true;
         clearFallback();
+        syncConversationSurface();
         const sc = (result as { structuredContent?: MonitorPayload } | undefined)?.structuredContent;
         if (!sc) return;
         requestEpochRef.current += 1;
@@ -568,9 +618,14 @@ function MonitorApp() {
 
   useEffect(() => {
     if (!isConnected) return;
-    // 不再在连接瞬间盲发无作用域快照：等待 ontoolinput/ontoolresult，
-    // 仅在短兜底窗口内两者均未到达时才发一次兜底快照。
-    if (!receivedToolEventRef.current && !currentTaskIdRef.current) {
+    // 连接就绪：同步宿主面类型；600ms 兜底快照仅用于无所属对话的 global 视图
+    syncConversationSurface();
+    const convSurface = isConversationSurface(app?.getHostCapabilities());
+    if (
+      shouldScheduleInitialFallback(convSurface)
+      && !receivedToolEventRef.current
+      && !currentTaskIdRef.current
+    ) {
       fallbackTimerRef.current = window.setTimeout(() => {
         fallbackTimerRef.current = null;
         if (!receivedToolEventRef.current && !currentTaskIdRef.current) {
@@ -582,7 +637,7 @@ function MonitorApp() {
       clearPoll();
       clearFallback();
     };
-  }, [isConnected, pollSnapshot, clearPoll, clearFallback]);
+  }, [isConnected, app, pollSnapshot, clearPoll, clearFallback, syncConversationSurface]);
 
   const switchTask = useCallback((nextId: string | null) => {
     if (nextId === selectedTaskIdRef.current) return;
@@ -864,9 +919,13 @@ function MonitorApp() {
                   "正在加载 Pi Worker 监控数据..."
                 ) : (
                   <>
-                    当前作用域没有可展示的 Pi Worker 任务。
+                    {inConversationSurface && !sessionLocked
+                      ? "当前侧面板尚未绑定会话——本对话派发 pi-worker 或调用 `pi_worker_monitor` 后自动锁定并仅显示当前会话任务（查看跨会话任务请从左侧栏 Pi Worker 全局入口打开）"
+                      : "当前作用域没有可展示的 Pi Worker 任务。"}
                     <br />
-                    发起 <code>pi_worker_start</code> 后将自动在此显示实时进度。
+                    {inConversationSurface && !sessionLocked
+                      ? "发起 pi_worker_start 后将自动锁定当前会话并在此显示实时进度。"
+                      : "发起 <code>pi_worker_start</code> 后将自动在此显示实时进度。"}
                   </>
                 )}
               </div>

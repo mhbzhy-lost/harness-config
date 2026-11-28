@@ -12,15 +12,20 @@ import {
   INITIAL_FALLBACK_MS,
   LOCKED_IDLE_POLL_MS,
   buildSnapshotScopeArgs,
+  canFetchSnapshot,
   fallbackGroupTasks,
   formatGroupLabel,
   formatSessionBadge,
   formatTaskOptionLabel,
+  isConversationSurface,
   isSessionLocked,
+  mergeToolResultScope,
   parseToolInputScope,
   pickAutoFocusTaskId,
   resolvePollDelayMs,
   resolveScopeMode,
+  shouldPollOnToolInput,
+  shouldScheduleInitialFallback,
   shortDir,
   truncateLabel,
 } from "../plugins/pi-worker/ui-src/scope.ts";
@@ -352,6 +357,81 @@ test("test_fallback_grouping_aggregates_latest_session_title_and_auto_focus", ()
   assert.equal(pickAutoFocusTaskId([]), null);
 });
 
+test("test_is_conversation_surface_follows_agy_host_capabilities", () => {
+  // 对话内侧面板具备 message / updateModelContext；左侧栏 global 视图两者皆无
+  assert.equal(isConversationSurface(undefined), false);
+  assert.equal(isConversationSurface(null), false);
+  assert.equal(isConversationSurface({}), false);
+  assert.equal(isConversationSurface({ serverTools: {} }), false);
+  assert.equal(isConversationSurface({ message: {} }), true);
+  assert.equal(isConversationSurface({ updateModelContext: {} }), true);
+  assert.equal(isConversationSurface({ message: {}, updateModelContext: {} }), true);
+});
+
+test("test_merge_tool_result_scope_never_downgrades_locked_session", () => {
+  const locked = { parentSessionId: "conv-abc", parentSessionTitle: "会话标题", cwd: "/repo/a" };
+
+  // 1. 锁定新会话：接受 payload；同会话且服务端无标题时保留已锁定标题，换会话则不沿用旧标题
+  const same = mergeToolResultScope(locked, { parentSessionId: "conv-abc", parentSessionTitle: null, cwd: null }, true);
+  assert.deepEqual(same, {
+    nextScope: { parentSessionId: "conv-abc", parentSessionTitle: "会话标题", cwd: null },
+    acceptPayload: true,
+    preservePreviousSession: false,
+  });
+  const switched = mergeToolResultScope(locked, { parentSessionId: "conv-new", parentSessionTitle: "新会话", cwd: "/repo/b" }, true);
+  assert.equal(switched.acceptPayload, true);
+  assert.deepEqual(switched.nextScope, { parentSessionId: "conv-new", parentSessionTitle: "新会话", cwd: "/repo/b" });
+  const switchedNoTitle = mergeToolResultScope(locked, { parentSessionId: "conv-new", parentSessionTitle: null, cwd: null }, false);
+  assert.equal(switchedNoTitle.nextScope.parentSessionTitle, null);
+
+  // 2. 拒绝 {} 降级：已锁定会话收到 parentSessionId=null 的重载/重放 payload，不覆盖、要求按锁定会话重拉
+  for (const incoming of [null, undefined, EMPTY_SCOPE, { parentSessionId: null, parentSessionTitle: "x", cwd: "/other" }]) {
+    const refused = mergeToolResultScope(locked, incoming, true);
+    assert.deepEqual(refused, { nextScope: locked, acceptPayload: false, preservePreviousSession: true });
+  }
+
+  // 3. 对话面未绑定会话：fail-closed，不展示跨会话任务
+  const failClosed = mergeToolResultScope(EMPTY_SCOPE, { parentSessionId: null, parentSessionTitle: null, cwd: "/repo" }, true);
+  assert.deepEqual(failClosed, { nextScope: EMPTY_SCOPE, acceptPayload: false, preservePreviousSession: false });
+  assert.deepEqual(mergeToolResultScope(EMPTY_SCOPE, null, true), failClosed);
+
+  // 4. global 视图：允许全量 payload，沿用服务端作用域
+  const globalAll = mergeToolResultScope(EMPTY_SCOPE, { parentSessionId: null, parentSessionTitle: null, cwd: "/repo" }, false);
+  assert.equal(globalAll.acceptPayload, true);
+  assert.equal(globalAll.preservePreviousSession, false);
+  assert.deepEqual(globalAll.nextScope, { parentSessionId: null, parentSessionTitle: null, cwd: "/repo" });
+  assert.deepEqual(mergeToolResultScope(EMPTY_SCOPE, null, false).nextScope, EMPTY_SCOPE);
+  // global 视图已锁定会话时同样拒绝降级
+  assert.equal(mergeToolResultScope(locked, null, false).preservePreviousSession, true);
+});
+
+test("test_tool_input_polling_and_snapshot_gates_fail_closed_in_conversation_surface", () => {
+  const convParsed = parseToolInputScope({ arguments: { parentSessionId: "conv-abc", cwd: "/repo" } });
+  const emptyParsed = parseToolInputScope({});
+  const cwdParsed = parseToolInputScope({ arguments: { cwd: "/repo" } });
+  const locked = { parentSessionId: "conv-abc", parentSessionTitle: null, cwd: null };
+
+  // 对话面：仅当入参或本地已有会话 id 才抢跑；空 {} / 仅 cwd 时等待 ontoolresult
+  assert.equal(shouldPollOnToolInput(convParsed, EMPTY_SCOPE, true), true);
+  assert.equal(shouldPollOnToolInput(emptyParsed, locked, true), true);
+  assert.equal(shouldPollOnToolInput(emptyParsed, EMPTY_SCOPE, true), false);
+  assert.equal(shouldPollOnToolInput(cwdParsed, EMPTY_SCOPE, true), false);
+  // global 视图：总是允许
+  assert.equal(shouldPollOnToolInput(emptyParsed, EMPTY_SCOPE, false), true);
+
+  // 快照闸：对话面仅允许带会话 id 的 session 模式
+  assert.equal(canFetchSnapshot("session", locked, true), true);
+  assert.equal(canFetchSnapshot("session", { ...locked, parentSessionId: null }, true), false);
+  assert.equal(canFetchSnapshot("cwd", { ...EMPTY_SCOPE, cwd: "/repo" }, true), false);
+  assert.equal(canFetchSnapshot("all", EMPTY_SCOPE, true), false);
+  assert.equal(canFetchSnapshot("all", EMPTY_SCOPE, false), true);
+  assert.equal(canFetchSnapshot("cwd", EMPTY_SCOPE, false), true);
+
+  // 600ms 兜底仅用于 global 视图
+  assert.equal(shouldScheduleInitialFallback(false), true);
+  assert.equal(shouldScheduleInitialFallback(true), false);
+});
+
 test("test_locked_session_keeps_low_frequency_polling_when_idle", () => {
   const running = makeScopeTask();
   const done = makeScopeTask({ status: "done" });
@@ -418,4 +498,12 @@ test("test_app_tsx_and_monitor_html_enforce_ui_event_window_and_memo", () => {
   assert.match(appSource, /MAX_UI_EVENTS\s*=\s*2000/);
   assert.match(appSource, /useMemo\(\s*\(\)\s*=>\s*reduceTimelineItems\(events,\s*isRunning\)/);
   assert.match(appSource, /slice\(/);
+  // 根因修复：对话面 fail-closed 闸门必须接入 poller、ontoolinput、ontoolresult 与兜底定时器
+  assert.match(appSource, /canFetchSnapshot\(mode,\s*scope,\s*inConversationSurfaceRef\.current\)/);
+  assert.match(appSource, /shouldPollOnToolInput\(parsed,\s*initialScopeRef\.current,\s*inConversationSurfaceRef\.current\)/);
+  assert.match(appSource, /mergeToolResultScope\(initialScopeRef\.current,\s*payload\.scope,\s*inConversationSurfaceRef\.current\)/);
+  assert.match(appSource, /shouldScheduleInitialFallback\(convSurface\)/);
+  assert.match(appSource, /isConversationSurface\(app\?\.getHostCapabilities\(\)\)/);
+  const html = readFileSync(MONITOR_HTML, "utf8");
+  assert.ok(html.includes("当前侧面板尚未绑定会话"), "monitor.html missing unbound-session hint");
 });
