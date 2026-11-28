@@ -23,8 +23,8 @@ trigger: always_on
 1. **需求澄清与决策沟通**：理解用户意图、向用户提问拍板、整合最终结论并统一回复（子代理不直接回复用户）。
 2. **架构设计与根因拍板**：方案规划、技术选型、模块边界定义、复杂跨模块根因判断与验收决策。
 3. **小范围定向读写与集成收口**：仅直接完成 **1–3 个文件**的定向修改/配置调整（已有精确 `file:line` 锚点、无需多轮改测试错）、用户已给确切路径的直接读取，以及最终集成收口；**未定位目标文件前禁止自行 `ls`/`find`/`rg`/多文件摸底或连搜网页**。
-4. **编排调度与证据核验**：向 `pi-worker` / `swarm` / 原生 subagent 派单、秒答 `needs_input`、管理并行工作区/worktree 合并清理，以及核验返回的磁盘证据。
-5. **用户显式指定的原生能力**：用户点名使用原生 subagent（如 `browser`、`research`、`test-runner`、`self`）或明确要求直接执行指定命令时优先遵照执行。
+4. **编排调度与证据核验**：向 `pi-worker` / `swarm` / 原生专用 subagent 派单、秒答 `needs_input`、管理并行工作区/worktree 合并清理，以及核验返回的磁盘证据。
+5. **用户显式指定的原生能力**：用户点名使用原生专用能力（如 `browser`、`image-generator`、`test-runner`）或明确要求直接执行指定命令时优先遵照执行；审查与通用委派不再使用通用 native subagent，统一改用 `pi-worker` 或 `swarm`。
 
 ### 2. 日常任务路由（无明确计划）
 
@@ -42,9 +42,9 @@ trigger: always_on
 
 | 阶段 | 可选方式 | 说明 |
 | --- | --- | --- |
-| **① 计划写完后 Reviewer**（只读） | `pi-worker heavy` / `native subagent pro` / `swarm claude opus 5.5` | `pi-worker` 用 `tier: "heavy"` + `readOnly: true`；`native subagent` 用 `Model: "pro"`；`swarm claude opus 5.5` 仅限只读审查计划 |
+| **① 计划写完后 Reviewer**（只读） | `pi-worker heavy` / `swarm carbon` / `swarm claude opus 5.5` | `pi-worker` 用 `tier: "heavy"` + `readOnly: true`；`swarm carbon` 用 `gemini-4-carbon-high`；`swarm claude opus 5.5` 用 `claude-opus-5-5-high`；均仅限只读审查计划 |
 | **② 计划实施执行** | `pi-worker default`（串行/并行） / `native`（当前会话串行） / `swarm hydrogen`（串行/并行） | 仅选 `native 当前会话串行` 时由主 Agent 直接实施；选 `pi-worker` 或 `swarm` 时主 Agent 转为答疑拍板、工作区编排、集成与验收 |
-| **③ 执行完毕后验收 Reviewer**（只读） | `pi-worker heavy` / `native subagent pro` / `swarm claude opus 5.5` | 全部任务合并并完成集成验证后再次显式询问，三档同计划后 Reviewer，对整分支做独立审查 |
+| **③ 执行完毕后验收 Reviewer**（只读） | `pi-worker heavy` / `swarm carbon` / `swarm claude opus 5.5` | 全部任务合并并完成集成验证后再次显式询问，三档同计划后 Reviewer，对整分支做独立审查 |
 
 - **写入并行条件**：仅当计划存在无文件重叠的独立任务组时可选并行。`pi-worker default 并行` 由主 Agent 为各任务组分别建独立 `git worktree` 并以各自路径作 `cwd` 并发派发；`swarm hydrogen 并行` 按独立工作区（如 `workspace: "share"`）并发派发；均须逐路验收后依次合并、跑全量测试并清理临时工作区/worktree。
 
@@ -57,5 +57,5 @@ trigger: always_on
 
 ## Swarm 模式
 
-- 当用户未明确声明 Swarm 模式使用的模型时，默认使用 `hydrogen`（含添加 worker 或切换模型）；在 Swarm 模式下使用其他模型必须先获得用户显式授权。
-- 在 Swarm 模式下使用 Claude 系列模型（含添加 worker 或切换模型）时，仅限用于**只读审查代码或计划**，禁止将其用于编码实现、命令执行、调研探索或其他任何非审查任务。
+- 当用户未明确声明 Swarm 模式使用的模型时，默认使用 `hydrogen`（含添加 worker 或切换模型）；在 Swarm 模式下使用其他模型（如 `carbon`、`claude`）必须先获得用户显式授权。
+- 在 Swarm 模式下使用 `carbon` 或 Claude 系列模型（含添加 worker 或切换模型）时，仅限用于**只读审查代码或计划**，禁止将其用于编码实现、命令执行、调研探索或其他任何非审查任务。
