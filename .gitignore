@@ -24,3 +24,6 @@ remote-terminal/config.json
 .agents/skills/pi-docs/examples
 .agents/skills/pi-docs/schemas
 .agents/skills/pi-docs/README.md
+
+# 本地规划与过程文档，不入库
+/docs/
