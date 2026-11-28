@@ -237,3 +237,72 @@ test("proxy tunnel: getProxyTunnelAgent reuses agent per port with idle timeout"
     customAgent.destroy();
   }
 });
+
+test("proxy tunnel: postJson reuses pooled ProxyTunnelAgent across consecutive default requests", async () => {
+  const tls = generateSelfSignedCert();
+  const targetServer = createHttpsServer({ key: tls.key, cert: tls.cert }, (_req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+  });
+
+  let connectCount = 0;
+  const proxy = createHttpServer();
+  const proxyConns = new Set();
+  proxy.on("connect", (req, clientSocket, head) => {
+    connectCount += 1;
+    const [host, portStr] = req.url.split(":");
+    const upstream = netConnect(Number(portStr), host, () => {
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head.length > 0) upstream.write(head);
+      upstream.pipe(clientSocket);
+      clientSocket.pipe(upstream);
+    });
+    proxyConns.add(clientSocket);
+    proxyConns.add(upstream);
+    const cleanup = () => {
+      proxyConns.delete(clientSocket);
+      proxyConns.delete(upstream);
+      clientSocket.destroy();
+      upstream.destroy();
+    };
+    upstream.on("error", cleanup);
+    clientSocket.on("error", cleanup);
+    upstream.on("close", () => clientSocket.destroy());
+    clientSocket.on("close", () => upstream.destroy());
+  });
+
+  try {
+    const targetPort = await listenServer(targetServer);
+    const proxyPort = await listenServer(proxy);
+    const script = `
+      import { postJson, getProxyTunnelAgent } from ${JSON.stringify(PROVIDERS_URL)};
+      const url = ${JSON.stringify(`https://127.0.0.1:${targetPort}/search`)};
+      const r1 = await postJson("exa", url, { q: 1 }, { "Content-Type": "application/json" }, { proxyPort: ${proxyPort} });
+      const r2 = await postJson("exa", url, { q: 2 }, { "Content-Type": "application/json" }, { proxyPort: ${proxyPort} });
+      getProxyTunnelAgent(${proxyPort}).destroy();
+      console.log(JSON.stringify({ s1: r1.status, s2: r2.status }));
+    `;
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+        env: { ...process.env, NODE_EXTRA_CA_CERTS: tls.certPath },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (c) => { stdout += c; });
+      child.stderr.on("data", (c) => { stderr += c; });
+      child.once("error", reject);
+      child.once("exit", (code) => resolve({ code, stdout, stderr }));
+    });
+
+    assert.equal(result.code, 0, `子进程异常退出 code=${result.code}, stderr=${result.stderr}`);
+    const parsed = JSON.parse(result.stdout.trim());
+    assert.deepEqual(parsed, { s1: 200, s2: 200 });
+    assert.equal(connectCount, 1, `连续两次默认 postJson 应复用代理池中的同一隧道，实际 CONNECT 次数=${connectCount}`);
+  } finally {
+    for (const s of proxyConns) s.destroy();
+    await closeServer(proxy);
+    await closeServer(targetServer);
+    rmSync(tls.dir, { recursive: true, force: true });
+  }
+});

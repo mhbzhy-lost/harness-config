@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
+import { connect as netConnect } from "node:net";
 import test from "node:test";
 import {
 	InvalidJsonError,
 	LruSessionStore,
 	PayloadTooLargeError,
+	RequestAbortedError,
 	isAuthorizedHeader,
 	readBoundedJsonBody,
 } from "../plugins/home-connect/src/http-guards.ts";
@@ -132,4 +135,74 @@ test("LruSessionStore refreshes access order on get and closes evicted session",
 	await store.closeAll();
 	assert.deepEqual(closed, ["b", "c"]);
 	assert.equal(store.size, 0);
+});
+
+test("readBoundedJsonBody rejects with RequestAbortedError on mid-POST abort and server-http guards unhandled rejections", async () => {
+	let caughtError = null;
+	let abortedResolve;
+	const abortedDone = new Promise((resolve) => {
+		abortedResolve = resolve;
+	});
+
+	const server = createServer(async (req, res) => {
+		try {
+			const parsed = await readBoundedJsonBody(req, 1024);
+			res.writeHead(200, { "Content-Type": "application/json" });
+			res.end(JSON.stringify({ parsed }));
+		} catch (error) {
+			if (error instanceof RequestAbortedError) {
+				caughtError = error;
+				if (!res.headersSent && !res.writableEnded) res.destroy();
+				abortedResolve();
+				return;
+			}
+			res.writeHead(500, { "Content-Type": "application/json" });
+			res.end(JSON.stringify({ error: error.message }));
+		}
+	});
+
+	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const addr = server.address();
+	assert.ok(addr && typeof addr === "object");
+
+	try {
+		// 1. 发送部分 chunked POST 后强制断连
+		await new Promise((resolve, reject) => {
+			const sock = netConnect(addr.port, "127.0.0.1", () => {
+				sock.write(
+					"POST /home HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n5\r\n{\"a\":",
+					() => {
+						setTimeout(() => {
+							sock.destroy();
+							resolve();
+						}, 30);
+					},
+				);
+			});
+			sock.on("error", reject);
+		});
+
+		await Promise.race([
+			abortedDone,
+			new Promise((_, reject) => setTimeout(() => reject(new Error("readBoundedJsonBody 未在断连后 reject")), 1000)),
+		]);
+		assert.ok(caughtError instanceof RequestAbortedError, `应抛出 RequestAbortedError，实际: ${caughtError}`);
+
+		// 2. 断连后服务仍可正常响应后续请求
+		const nextRes = await fetch(`http://127.0.0.1:${addr.port}/home`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ ok: true }),
+		});
+		assert.equal(nextRes.status, 200);
+		assert.deepEqual(await nextRes.json(), { parsed: { ok: true } });
+
+		// 3. 核验 server-http.ts 已捕获 RequestAbortedError 并对 handle() 挂载兜底 .catch
+		const serverSrc = readFileSync(new URL("../plugins/home-connect/src/server-http.ts", import.meta.url), "utf8");
+		assert.match(serverSrc, /instanceof RequestAbortedError/);
+		assert.match(serverSrc, /handle\(req,\s*res,\s*"relay"\)\.catch\(/);
+		assert.match(serverSrc, /handle\(req,\s*res,\s*"lan"\)\.catch\(/);
+	} finally {
+		await new Promise((resolve) => server.close(() => resolve()));
+	}
 });

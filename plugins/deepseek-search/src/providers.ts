@@ -124,6 +124,7 @@ class ProxyTunnelAgent extends HttpsAgent {
     let tlsSocket: TLSSocket | undefined;
     let onTlsError: ((error: Error) => void) | undefined;
     let onTlsClose: (() => void) | undefined;
+    let onTlsTimeout: (() => void) | undefined;
 
     const fail = (error: Error) => {
       if (settled) return;
@@ -141,6 +142,7 @@ class ProxyTunnelAgent extends HttpsAgent {
       clearTimeout(deadlineTimer);
       if (onTlsError) tls.removeListener("error", onTlsError);
       if (onTlsClose) tls.removeListener("close", onTlsClose);
+      if (onTlsTimeout) tls.removeListener("timeout", onTlsTimeout);
       tls.setTimeout(0);
       callback(null, tls);
     };
@@ -179,10 +181,11 @@ class ProxyTunnelAgent extends HttpsAgent {
       }
       onTlsError = (error: Error) => fail(new ProviderFailure("exa", `代理隧道 TLS 握手失败：${error.name}`));
       onTlsClose = () => fail(new ProviderFailure("exa", "代理隧道 TLS 连接提前关闭"));
+      onTlsTimeout = () => fail(new ProviderFailure("exa", "代理隧道 TLS 握手超时"));
       tlsSocket.once("secureConnect", () => succeed(tlsSocket!));
       tlsSocket.once("error", onTlsError);
       tlsSocket.once("close", onTlsClose);
-      tlsSocket.setTimeout(this.timeoutMs, () => fail(new ProviderFailure("exa", "代理隧道 TLS 握手超时")));
+      tlsSocket.setTimeout(this.timeoutMs, onTlsTimeout);
     });
     connectReq.once("timeout", () => fail(new ProviderFailure("exa", "代理 CONNECT 超时")));
     connectReq.once("error", (error: Error) => fail(new ProviderFailure("exa", `代理 CONNECT 失败：${error.name}`)));
@@ -277,6 +280,7 @@ export async function postJson(
   const bodyText = JSON.stringify(payload);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let ephemeralAgent: ProxyTunnelAgent | undefined;
   try {
     if (proxyPort === undefined) {
       const response = await fetch(url, {
@@ -293,7 +297,12 @@ export async function postJson(
       const body = await readFetchBody(response, provider);
       return { status: response.status, headers: response.headers, body };
     }
-    const agent = getProxyTunnelAgent(proxyPort, { ca: options?.ca, timeoutMs });
+    const hasCustomAgentOptions = options?.ca !== undefined
+      || (options?.timeoutMs !== undefined && options.timeoutMs !== REQUEST_TIMEOUT_MS);
+    const agent = hasCustomAgentOptions
+      ? getProxyTunnelAgent(proxyPort, { ca: options?.ca, timeoutMs })
+      : getProxyTunnelAgent(proxyPort);
+    if (hasCustomAgentOptions) ephemeralAgent = agent;
     return await new Promise<HttpResponse>((resolve, reject) => {
       let settled = false;
       let request: ClientRequest;
@@ -372,6 +381,7 @@ export async function postJson(
     throw new ProviderFailure(provider, `${provider} 请求失败`);
   } finally {
     clearTimeout(timer);
+    ephemeralAgent?.destroy();
   }
 }
 

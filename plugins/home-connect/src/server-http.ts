@@ -21,6 +21,7 @@ import {
 	InvalidJsonError,
 	LruSessionStore,
 	PayloadTooLargeError,
+	RequestAbortedError,
 	isAuthorizedHeader,
 	readBoundedJsonBody,
 } from "./http-guards.ts";
@@ -239,7 +240,13 @@ async function handle(req: IncomingMessage, res: ServerResponse, access: Access)
 				json(res, 400, { error: "invalid_json" });
 				return;
 			}
-			throw error;
+			if (error instanceof RequestAbortedError) {
+				if (!res.headersSent && !res.writableEnded) res.destroy();
+				return;
+			}
+			if (!res.headersSent && !res.writableEnded) json(res, 400, { error: "request_read_failed" });
+			else if (!res.writableEnded) res.destroy();
+			return;
 		}
 	} else if (Number(req.headers["content-length"] ?? 0) > MAX_BODY_BYTES) {
 		json(res, 413, { error: "payload_too_large" }, { Connection: "close" });
@@ -268,19 +275,28 @@ async function handle(req: IncomingMessage, res: ServerResponse, access: Access)
 	}
 }
 
+function onUnhandledRequestError(res: ServerResponse, error: unknown): void {
+	console.error("home-connect HTTP 请求未捕获异常:", error);
+	if (!res.headersSent && !res.writableEnded) {
+		json(res, 500, { error: "internal_error" });
+	} else if (!res.writableEnded) {
+		res.destroy();
+	}
+}
+
 let httpServer: Server | undefined;
 let httpsServer: Server | undefined;
 let caPem: string | undefined;
 if (cfg.tls) {
 	if (cfg.tls.ca && existsSync(resolvePath(cfg.tls.ca))) caPem = readFileSync(resolvePath(cfg.tls.ca), "utf8");
 	httpsServer = createHttpsServer({ cert: readFileSync(resolvePath(cfg.tls.cert)), key: readFileSync(resolvePath(cfg.tls.key)) }, (req, res) => {
-		void handle(req, res, "relay");
+		void handle(req, res, "relay").catch((error) => onUnhandledRequestError(res, error));
 	});
 	httpsServer.listen(cfg.tls.port, "127.0.0.1", () => console.log(`home-connect 远程入口(中继路, TLS) 127.0.0.1:${cfg.tls.port}`));
 	if (cfg.tls.ca && caPem) console.log(`CA 证书可下发：GET /ca.crt（SHA256 ${caFingerprint(caPem)}）`);
 }
 httpServer = createHttpServer((req, res) => {
-	void handle(req, res, "lan");
+	void handle(req, res, "lan").catch((error) => onUnhandledRequestError(res, error));
 });
 httpServer.listen(cfg.port, cfg.bind, () => console.log(`home-connect 远程入口(局域网路) ${cfg.bind}:${cfg.port}`));
 

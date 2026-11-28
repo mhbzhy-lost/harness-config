@@ -19,6 +19,15 @@ export class InvalidJsonError extends Error {
 	}
 }
 
+export class RequestAbortedError extends Error {
+	readonly statusCode = 400;
+
+	constructor(message = "request_aborted") {
+		super(message);
+		this.name = "RequestAbortedError";
+	}
+}
+
 /** 按 UTF-8 字节长度与常量时间比较校验 Bearer 鉴权头，避免多字节字符引发 RangeError。 */
 export function isAuthorizedHeader(given: string | undefined, expectedApiKey: string): boolean {
 	if (!given || !expectedApiKey) return false;
@@ -49,6 +58,7 @@ export function readBoundedJsonBody(req: IncomingMessage, maxBytes: number): Pro
 			req.off("end", onEnd);
 			req.off("error", onError);
 			req.off("aborted", onAborted);
+			req.off("close", onClose);
 		};
 
 		const fail = (error: Error) => {
@@ -82,12 +92,16 @@ export function readBoundedJsonBody(req: IncomingMessage, maxBytes: number): Pro
 		};
 
 		const onError = (error: Error) => fail(error);
-		const onAborted = () => fail(new Error("request_aborted"));
+		const onAborted = () => fail(new RequestAbortedError());
+		const onClose = () => {
+			if (!req.complete) fail(new RequestAbortedError());
+		};
 
 		req.on("data", onData);
 		req.on("end", onEnd);
 		req.on("error", onError);
 		req.on("aborted", onAborted);
+		req.on("close", onClose);
 	});
 }
 
