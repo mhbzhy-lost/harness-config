@@ -6,14 +6,16 @@ import {
   chmodSync,
   constants,
   createWriteStream,
+  existsSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   statSync,
   unlinkSync,
 } from "node:fs";
 import type { WriteStream } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, dirname, isAbsolute, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   PROTOCOL_APPEND_PROMPT,
@@ -45,9 +47,115 @@ export const DEFAULT_EXCLUDE_TOOLS = [
 ] as const;
 export const READONLY_EXCLUDE_TOOLS = ["write", "edit"] as const;
 const READONLY_APPEND_PROMPT =
-  "6. 当前为只读模式（readOnly=true）：write 与 edit 工具已禁用，严禁通过 bash 创建、修改或删除项目源码/配置文件（测试或构建命令产生的正常临时产物除外）。";
+  "7. 当前为只读模式（readOnly=true）：write 与 edit 工具已禁用，严禁通过 bash 创建、修改或删除项目源码/配置文件（测试或构建命令产生的正常临时产物除外）。";
+
+/** 子进程允许加载的 Pi 内置扩展白名单（不含 llama.cpp） */
+export const WORKER_BUILTIN_EXTENSIONS = ["builtin:mcp", "builtin:codemode", "builtin:tool-search"] as const;
+/** 子进程允许加载的仓内受管扩展白名单（严格排除纯交互/TUI 扩展） */
+export const WORKER_MANAGED_EXTENSIONS = [
+  "agent-plugins",
+  "bash-cwd",
+  "endpoint-fallback",
+  "network-recovery",
+  "cliproxyapi",
+  "security-gates",
+  "tool-timing",
+] as const;
+const WORKER_DCP_PACKAGE_NAME = "pi-dcp";
 
 export const WORKER_EXTENSION_PATH = join(dirname(fileURLToPath(import.meta.url)), "worker-ext.ts");
+
+/** 从 `pi/settings.json` 的 `packages` 中查找 pi-dcp 锁版条目（单一事实源） */
+function findDcpPackageSpec(repoRoot: string): string | undefined {
+  let settings: unknown;
+  try {
+    settings = JSON.parse(readFileSync(join(repoRoot, "pi", "settings.json"), "utf8"));
+  } catch {
+    return undefined;
+  }
+  const packages = (settings as { packages?: unknown } | null)?.packages;
+  if (!Array.isArray(packages)) return undefined;
+  return packages.find((p): p is string => typeof p === "string" && p.includes(WORKER_DCP_PACKAGE_NAME));
+}
+
+/**
+ * 构造子进程扩展参数：`--no-extensions` 关闭自动发现，再按白名单显式 `-e` 注入，
+ * 避免本机 settings.json / 交互式包（pi-subagents 等）与纯交互扩展泄漏到无头 worker。
+ */
+export function resolveWorkerExtensionArgs(repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..")): string[] {
+  const args: string[] = ["--no-extensions"];
+  for (const builtin of WORKER_BUILTIN_EXTENSIONS) args.push("-e", builtin);
+  const dcpSpec = findDcpPackageSpec(repoRoot);
+  if (dcpSpec) args.push("-e", dcpSpec);
+  for (const name of WORKER_MANAGED_EXTENSIONS) {
+    const extPath = join(repoRoot, "pi", "extensions", name, `${name}.ts`);
+    if (existsSync(extPath)) args.push("-e", extPath);
+  }
+  args.push("-e", WORKER_EXTENSION_PATH);
+  return args;
+}
+
+/**
+ * 发现目标项目自身的上下文文件（`AGENTS.md` 优先，其次 `CLAUDE.md`）：
+ * 在 git 仓库内从项目根向下收集到 `cwd`；不在 git 仓库中时仅检查 `cwd` 自身，不向上爬。
+ * 明确排除 `agentDir` 下的文件（即 `~/.pi/agent/AGENTS.md` = `pi/GLOBAL.md`），保证全局偏好不泄漏进 worker。
+ */
+export function discoverProjectContextFiles(
+  cwd: string,
+  options: { agentDir?: string } = {},
+): string[] {
+  const resolvedCwd = realpathSync(resolve(cwd));
+  const agentDirSource = resolve(
+    options.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
+  );
+  const agentDir = existsSync(agentDirSource) ? realpathSync(agentDirSource) : agentDirSource;
+  const CONTEXT_FILE_NAMES = ["AGENTS.md", "CLAUDE.md"];
+  const contextFileInDir = (dir: string): string | undefined => {
+    for (const name of CONTEXT_FILE_NAMES) {
+      const candidate = join(dir, name);
+      if (existsSync(candidate)) return candidate;
+    }
+    return undefined;
+  };
+
+  let projectRoot: string | undefined;
+  for (let dir = resolvedCwd; ; dir = dirname(dir)) {
+    if (existsSync(join(dir, ".git"))) {
+      projectRoot = dir;
+      break;
+    }
+    if (dirname(dir) === dir) break;
+  }
+
+  // 从 cwd 向上走到项目根后逆序，得到根 → cwd 的目录序列；不在 git 仓库中时仅 cwd 自身
+  const dirs: string[] = [];
+  if (projectRoot) {
+    for (let dir = resolvedCwd; ; dir = dirname(dir)) {
+      dirs.push(dir);
+      if (dir === projectRoot) break;
+    }
+    dirs.reverse();
+  } else {
+    dirs.push(resolvedCwd);
+  }
+
+  const files: string[] = [];
+  const seenReal = new Set<string>();
+  for (const dir of dirs) {
+    const file = contextFileInDir(dir);
+    if (!file) continue;
+    let realFile: string;
+    try {
+      realFile = realpathSync(file);
+    } catch {
+      continue;
+    }
+    if (dirname(realFile) === agentDir || seenReal.has(realFile)) continue;
+    seenReal.add(realFile);
+    files.push(file);
+  }
+  return files;
+}
 
 /** 任务/会话标题统一截断长度 */
 export const MAX_TITLE_CHARS = 48;
@@ -164,6 +272,8 @@ export interface PiWorkerRunnerOptions {
   collectGitChanges?: (cwd: string) => Promise<string[]>;
   pipeDrainGraceMs?: number;
   streamEndTimeoutMs?: number;
+  /** 覆盖仓根路径（仅测试注入；默认由本文件位置推导） */
+  repoRoot?: string;
 }
 
 interface ActiveExecution {
@@ -447,6 +557,7 @@ export class PiWorkerRunner {
   private readonly collectGitChangesFn: (cwd: string) => Promise<string[]>;
   private readonly pipeDrainGraceMs: number;
   private readonly streamEndTimeoutMs: number;
+  private readonly repoRoot: string | undefined;
   private readonly active = new Map<string, ActiveExecution>();
   private readonly inFlight = new Set<string>();
   private shutdownPromise: Promise<void> | null = null;
@@ -455,6 +566,7 @@ export class PiWorkerRunner {
     this.baseEnv = options.env ?? process.env;
     this.store = options.store ?? new TaskStore(undefined);
     this.explicitPiBinary = options.piBinary;
+    this.repoRoot = options.repoRoot;
     this.collectGitChangesFn = options.collectGitChanges ?? collectGitChanges;
     this.pipeDrainGraceMs = options.pipeDrainGraceMs ?? PIPE_DRAIN_GRACE_MS;
     this.streamEndTimeoutMs = options.streamEndTimeoutMs ?? STREAM_END_TIMEOUT_MS;
@@ -480,10 +592,14 @@ export class PiWorkerRunner {
       "--print",
       "--session-dir", record.sessionDir,
       "--session-id", record.taskId,
-      "-e", WORKER_EXTENSION_PATH,
+      ...resolveWorkerExtensionArgs(this.repoRoot),
       "--exclude-tools", record.excludeTools.join(","),
-      "--append-system-prompt", appendPrompt,
+      "--no-context-files",
     ];
+    for (const contextFile of discoverProjectContextFiles(record.cwd)) {
+      args.push("--append-system-prompt", contextFile);
+    }
+    args.push("--append-system-prompt", appendPrompt);
     if (record.provider) args.push("--provider", record.provider);
     if (record.model) args.push("--model", record.model);
     if (record.thinking) args.push("--thinking", record.thinking);

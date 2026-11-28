@@ -61,6 +61,7 @@ export const PROTOCOL_APPEND_PROMPT = [
   "3. 遇到无法自行决断的需求/架构歧义时，调用 worker_ask_parent 工具（填写清晰的 question、可选 options 与当前进展 summary），不要编造假设；收到工具回执后等待本轮自动挂起退出。",
   "4. 遇到缺少凭据、权限、依赖等无法绕过的外部阻塞时，调用 worker_report_blocked 工具（说明 reason 与 summary）。",
   "5. 完成目标并跑通验收命令后，优先调用 worker_finish 工具汇报最终 summary 与 verifiedCommands（精确命令及结果）。",
+  "6. 通用偏好：`PATH` 中可直接使用 `fd`、`rg` 与 `apply_patch`（多文件增删改经 stdin 提交 `*** Begin Patch` 结构化补丁）；回复、注释与说明默认中文（专业术语与代码标识符除外）；未经要求不改动无关代码，不扩写无关测试。",
 ].join("\n");
 
 const VALID_OUTCOME_STATUSES = new Set<string>(["done", "needs_input", "blocked", "failed"]);

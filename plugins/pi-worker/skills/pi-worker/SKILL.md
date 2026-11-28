@@ -7,6 +7,13 @@ description: Use when delegating routed subagent tasks (broad exploration, test/
 
 通过 MCP 将本地自定义 Pi 封装为可异步执行、支持抽象档位映射、只读并发、内部尾部 DCP 压缩与挂起提问续跑（Suspend-Resume）的跨 Harness 通用子代理，统一承接探索、验证、审查与多步编码任务，不污染主会话上下文。
 
+## 子进程加载约束（严格白名单）
+
+worker 子进程始终以 `--no-extensions` + `--no-context-files` 启动，只显式注入白名单资源，与本机交互式 Pi 配置解耦：
+
+- **扩展**：仅 `-e` 注入内置 `builtin:mcp` / `builtin:codemode` / `builtin:tool-search`、`pi/settings.json` 锁版的 `pi-dcp` 包、仓内受管扩展（`agent-plugins`、`bash-cwd`、`endpoint-fallback`、`network-recovery`、`cliproxyapi`、`security-gates`、`tool-timing`）与 `worker-ext.ts`；`builtin:llama.cpp`、`ask-user-question`、`bash-async`、`compact-tools`、`session-owner`、`tui-lite`、`pi-core-ask`、`pi-subagents` 等交互式/TUI/子代理扩展一律不加载（`--exclude-tools` 作为纵深防御继续屏蔽 `ask_question` / `bash_async` 等）。
+- **上下文文件**：跳过 Pi 原生 `AGENTS.md` / `CLAUDE.md` 发现，由 `discoverProjectContextFiles` 仅收集目标项目自身的上下文文件（git 根 → `cwd` 每层，`AGENTS.md` 优先于 `CLAUDE.md`；非 git 目录仅 `cwd` 自身），再以 `--append-system-prompt <path>` 按序注入；`~/.pi/agent/AGENTS.md`（即 `pi/GLOBAL.md`）**绝不加载**，worker 适用的通用偏好（`fd`/`rg`/`apply_patch`、中文回复、不改无关代码）已内置于 `PROTOCOL_APPEND_PROMPT`。
+
 ## 何时使用 vs 何时不要使用
 
 - **适用场景**：

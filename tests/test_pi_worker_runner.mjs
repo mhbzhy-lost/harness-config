@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { PROTOCOL_APPEND_PROMPT, appendSteerEntry, readSteerEntries } from "../plugins/pi-worker/src/protocol.ts";
 import { readFormattedEventsDelta } from "../plugins/pi-worker/src/stream.ts";
@@ -11,9 +11,13 @@ import {
   MAX_TITLE_CHARS,
   PiWorkerRunner,
   READONLY_EXCLUDE_TOOLS,
+  WORKER_BUILTIN_EXTENSIONS,
   WORKER_EXTENSION_PATH,
+  WORKER_MANAGED_EXTENSIONS,
+  discoverProjectContextFiles,
   extractTitleFromPrompt,
   resolvePiBinary,
+  resolveWorkerExtensionArgs,
   sanitizeTaskTitle,
 } from "../plugins/pi-worker/src/runner.ts";
 import { TaskStore } from "../plugins/pi-worker/src/store.ts";
@@ -293,8 +297,9 @@ test("test_start_needs_input_then_reply_resumes_same_session_via_stdin", async (
       assert.ok(!r.argv.includes("-c") && !r.argv.includes("--continue") && !r.argv.includes("--session"));
       assert.equal(r.argv[r.argv.indexOf("--session-dir") + 1], join(stateDir, "sessions"));
       assert.equal(r.argv[r.argv.indexOf("--session-id") + 1], first.taskId);
-      assert.equal(r.argv[r.argv.indexOf("-e") + 1], WORKER_EXTENSION_PATH);
-      assert.equal(r.argv[r.argv.indexOf("--append-system-prompt") + 1], PROTOCOL_APPEND_PROMPT);
+      // 扩展白名单：最后一项 -e 固定为 worker-ext.ts；协议 prompt 为最后一个 --append-system-prompt
+      assert.equal(r.argv[r.argv.lastIndexOf("-e") + 1], WORKER_EXTENSION_PATH);
+      assert.equal(r.argv[r.argv.lastIndexOf("--append-system-prompt") + 1], PROTOCOL_APPEND_PROMPT);
       const excluded = r.argv[r.argv.indexOf("--exclude-tools") + 1].split(",");
       for (const tool of [...DEFAULT_EXCLUDE_TOOLS, "write"]) {
         assert.ok(excluded.includes(tool), `missing excluded tool: ${tool}`);
@@ -307,8 +312,8 @@ test("test_start_needs_input_then_reply_resumes_same_session_via_stdin", async (
     assert.equal(r1.stdin, "- 检查 @src/index.ts 中的边界问题");
     assert.equal(r2.stdin, "@confirm 选方案 A");
     assert.equal(
-      r1.argv[r1.argv.indexOf("--append-system-prompt") + 1],
-      r2.argv[r2.argv.indexOf("--append-system-prompt") + 1],
+      r1.argv[r1.argv.lastIndexOf("--append-system-prompt") + 1],
+      r2.argv[r2.argv.lastIndexOf("--append-system-prompt") + 1],
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -781,7 +786,7 @@ test("test_tier_resolution_reply_switch_and_readonly_concurrency", async () => {
     assert.equal(upgraded.thinking, "medium");
 
     const records = readFileSync(recordFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
-    assert.match(records[0].argv[records[0].argv.indexOf("--append-system-prompt") + 1], /只读模式/);
+    assert.match(records[0].argv[records[0].argv.lastIndexOf("--append-system-prompt") + 1], /只读模式/);
     assert.equal(records[0].argv[records[0].argv.indexOf("--model") + 1], "glm-5.3-flash");
     assert.equal(records[1].argv[records[1].argv.indexOf("--model") + 1], "glm-5.4");
 
@@ -1229,6 +1234,237 @@ process.exit(0);
     assert.doesNotMatch(childOpts, /--diagnostic-dir/);
     assert.match(childOpts, /--max-old-space-size=4096/);
     assert.match(childOpts, /--enable-source-maps/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** 收集 argv 中某个可重复选项的全部取值（如 `-e`、`--append-system-prompt`） */
+function collectOptionValues(argv, flag) {
+  const values = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === flag) values.push(argv[i + 1]);
+  }
+  return values;
+}
+
+test("test_build_args_uses_strict_extension_whitelist_and_no_context_files", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pi-worker-ext-allow-")));
+  try {
+    const stateDir = join(dir, "state");
+    const workDir = join(dir, "repo");
+    mkdirSync(workDir, { recursive: true });
+    const recordFile = join(dir, "invocations.jsonl");
+    const fakePi = createFakePi(dir, recordFile);
+
+    const runner = new PiWorkerRunner({
+      store: new TaskStore(stateDir),
+      piBinary: fakePi,
+      env: cleanEnv({ FAKE_PI_SCENARIO: "two-round" }),
+    });
+    await runner.start({ cwd: workDir, prompt: "检查边界", waitSeconds: 5 });
+
+    const [record] = readFileSync(recordFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const argv = record.argv;
+
+    // 1. 严格白名单与上下文隔离开关
+    assert.ok(argv.includes("--no-extensions"));
+    assert.ok(argv.includes("--no-context-files"));
+    assert.ok(argv.includes("--exclude-tools"));
+    for (const tool of DEFAULT_EXCLUDE_TOOLS) {
+      assert.ok(argv[argv.indexOf("--exclude-tools") + 1].split(",").includes(tool));
+    }
+
+    // 2. -e 白名单：内置 → pi-dcp（与 pi/settings.json 锁版一致）→ 仓内受管扩展 → worker-ext.ts
+    const exts = collectOptionValues(argv, "-e");
+    assert.deepEqual(exts.slice(0, WORKER_BUILTIN_EXTENSIONS.length), [...WORKER_BUILTIN_EXTENSIONS]);
+    const settings = JSON.parse(readFileSync(resolve(import.meta.dirname, "../pi/settings.json"), "utf8"));
+    const dcpSpec = settings.packages.find((p) => typeof p === "string" && p.includes("pi-dcp"));
+    assert.ok(dcpSpec, "pi/settings.json 应锁定 pi-dcp 包");
+    assert.equal(exts[WORKER_BUILTIN_EXTENSIONS.length], dcpSpec);
+    const managed = exts.slice(WORKER_BUILTIN_EXTENSIONS.length + 1, -1);
+    assert.deepEqual(managed, [...WORKER_MANAGED_EXTENSIONS].map((name) =>
+      resolve(import.meta.dirname, "../pi/extensions", name, `${name}.ts`)));
+    assert.equal(exts.at(-1), WORKER_EXTENSION_PATH);
+    assert.equal(new Set(exts).size, exts.length);
+
+    // 3. 明确排除交互式/TUI/子代理扩展
+    for (const forbidden of [
+      "builtin:llama.cpp",
+      "ask-user-question",
+      "bash-async",
+      "compact-tools",
+      "pi/extensions/dcp/dcp.ts",
+      "session-owner",
+      "tui-lite",
+      "pi-core-ask",
+      "pi-subagents",
+    ]) {
+      assert.ok(!exts.some((e) => e.includes(forbidden)), `must not load ${forbidden}`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_resolve_worker_extension_args_with_injected_repo_root_skips_missing", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pi-worker-ext-root-")));
+  try {
+    // 临时仓根：无 pi/settings.json、仅存在一个受管扩展 → 安全跳过其余项
+    mkdirSync(join(dir, "pi", "extensions", "bash-cwd"), { recursive: true });
+    writeFileSync(join(dir, "pi", "extensions", "bash-cwd", "bash-cwd.ts"), "", "utf8");
+    const args = resolveWorkerExtensionArgs(dir);
+    assert.deepEqual(args, [
+      "--no-extensions",
+      "-e", "builtin:mcp",
+      "-e", "builtin:codemode",
+      "-e", "builtin:tool-search",
+      "-e", join(dir, "pi", "extensions", "bash-cwd", "bash-cwd.ts"),
+      "-e", WORKER_EXTENSION_PATH,
+    ]);
+
+    // 写入不含 pi-dcp 的 settings.json 后依旧不注入 pi-dcp
+    mkdirSync(join(dir, "pi"), { recursive: true });
+    writeFileSync(join(dir, "pi", "settings.json"), JSON.stringify({ packages: ["npm:other@1.0.0"] }), "utf8");
+    assert.ok(!resolveWorkerExtensionArgs(dir).some((a) => a.includes("pi-dcp")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_discover_project_context_files_git_root_to_cwd_prefers_agents_md", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pi-worker-ctx-git-")));
+  try {
+    const repo = join(dir, "outer", "repo");
+    const pkg = join(repo, "packages", "core");
+    mkdirSync(pkg, { recursive: true });
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    // git 根之上还有一层 outer/AGENTS.md，不得越界收集
+    writeFileSync(join(dir, "outer", "AGENTS.md"), "outer", "utf8");
+    writeFileSync(join(repo, "AGENTS.md"), "root-agents", "utf8");
+    writeFileSync(join(repo, "CLAUDE.md"), "root-claude", "utf8");
+    mkdirSync(join(repo, "packages", "only-claude"), { recursive: true });
+    writeFileSync(join(repo, "packages", "only-claude", "CLAUDE.md"), "claude-only", "utf8");
+    writeFileSync(join(pkg, "AGENTS.md"), "pkg-agents", "utf8");
+    writeFileSync(join(pkg, "CLAUDE.md"), "pkg-claude", "utf8");
+
+    assert.deepEqual(discoverProjectContextFiles(pkg, { agentDir: join(dir, "agent") }), [
+      join(repo, "AGENTS.md"),
+      join(pkg, "AGENTS.md"),
+    ]);
+    assert.deepEqual(discoverProjectContextFiles(join(repo, "packages", "only-claude"), { agentDir: join(dir, "agent") }), [
+      join(repo, "AGENTS.md"),
+      join(repo, "packages", "only-claude", "CLAUDE.md"),
+    ]);
+    // 无上下文文件的子目录：仍只从 git 根收集
+    const deep = join(pkg, "src", "deep");
+    mkdirSync(deep, { recursive: true });
+    assert.deepEqual(discoverProjectContextFiles(deep, { agentDir: join(dir, "agent") }), [
+      join(repo, "AGENTS.md"),
+      join(pkg, "AGENTS.md"),
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_discover_project_context_files_worktree_and_non_git", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pi-worker-ctx-wt-")));
+  try {
+    // git worktree：.git 为文件
+    const wt = join(dir, "wt");
+    const sub = join(wt, "sub");
+    mkdirSync(sub, { recursive: true });
+    writeFileSync(join(wt, ".git"), "gitdir: /elsewhere/main/.git/worktrees/wt\n", "utf8");
+    writeFileSync(join(wt, "AGENTS.md"), "wt", "utf8");
+    writeFileSync(join(sub, "AGENTS.md"), "sub", "utf8");
+    assert.deepEqual(discoverProjectContextFiles(sub, { agentDir: join(dir, "agent") }), [
+      join(wt, "AGENTS.md"),
+      join(sub, "AGENTS.md"),
+    ]);
+
+    // 非 git 目录：仅收集 cwd 自身，不向上爬
+    const plain = join(dir, "plain", "child");
+    mkdirSync(plain, { recursive: true });
+    writeFileSync(join(dir, "plain", "AGENTS.md"), "parent", "utf8");
+    assert.deepEqual(discoverProjectContextFiles(plain, { agentDir: join(dir, "agent") }), []);
+    writeFileSync(join(plain, "CLAUDE.md"), "child", "utf8");
+    assert.deepEqual(discoverProjectContextFiles(plain, { agentDir: join(dir, "agent") }), [join(plain, "CLAUDE.md")]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_discover_project_context_files_never_loads_agent_dir_global", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pi-worker-ctx-global-")));
+  try {
+    // 模拟 ~/.pi/agent 下含 AGENTS.md（即 pi/GLOBAL.md）：cwd 设为 agentDir 本身
+    const agentDir = join(dir, "home", ".pi", "agent");
+    const project = join(agentDir, "projects", "repo");
+    mkdirSync(project, { recursive: true });
+    mkdirSync(join(project, ".git"), { recursive: true });
+    writeFileSync(join(agentDir, "AGENTS.md"), "GLOBAL", "utf8");
+    writeFileSync(join(project, "AGENTS.md"), "project", "utf8");
+    assert.deepEqual(discoverProjectContextFiles(project, { agentDir }), [join(project, "AGENTS.md")]);
+    assert.deepEqual(discoverProjectContextFiles(agentDir, { agentDir }), []);
+
+    // 非 git 且 cwd 为 agentDir 子目录：仅 cwd 自身，agentDir/AGENTS.md 永不入选
+    rmSync(join(project, ".git"), { recursive: true, force: true });
+    assert.deepEqual(discoverProjectContextFiles(project, { agentDir }), [join(project, "AGENTS.md")]);
+    assert.deepEqual(discoverProjectContextFiles(agentDir, { agentDir }), []);
+
+    // 指向 agentDir/AGENTS.md 的软链（realpath 去重 + 目录排除）同样被排除
+    const linkDir = join(dir, "link");
+    mkdirSync(linkDir, { recursive: true });
+    symlinkSync(join(agentDir, "AGENTS.md"), join(linkDir, "AGENTS.md"));
+    assert.deepEqual(discoverProjectContextFiles(linkDir, { agentDir }), []);
+
+    // 环境变量 PI_CODING_AGENT_DIR 作为默认 agentDir
+    const prev = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    try {
+      assert.deepEqual(discoverProjectContextFiles(agentDir), []);
+    } finally {
+      if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prev;
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("test_build_args_appends_project_context_files_before_protocol_prompt", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "pi-worker-ctx-e2e-")));
+  try {
+    const repo = join(dir, "repo");
+    const workDir = join(repo, "sub");
+    mkdirSync(workDir, { recursive: true });
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    writeFileSync(join(repo, "AGENTS.md"), "repo rules", "utf8");
+    writeFileSync(join(workDir, "AGENTS.md"), "sub rules", "utf8");
+    const recordFile = join(dir, "invocations.jsonl");
+    const fakePi = createFakePi(dir, recordFile);
+
+    const runner = new PiWorkerRunner({
+      store: new TaskStore(join(dir, "state")),
+      piBinary: fakePi,
+      env: cleanEnv({ FAKE_PI_SCENARIO: "two-round", PI_CODING_AGENT_DIR: join(dir, "agent") }),
+    });
+    const result = await runner.start({ cwd: workDir, prompt: "检查边界", waitSeconds: 5 });
+    assert.equal(result.status, "needs_input");
+
+    const [record] = readFileSync(recordFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const argv = record.argv;
+    const noCtxIndex = argv.indexOf("--no-context-files");
+    assert.ok(noCtxIndex > 0);
+    const appends = collectOptionValues(argv, "--append-system-prompt");
+    assert.deepEqual(appends, [
+      join(repo, "AGENTS.md"),
+      join(workDir, "AGENTS.md"),
+      PROTOCOL_APPEND_PROMPT,
+    ]);
+    // --append-system-prompt 必须全部位于 --no-context-files 之后
+    assert.ok(argv.indexOf("--append-system-prompt") > noCtxIndex);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
