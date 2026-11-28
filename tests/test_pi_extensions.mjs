@@ -4,12 +4,13 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { homedir } from "node:os";
 
 import { checkSensitivePath, checkShellPolicy, checkSynchronousBash } from "../pi/extensions/security-gates/shell-policy.ts";
 import { createNetworkRecoveryExtension } from "../pi/extensions/network-recovery/extension.ts";
 import { createCliproxyapiExtension, createLazyProxyController, hasCredentials, portListening, resolveCliproxyapiOptions } from "../pi/extensions/cliproxyapi/controller.ts";
 import { createEndpointFallbackExtension, defaultProbe } from "../pi/extensions/endpoint-fallback/index.ts";
-import { classifyPiLaunch, defaultPiSessionDir, resolveRecentSession } from "../pi/extensions/session-owner/contract.ts";
+import { agentDirFromArgv, classifyPiLaunch, defaultPiSessionDir, LaunchIntentError, resolveAgentDir, resolveLaunchTarget, resolveRecentSession } from "../pi/extensions/session-owner/contract.ts";
 import { createBashCwdToolDefinition, createCachedBashOptions, prepareBashCwdExecution } from "../pi/extensions/bash-cwd/extension.ts";
 import { createBashAsyncController } from "../pi/extensions/bash-async/controller.ts";
 import { createToolTimingExtension } from "../pi/extensions/tool-timing/index.ts";
@@ -270,6 +271,141 @@ test("session-owner: --version/--help 归为 non-interactive，未设 SESSION_DI
     assert.equal(recent.session.id, "sess-1");
     assert.equal(recent.session.path, realpathSync(sessionFile));
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function makeAgentLayout(prefix) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+  const workDir = join(root, "proj");
+  mkdirSync(workDir, { recursive: true });
+  const writeSession = (agentDir, id) => {
+    const dir = join(agentDir, "sessions", `--${workDir.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, `${id}.jsonl`);
+    writeFileSync(path, `${JSON.stringify({ type: "session", version: 3, id, cwd: workDir })}\n`);
+    return path;
+  };
+  return { root, workDir, writeSession };
+}
+
+test("session-owner: classifyPiLaunch 将 --agent-dir 视为带值参数，缺值时 fail-closed", () => {
+  const tty = { stdinTty: true, stdoutTty: true };
+  assert.equal(classifyPiLaunch(["--agent-dir", "/tmp/agent", "--resume"], tty).kind, "resume");
+  assert.equal(classifyPiLaunch(["--agent-dir", "-c"], tty).kind, "new", "--agent-dir 的值按 Pi 行为被消费，不当作 -c");
+  assert.equal(classifyPiLaunch(["--skill", "--agent-dir", "/tmp/agent", "-c"], tty).kind, "continue", "其他带值参数的值不得误认为 --agent-dir");
+  assert.equal(classifyPiLaunch(["--", "--agent-dir"], tty).kind, "new", "`--` 之后的 token 不参与解析");
+  for (const argv of [["--agent-dir"], ["--agent-dir", ""], ["--agent-dir", "--"]]) {
+    assert.throws(() => classifyPiLaunch(argv, tty), (error) => error instanceof LaunchIntentError && error.code === "missing-value");
+  }
+});
+
+test("session-owner: agentDirFromArgv 展开 ~、相对路径相对 cwd、后者覆盖前者并优先于 PI_CODING_AGENT_DIR", () => {
+  const { root, workDir } = makeAgentLayout("so-agentdir-");
+  try {
+    assert.equal(agentDirFromArgv(["--agent-dir", "agent", "--agent-dir", "agent2"], workDir), join(workDir, "agent2"));
+    assert.equal(agentDirFromArgv(["--agent-dir", "~"], workDir), realpathSync(join(homedir())));
+    assert.equal(agentDirFromArgv(["--agent-dir", "~/pi-agent"], workDir), join(realpathSync(join(homedir())), "pi-agent"));
+    assert.equal(agentDirFromArgv(["-c"], workDir), undefined);
+    const env = { PI_CODING_AGENT_DIR: join(root, "env-agent") };
+    assert.equal(resolveAgentDir(["--agent-dir", "agent"], workDir, env), join(workDir, "agent"));
+    assert.equal(resolveAgentDir(["-c"], workDir, env), join(root, "env-agent"));
+    assert.equal(resolveAgentDir(["-c"], workDir, {}), join(homedir(), ".pi", "agent"));
+    const safePath = `--${workDir.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+    assert.equal(defaultPiSessionDir(workDir, env, join(workDir, "agent")), join(workDir, "agent", "sessions", safePath));
+    assert.equal(defaultPiSessionDir(workDir, env), join(root, "env-agent", "sessions", safePath));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("session-owner: resolveRecentSession 用 --agent-dir 定位默认会话目录，命中目标目录而非 env/默认目录", async () => {
+  const { root, workDir, writeSession } = makeAgentLayout("so-recent-");
+  try {
+    const envAgentDir = join(root, "env-agent");
+    const targetAgentDir = join(workDir, "target-agent");
+    const envSession = writeSession(envAgentDir, "sess-env");
+    const targetSession = writeSession(targetAgentDir, "sess-target");
+    const env = { PI_CODING_AGENT_DIR: envAgentDir, HOME: root };
+
+    const byEnv = await resolveRecentSession({ argv: ["-c"], cwd: workDir, env });
+    assert.equal(byEnv.kind, "found");
+    assert.equal(byEnv.session.id, "sess-env");
+    // 相对路径相对 cwd 解析；优先级高于 PI_CODING_AGENT_DIR
+    const byArgv = await resolveRecentSession({ argv: ["--agent-dir", "target-agent", "-c"], cwd: workDir, env });
+    assert.equal(byArgv.kind, "found");
+    assert.equal(byArgv.session.id, "sess-target");
+    assert.equal(byArgv.session.path, realpathSync(targetSession));
+    assert.notEqual(byArgv.session.path, envSession);
+    // 显式 --session-dir 仍优先于 --agent-dir
+    const bySessionDir = await resolveRecentSession({ argv: ["--agent-dir", "target-agent", "--session-dir", join(envAgentDir, "sessions", `--${workDir.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`), "-c"], cwd: workDir, env });
+    assert.equal(bySessionDir.kind, "found");
+    assert.equal(bySessionDir.session.id, "sess-env");
+    // 缺值 fail-closed：目标目录中确有会话也不得命中
+    const missing = await resolveRecentSession({ argv: ["--agent-dir", "--", "-c"], cwd: workDir, env: { ...env, PI_CODING_AGENT_DIR: targetAgentDir } });
+    assert.equal(missing.kind, "unavailable");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("session-owner: resolveLaunchTarget 调用 list/listAll 期间按 --agent-dir 临时对齐 PI_CODING_AGENT_DIR 并在 finally 恢复", async () => {
+  const { root, workDir, writeSession } = makeAgentLayout("so-target-");
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  try {
+    const envAgentDir = join(root, "env-agent");
+    const targetAgentDir = join(workDir, "target-agent");
+    writeSession(envAgentDir, "sess-env");
+    const target = writeSession(targetAgentDir, "sess-target");
+    const seen = [];
+    const manager = {
+      async list(cwd, sessionDir) {
+        seen.push(["list", sessionDir, process.env.PI_CODING_AGENT_DIR]);
+        return process.env.PI_CODING_AGENT_DIR === targetAgentDir ? [{ id: "sess-target", cwd: workDir, path: target }] : [{ id: "sess-env", cwd: workDir, path: join(envAgentDir, "x.jsonl") }];
+      },
+      async listAll(sessionDir) {
+        seen.push(["listAll", sessionDir, process.env.PI_CODING_AGENT_DIR]);
+        return [];
+      },
+    };
+    const env = { PI_CODING_AGENT_DIR: envAgentDir };
+    const intent = { kind: "session-id", value: "sess-target", continueArgIndex: null };
+
+    const resolved = await resolveLaunchTarget({ argv: ["--agent-dir", "target-agent", "--session-id", "sess-target"], cwd: workDir, env, sessionManager: manager, intent });
+    assert.equal(resolved.kind, "resolved");
+    assert.equal(resolved.reservation.sessionFile, realpathSync(target));
+    assert.deepEqual(seen, [["list", undefined, join(workDir, "target-agent")]]);
+    assert.equal(process.env.PI_CODING_AGENT_DIR, previous);
+
+    // 仅传 env、未传 --agent-dir：不触碰 process.env（mock 行为不变）
+    seen.length = 0;
+    const byEnv = await resolveLaunchTarget({ argv: ["--session-id", "sess-env"], cwd: workDir, env, sessionManager: manager, intent: { kind: "session-id", value: "sess-env", continueArgIndex: null } });
+    assert.equal(byEnv.kind, "resolved");
+    assert.deepEqual(seen, [["list", undefined, previous]]);
+
+    // 显式 --session-dir：不触碰 process.env
+    seen.length = 0;
+    const bySessionDir = await resolveLaunchTarget({ argv: ["--agent-dir", "target-agent", "--session-dir", join(envAgentDir, "sessions"), "--session-id", "sess-env"], cwd: workDir, env, sessionManager: manager, intent: { kind: "session-id", value: "sess-env", continueArgIndex: null } });
+    assert.equal(bySessionDir.kind, "resolved");
+    assert.deepEqual(seen, [["list", join(envAgentDir, "sessions"), previous]]);
+
+    // --session <id> 同时走 list 与 listAll；list 抛错时也应恢复原有 env 值
+    delete process.env.PI_CODING_AGENT_DIR;
+    const failing = {
+      list() { throw new Error("boom"); },
+      async listAll() { throw new Error("must not run"); },
+    };
+    const failed = await resolveLaunchTarget({ argv: ["--agent-dir", "target-agent", "--session", "sess"], cwd: workDir, env, sessionManager: failing, intent: { kind: "session", value: "sess", continueArgIndex: null } });
+    assert.equal(failed.kind, "unavailable");
+    assert.equal(process.env.PI_CODING_AGENT_DIR, undefined);
+    seen.length = 0;
+    const forked = await resolveLaunchTarget({ argv: ["--agent-dir", "target-agent", "--fork", "sess-target"], cwd: workDir, env, sessionManager: manager, intent: { kind: "fork", value: "sess-target", continueArgIndex: null } });
+    assert.equal(forked.kind, "resolved");
+    assert.equal(forked.reservation.kind, "fork-source");
+    assert.deepEqual(seen, [["list", undefined, join(workDir, "target-agent")], ["listAll", undefined, join(workDir, "target-agent")]]);
+    assert.equal(process.env.PI_CODING_AGENT_DIR, undefined);
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -5,7 +5,7 @@ description: Use when adding, deleting, updating, or diagnosing missing, invalid
 
 # 管理 Pi Provider 与 Model
 
-管理本机 Pi 的自定义模型与提供商定义。默认配置根目录是 `~/.pi/agent/`；显式设置 `PI_CODING_AGENT_DIR` 时，以该目录为准（Pi 1.6.1 本体仅识别 `PI_CODING_AGENT_DIR`；`PI_AGENT_DIR` 只是本管理脚本的兼容别名，不要依赖它传给 Pi）。
+管理本机 Pi 的自定义模型与提供商定义。默认配置根目录是 `~/.pi/agent/`；显式设置 `PI_CODING_AGENT_DIR` 或传入 `--agent-dir <dir>` 时，以该目录为准（Pi 1.7.0 起本体同时支持 `--agent-dir <dir>` 与 `PI_CODING_AGENT_DIR`，前者优先，且 Pi 启动时会把 `--agent-dir` 写入 `PI_CODING_AGENT_DIR` 供扩展与子进程读取；1.6.x 仅识别 `PI_CODING_AGENT_DIR`；`PI_AGENT_DIR` 只是本管理脚本的兼容别名，不要依赖它传给 Pi）。
 
 只管理 `models.json` 中不敏感的 provider/model 定义，不检查凭据，不调用真实 provider。`models.json` 与 `auth.json` 均为本机配置，不提交、不跨机器同步；`settings.json` 中的 `enabledModels` 同样是本机选择，不因新增定义自动改写。
 

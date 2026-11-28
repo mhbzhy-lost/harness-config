@@ -56,7 +56,7 @@ export class LaunchIntentError extends Error {
   constructor(code: "missing-value" | "conflicting-intents" | "unverifiable-cwd" | "unverifiable-path", message: string) { super(message); this.name = "LaunchIntentError"; this.code = code; }
 }
 
-const VALUE_OPTIONS = new Set(["-n", "-t", "-xt", "--use-theme", "--tui-mode", "-e", "--extension", "--skill", "--prompt-template", "--theme", "--provider", "--model", "--models", "--thinking", "--tools", "--exclude-tools", "--api-key", "--name", "--system-prompt", "--append-system-prompt", "--session-dir", "--session", "--session-id", "--fork", "--mode", "--export"]);
+const VALUE_OPTIONS = new Set(["-n", "-t", "-xt", "--use-theme", "--tui-mode", "-e", "--extension", "--skill", "--prompt-template", "--theme", "--provider", "--model", "--models", "--thinking", "--tools", "--exclude-tools", "--api-key", "--name", "--system-prompt", "--append-system-prompt", "--session-dir", "--agent-dir", "--session", "--session-id", "--fork", "--mode", "--export"]);
 const INFO_FLAGS = new Set(["-h", "--help", "-v", "-V", "--version"]);
 type Token = Readonly<{ index: number; value: string }>;
 
@@ -93,6 +93,7 @@ export function classifyPiLaunch(argv: readonly string[], tty?: TtyFacts): Launc
     else if (value === "--session") next = { kind: "session", value: separatedValue(argv, index, value), continueArgIndex: null };
     else if (value === "--session-id") next = { kind: "session-id", value: separatedValue(argv, index, value), continueArgIndex: null };
     else if (value === "--fork") next = { kind: "fork", value: separatedValue(argv, index, value), continueArgIndex: null };
+    else if (value === "--agent-dir") agentDirValue(argv, index);
     else if (value === "--no-session") ephemeral = true;
     else if (value === "-p" || value === "--print") print = true;
     else if (value === "--mode") mode = separatedValue(argv, index, value);
@@ -124,13 +125,48 @@ function sessionDirFromArgv(argv: readonly string[]): string | undefined {
 }
 
 /**
+ * 解析 `--agent-dir <dir>`（Pi 1.7.0 起支持，优先于 PI_CODING_AGENT_DIR）；多次传入时后者覆盖前者。
+ * 与 Pi 的 applyAgentDirArg 一致：`~` 展开、相对路径相对 cwd 解析为绝对路径；缺值时 fail-closed。
+ */
+export function agentDirFromArgv(argv: readonly string[], cwd: string): string | undefined {
+  let agentDir: string | undefined;
+  for (const { index, value } of consumedTokens(argv)) {
+    if (value !== "--agent-dir") continue;
+    agentDir = resolve(cwd, expandTilde(agentDirValue(argv, index)));
+  }
+  return agentDir;
+}
+
+/** 与 Pi 的 takeAgentDirArg 一致：缺值（含空串或紧跟 `--`）时报错，而不是把下一个 token 当目录。 */
+function agentDirValue(argv: readonly string[], index: number): string {
+  const raw = argv[index + 1];
+  if (raw === undefined || raw === "" || raw === "--") throw new LaunchIntentError("missing-value", "--agent-dir requires a directory");
+  return raw;
+}
+
+function expandTilde(value: string): string { return value === "~" || value.startsWith("~/") ? join(homedir(), value.slice(2)) : value; }
+
+function expandAgentDir(value: string): string {
+  return resolve(expandTilde(value));
+}
+
+/**
+ * 生效的 agent 目录：`--agent-dir` > PI_CODING_AGENT_DIR > ~/.pi/agent（与 Pi 1.7.0 getAgentDir 一致）。
+ */
+export function resolveAgentDir(argv: readonly string[], cwd: string, env: Readonly<Record<string, string | undefined>> = process.env): string {
+  const fromArgv = agentDirFromArgv(argv, cwd);
+  if (fromArgv !== undefined) return fromArgv;
+  const configured = env.PI_CODING_AGENT_DIR?.trim();
+  return configured ? expandAgentDir(configured) : join(homedir(), ".pi", "agent");
+}
+
+/**
  * 与 Pi SessionManager.getDefaultSessionDirPath 对齐：
  * 未显式传入 --session-dir 或 PI_CODING_AGENT_SESSION_DIR 时，定位到
  * <agentDir>/sessions/--<encoded-cwd>--，避免标准 Pi 安装下 `pi -c` 漏检。
+ * agentDir 由 resolveAgentDir 给出（--agent-dir 优先于 PI_CODING_AGENT_DIR）。
  */
-export function defaultPiSessionDir(cwd: string, env: Readonly<Record<string, string | undefined>> = process.env): string {
-  const configuredAgentDir = env.PI_CODING_AGENT_DIR?.trim();
-  const agentDir = configuredAgentDir ? resolve(configuredAgentDir.startsWith("~/") ? join(homedir(), configuredAgentDir.slice(2)) : configuredAgentDir) : join(homedir(), ".pi", "agent");
+export function defaultPiSessionDir(cwd: string, env: Readonly<Record<string, string | undefined>> = process.env, agentDir: string = resolveAgentDir([], cwd, env)): string {
   const safePath = `--${resolve(cwd).replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
   return join(agentDir, "sessions", safePath);
 }
@@ -193,7 +229,7 @@ export async function resolveRecentSession(input: ResolveRecentSessionInput): Pr
     const cwd = canonicalizeCwd(input.cwd);
     const effectiveEnv = input.env ?? process.env;
     const explicitDir = sessionDirFromArgv(input.argv) ?? effectiveEnv.PI_CODING_AGENT_SESSION_DIR;
-    const sessionDir = verifiedSessionDir(cwd, explicitDir ?? defaultPiSessionDir(cwd, effectiveEnv));
+    const sessionDir = verifiedSessionDir(cwd, explicitDir ?? defaultPiSessionDir(cwd, effectiveEnv, resolveAgentDir(input.argv, cwd, effectiveEnv)));
     if (sessionDir === undefined) return { kind: "absent" };
     let names: string[];
     try { names = readdirSync(sessionDir).filter((name) => name.endsWith(".jsonl")); }
@@ -240,11 +276,27 @@ export function readSessionHeaderBytes(path: string): Buffer {
   } finally { closeSync(fd); }
 }
 
+/**
+ * 真实 SessionManager.list / listAll 未传 sessionDir 时经 getAgentDir() 读取 process.env.PI_CODING_AGENT_DIR；
+ * Pi 1.7.0 的 main() 会把 `--agent-dir` 写入该变量，这里在查询期间临时对齐，避免误查 ~/.pi/agent/sessions。
+ */
+async function withAgentDirEnv<T>(agentDir: string | undefined, sessionDir: string | undefined, run: () => Promise<T>): Promise<T> {
+  if (agentDir === undefined || sessionDir !== undefined) return run();
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try { return await run(); }
+  finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+  }
+}
+
 export async function resolveLaunchTarget(input: ResolveRecentSessionInput & Readonly<{ intent: LaunchIntent }>): Promise<TargetResolution> {
   const cwd = canonicalizeCwd(input.cwd);
   const effectiveEnv = input.env ?? process.env;
   const sessionDirValue = sessionDirFromArgv(input.argv) ?? effectiveEnv.PI_CODING_AGENT_SESSION_DIR;
   const sessionDir = verifiedSessionDir(cwd, sessionDirValue);
+  const agentDir = agentDirFromArgv(input.argv, cwd);
   if (input.intent.kind === "continue") {
     const recent = await resolveRecentSession(input);
     if (recent.kind === "found") return { kind: "resolved", reservation: { kind: "session", cwd, sessionFile: normalizeSessionPath(recent.session.path, cwd), sessionId: recent.session.id } };
@@ -265,14 +317,14 @@ export async function resolveLaunchTarget(input: ResolveRecentSessionInput & Rea
     if (!manager) return { kind: "unavailable" };
     if (input.intent.kind === "session-id") {
       const sessionId = input.intent.value;
-      const local = await manager.list(cwd, sessionDir);
+      const local = await withAgentDirEnv(agentDir, sessionDir, () => manager.list(cwd, sessionDir));
       const existing = local.filter((entry) => entry.id === sessionId);
       if (existing.length > 1) return { kind: "unavailable" };
       return { kind: "resolved", reservation: existing[0] ? { kind: "session", cwd, sessionFile: normalizeSessionPath(existing[0].path, cwd), sessionId: existing[0].id } : { kind: "session-id", cwd, sessionId } };
     }
     const value = input.intent.value;
-    const local = await manager.list(cwd, sessionDir);
-    const all = manager.listAll ? await manager.listAll(sessionDir) : [];
+    const local = await withAgentDirEnv(agentDir, sessionDir, () => manager.list(cwd, sessionDir));
+    const all = manager.listAll ? await withAgentDirEnv(agentDir, sessionDir, () => manager.listAll(sessionDir)) : [];
     const matches = [...local, ...all].filter((entry, index, entries) => (entry.id === value || entry.id.startsWith(value)) && entries.findIndex((candidate) => candidate.path === entry.path) === index);
     if (matches.length !== 1) return { kind: "unavailable" };
     const match = matches[0]!;

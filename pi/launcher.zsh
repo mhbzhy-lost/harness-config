@@ -159,8 +159,54 @@ fi
 
 export PI_SESSION_OWNER_ID="$owner_id"
 
+# 与 contract.ts 的 VALUE_OPTIONS 保持一致：这些参数的下一个 token 是值，不能被当作 -e/--extension 的扩展名或 --agent-dir
+pi_value_options=(-n -t -xt --use-theme --tui-mode -e --extension --skill --prompt-template --theme --provider --model --models --thinking --tools --exclude-tools --api-key --name --system-prompt --append-system-prompt --session-dir --agent-dir --session --session-id --fork --mode --export)
+
+# 扫描 `--` 之前的参数：收集已有的 -e/--extension 扩展列表（OSC 7577 Program Resume 恢复命令会原样重复）与 --agent-dir <dir>
+args_agent_dir=""
+existing_extensions=()
+for (( index = 1; index <= ${#args}; index += 1 )); do
+  arg="${args[index]}"
+  [[ "$arg" == -- ]] && break
+  if [[ "$arg" == -e || "$arg" == --extension ]]; then
+    (( index < ${#args} )) || break
+    (( index += 1 ))
+    existing_extensions+=("${args[index]}")
+  elif [[ "$arg" == --agent-dir ]]; then
+    (( index < ${#args} )) || break
+    (( index += 1 ))
+    args_agent_dir="${args[index]}"
+  elif [[ " ${pi_value_options[*]} " == *" $arg "* ]]; then
+    (( index += 1 ))
+  fi
+done
+case "$args_agent_dir" in
+  "~") args_agent_dir="$HOME" ;;
+  "~/"*) args_agent_dir="$HOME/${args_agent_dir#\~/}" ;;
+  "") unset args_agent_dir ;;
+esac
+
+# 判断扩展是否已由用户参数传入：非本地路径（npm:/git: 等）精确匹配，本地路径按规范化后的绝对路径比较
+_extension_present() {
+  local candidate=$1 ext
+  local normalized=${candidate:A}
+  for ext in "${existing_extensions[@]}"; do
+    [[ "$ext" == "$candidate" ]] && return 0
+    [[ "$ext" != *:* && "${ext:A}" == "$normalized" ]] && return 0
+  done
+  return 1
+}
+
 # 为长生命周期 Pi 进程保留充足堆内存与近 OOM 诊断快照（仅直传 Pi 主进程，不通过 NODE_OPTIONS 泄漏给下游子进程）
-heap_diagnostic_dir="${${PI_HEAP_DIAGNOSTIC_DIR:-${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/diagnostics/heap}:a}"
+# Pi 1.7.0 的 --agent-dir 与 PI_CODING_AGENT_DIR 一样决定诊断目录
+if [[ -n "${PI_HEAP_DIAGNOSTIC_DIR:-}" ]]; then
+  heap_diagnostic_dir="${PI_HEAP_DIAGNOSTIC_DIR:a}"
+elif [[ -n "${args_agent_dir:-}" ]]; then
+  heap_diagnostic_dir="${args_agent_dir:A}/diagnostics/heap"
+else
+  heap_base="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+  heap_diagnostic_dir="${heap_base:a}/diagnostics/heap"
+fi
 if mkdir -p "$heap_diagnostic_dir" && chmod 700 "$heap_diagnostic_dir"; then
   node_heap_mb="${PI_NODE_MAX_OLD_SPACE_SIZE:-8192}"
 else
@@ -169,10 +215,12 @@ else
 fi
 
 _load_interactive_packages
-interactive_flags=()
+# 仅注入尚未由用户参数（含终端 OSC 7577 恢复命令）传入的扩展，避免 Pi 1.7.0 下重复 -e
+inject_flags=()
+_extension_present "$pi_root/extensions/session-owner/session-owner.ts" || inject_flags+=(-e "$pi_root/extensions/session-owner/session-owner.ts")
 for pkg in "${interactive_pkgs[@]}"; do
-  interactive_flags+=(-e "$pkg")
+  _extension_present "$pkg" || inject_flags+=(-e "$pkg")
 done
 
 cleanup; trap - EXIT HUP INT TERM
-_exec_pi -e "$pi_root/extensions/session-owner/session-owner.ts" "${interactive_flags[@]}" "${args[@]}"
+_exec_pi "${inject_flags[@]}" "${args[@]}"
