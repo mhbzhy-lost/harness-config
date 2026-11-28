@@ -3,7 +3,8 @@
 #   1. qwen/settings.json 深度合并进 ~/.qwen/settings.json，注入 env.HARNESS_CONFIG_ROOT=仓库根，
 #      确保 skills.directories 含 <仓库根>/skills，注入 cliproxyapi 懒加载 SessionStart hook，
 #      清理 comfyui-draw 旧版 classic hooks（已迁 Mods）与旧版 codex-proxy / cliproxyapi SessionEnd hooks，
-#      迁移旧状态目录 ~/.qwen/codex-proxy → ~/.qwen/cliproxyapi（均为 per-machine 绝对路径）
+#      迁移旧状态目录 ~/.qwen/codex-proxy → ~/.qwen/cliproxyapi（均为 per-machine 绝对路径），
+#      并对已有 config.yaml 增量补齐 Antigravity 防风控清洗与冷却/重试基线（manager.py sync-config）
 #   2. plugins/* 软链接进 ~/.qwen/extensions/
 #   3. qwen/shell.zsh 注册 source 进 ~/.zshrc（标记块，幂等；qwen 主题随系统明暗）
 #   4. qwen/QWEN.md 软链接为 ~/.qwen/QWEN.md（全局指令，跨机同步）
@@ -47,6 +48,7 @@ usage() {
 清理 comfyui-draw 旧版 classic hooks（/draw 已迁 Mods，由扩展自带 hooks/register.js 实现）
 与旧版 codex-proxy-start/codex-proxy-end、cliproxyapi-end hooks（SessionEnd 回收已退役），
 迁移旧状态目录 ~/.qwen/codex-proxy → ~/.qwen/cliproxyapi（存在时），
+对已有 ~/.qwen/cliproxyapi/config.yaml 增量补齐 routing / oauth.providers.antigravity 基线段（不覆盖手改内容），
 把 qwen/shell.zsh 的 source 行注册进 ~/.zshrc（标记块，幂等），
 把 qwen/QWEN.md 软链接为全局 QWEN.md（真实文件则警告跳过，不破坏），
 把 qwen/agents/*.md 逐文件软链接进 ~/.qwen/agents/（同语义），
@@ -248,6 +250,11 @@ if text is not None:
         m._atomic_write_text(config, text.replace(old_auth, new_auth))
         print(f"config.yaml 的 auth-dir 已改写: {old_auth} → {new_auth}")
 PY
+
+# --- 1c. 增量补齐 cliproxyapi config.yaml 的跨机安全基线（旧机器；幂等，无缺失项时零变更） ---
+# state 目录锚定 settings.json 所在目录（与 1b 的迁移目标一致）；config.yaml 不存在时 manager.py 静默 no-op
+CLIPROXYAPI_STATE_DIR="$(dirname "$TARGET")/cliproxyapi" python3 "$NATIVE_EXT_SRC/cliproxyapi/scripts/manager.py" sync-config \
+  $([[ "$DRY_RUN" == 1 ]] && echo "--dry-run")
 
 # --- 2. 插件软链接 ---
 source "$SCRIPT_DIR/lib-plugins.sh"

@@ -12,6 +12,37 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MANAGER = ROOT / "qwen/extensions/cliproxyapi/scripts/manager.py"
 
+# 期望的跨机安全基线段（独立于实现手写，防止实现与测试同源漂移）
+MODEL_ALIAS_ANTIGRAVITY_BLOCK = (
+    "  model-alias:\n"
+    "    antigravity:\n"
+    '      - name: "gemini-4-carbon-high"\n'
+    '        alias: "gemini-4-carbon"\n'
+    "        fork: true\n"
+    '      - name: "gemini-4-neon-xhigh"\n'
+    '        alias: "gemini-4-neon"\n'
+    "        fork: true\n"
+    '      - name: "gemini-4-hydrogen-xhigh"\n'
+    '        alias: "gemini-4-hydrogen"\n'
+    "        fork: true\n"
+)
+ANTIGRAVITY_PROVIDER_BLOCK = (
+    "    antigravity:\n"
+    '      tos-pause-window: "6h"\n'
+    "      sensitive-words-replace:\n"
+    '        "You are a coding assistant running inside pi, a coding agent harness.": "You are a helpful coding assistant."\n'
+    '        "cliproxyapi": "local-gateway"\n'
+    '        "CLIProxyAPI": "local-gateway"\n'
+    '        "codex-proxy": "local-gateway"\n'
+    "      sensitive-patterns-replace:\n"
+    "        - pattern: 'You are Qwen Code,[^\\n.]*developed by Alibaba Group[^\\n.]*\\.'\n"
+    '          replacement: "You are a helpful coding assistant."\n'
+    "        - pattern: 'You are Qwen Code,[^\\n.]*\\.'\n"
+    '          replacement: "You are a helpful coding assistant."\n'
+    "        - pattern: '(?s)<docs>.*?</docs>\\n?'\n"
+    '          replacement: ""\n'
+)
+
 
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -266,6 +297,291 @@ class LegacyEnvAndInitConfigTest(unittest.TestCase):
             self.assertEqual(res.returncode, 0, msg=res.stderr)
             self.assertIn("# port: ", config.read_text(encoding="utf-8"))
 
+    def test_init_config_writes_cross_machine_baseline_with_0600(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home_dir = tmp_path / "home"
+            bin_dir = tmp_path / "bin"
+            home_dir.mkdir()
+            bin_dir.mkdir()
+            port = find_free_port()
+            env = make_isolated_env(home_dir, bin_dir, port)
+
+            self.assertEqual(run_manager(env, "init-config").returncode, 0)
+            config = home_dir / ".qwen" / "cliproxyapi" / "config.yaml"
+            text = config.read_text(encoding="utf-8")
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            self.assertIn("config-version: 8\n", text)
+            self.assertIn('  host: "127.0.0.1"\n', text)
+            self.assertIn(f"  port: {port}\n", text)
+            # 冷却/重试保护
+            self.assertIn("routing:\n  retry:\n    request-retry: 0\n    max-retry-interval: 0\n  cooldown:\n    save-cooldown-status: true\n", text)
+            self.assertIn(f'  proxy-url: "http://127.0.0.1:19999"\n', text)
+            self.assertIn(f'  auth-dir: "{home_dir / ".qwen" / "cliproxyapi" / "auth"}"\n', text)
+            # Antigravity 身份清洗（Pi 自述 + 网关名 + Qwen 署名 + <docs> 段）
+            self.assertIn(f'  auth-dir: "{home_dir / ".qwen" / "cliproxyapi" / "auth"}"\n' + MODEL_ALIAS_ANTIGRAVITY_BLOCK + "  providers:\n    antigravity:\n      tos-pause-window: \"6h\"\n", text, "model-alias 位于 auth-dir 与 providers 之间")
+            self.assertIn('        "You are a coding assistant running inside pi, a coding agent harness.": "You are a helpful coding assistant."\n', text)
+            for word in ("cliproxyapi", "CLIProxyAPI", "codex-proxy"):
+                self.assertIn(f'        "{word}": "local-gateway"\n', text)
+            self.assertIn("        - pattern: 'You are Qwen Code,[^\\n.]*developed by Alibaba Group[^\\n.]*\\.'\n          replacement: \"You are a helpful coding assistant.\"\n", text)
+            self.assertIn("        - pattern: 'You are Qwen Code,[^\\n.]*\\.'\n          replacement: \"You are a helpful coding assistant.\"\n", text)
+            self.assertIn("        - pattern: '(?s)<docs>.*?</docs>\\n?'\n          replacement: \"\"\n", text)
+            self.assertTrue(text.endswith("\n"))
+
+            # 生成结果对 sync-config 而言已是完整基线：不得再改写或产生备份
+            before = config.read_bytes()
+            res = run_manager(env, "sync-config")
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            self.assertEqual(res.stdout.strip(), "")
+            self.assertEqual(config.read_bytes(), before)
+            self.assertEqual(sorted(p.name for p in config.parent.iterdir()), ["auth", "config.yaml", "lock"])
+
+    def test_state_dir_env_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            state_dir = tmp_path / "custom-state"
+            env = make_isolated_env(tmp_path / "home", bin_dir, find_free_port())
+            env["CLIPROXYAPI_STATE_DIR"] = str(state_dir)
+
+            self.assertEqual(run_manager(env, "init-config").returncode, 0)
+            self.assertTrue((state_dir / "config.yaml").exists())
+            self.assertTrue((state_dir / "auth").is_dir())
+            self.assertFalse((tmp_path / "home" / ".qwen").exists(), msg="CLIPROXYAPI_STATE_DIR 覆盖后不得再使用 ~/.qwen/cliproxyapi")
+            self.assertIn(f'auth-dir: "{state_dir / "auth"}"', (state_dir / "config.yaml").read_text(encoding="utf-8"))
+
+            # 空字符串视为未设置，回落默认
+            env["CLIPROXYAPI_STATE_DIR"] = ""
+            data = json.loads(run_manager(env, "status").stdout)
+            self.assertEqual(data["api_port"], int(env["CLIPROXYAPI_API_PORT"]))
+
+
+def legacy_config(auth_dir: Path) -> str:
+    """改造前的旧版 config.yaml：无 routing、无 providers.antigravity，带用户手改项与注释。"""
+    return (
+        "config-version: 8\n"
+        "server:\n"
+        '  host: "127.0.0.1"  # 本机绑定\n'
+        "  port: 8317\n"
+        "  server-id: keep-me-1234\n"
+        "requests:\n"
+        '  proxy-url: "http://127.0.0.1:7899"\n'
+        "oauth:\n"
+        f'  auth-dir: "{auth_dir}"\n'
+        "  model-alias:\n"
+        "    antigravity:\n"
+        '      - name: "gemini-4-carbon-high"\n'
+        '        alias: "gemini-4-carbon"\n'
+    )
+
+
+class SyncConfigTest(unittest.TestCase):
+    """sync-config：对已有旧 config.yaml 做非破坏性增量补齐（全部隔离在临时目录，不触碰 ~/.qwen）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.state = self.root / "state"
+        self.state.mkdir()
+        self.config = self.state / "config.yaml"
+        self.port = find_free_port()
+        self.bin_dir = self.root / "bin"
+        self.bin_dir.mkdir()
+        self.env = make_isolated_env(self.root / "home", self.bin_dir, self.port)
+        self.env["CLIPROXYAPI_STATE_DIR"] = str(self.state)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def sync(self, *args: str) -> subprocess.CompletedProcess[str]:
+        res = run_manager(self.env, "sync-config", *args)
+        self.assertEqual(res.returncode, 0, msg=res.stderr)
+        self.assertEqual(res.stderr.strip(), "")
+        return res
+
+    def backups(self) -> list[str]:
+        return sorted(p.name for p in self.state.glob("config.yaml.bak-*"))
+
+    def test_sync_config_upgrades_legacy_config_preserving_user_changes(self) -> None:
+        self.config.write_text(legacy_config(self.state / "auth"), encoding="utf-8")
+        self.config.chmod(0o644)
+        original = self.config.read_text(encoding="utf-8")
+
+        res = self.sync()
+        self.assertIn("已增量补齐", res.stdout)
+        self.assertIn("routing", res.stdout)
+        self.assertIn("providers:", res.stdout)
+        text = self.config.read_text(encoding="utf-8")
+        # 新增段
+        self.assertIn("routing:\n  retry:\n    request-retry: 0\n    max-retry-interval: 0\n  cooldown:\n    save-cooldown-status: true\nrequests:\n", text, "routing 段应插在 server 之后、requests 之前")
+        self.assertIn("  providers:\n    antigravity:\n      tos-pause-window: \"6h\"\n      sensitive-words-replace:\n", text)
+        self.assertIn('        "cliproxyapi": "local-gateway"\n', text)
+        self.assertIn("        - pattern: '(?s)<docs>.*?</docs>\\n?'\n          replacement: \"\"\n", text)
+        # 旧内容逐行保留（含注释、server-id、手改端口与代理、auth-dir、model-alias）
+        for line in original.splitlines():
+            self.assertIn(line, text.splitlines(), msg=f"用户原有行丢失: {line!r}")
+        self.assertLess(text.index("routing:"), text.index("requests:"))
+        # providers 段追加在 oauth 块末尾（model-alias 之后）
+        self.assertLess(text.index("alias: \"gemini-4-carbon\""), text.index("  providers:"))
+        # 备份为原文（0600），config.yaml 收紧为 0600
+        backups = self.backups()
+        self.assertEqual(len(backups), 1)
+        self.assertRegex(backups[0], r"^config\.yaml\.bak-\d{14}$")
+        self.assertEqual((self.state / backups[0]).read_text(encoding="utf-8"), original)
+        self.assertEqual((self.state / backups[0]).stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
+
+        # 二次执行：严格幂等，无变更、无新备份
+        snapshot = self.config.read_bytes()
+        second = self.sync()
+        self.assertEqual(second.stdout.strip(), "")
+        self.assertEqual(self.config.read_bytes(), snapshot)
+        self.assertEqual(self.backups(), backups)
+
+    def test_sync_config_inserts_providers_when_oauth_lacks_it_and_no_oauth_at_all(self) -> None:
+        # oauth 存在但无 providers:
+        self.config.write_text('config-version: 8\nserver:\n  port: 1\noauth:\n  auth-dir: "/x/auth"\n', encoding="utf-8")
+        self.sync()
+        text = self.config.read_text(encoding="utf-8")
+        self.assertIn('  auth-dir: "/x/auth"\n' + MODEL_ALIAS_ANTIGRAVITY_BLOCK + "  providers:\n    antigravity:\n      tos-pause-window: \"6h\"\n", text, "oauth 存在但无 model-alias/providers：依次追加")
+        # 连顶层 oauth: 都没有（且末尾无换行）
+        self.config.write_text("config-version: 8\nserver:\n  port: 2", encoding="utf-8")
+        res = self.sync()
+        self.assertEqual(res.stdout.count("将补齐") + res.stdout.count("已增量补齐"), 1)
+        text = self.config.read_text(encoding="utf-8")
+        self.assertIn("  port: 2\n\nrouting:\n  retry:\n", text, "只有 config-version/server 时 routing 追加到末尾，并先补行结束")
+        self.assertLess(text.index("routing:"), text.index("oauth:"))
+        self.assertTrue(text.endswith("\noauth:\n  model-alias:\n    antigravity:\n" + MODEL_ALIAS_ANTIGRAVITY_BLOCK.split("\n", 2)[2].rstrip("\n") + "\n  providers:\n" + ANTIGRAVITY_PROVIDER_BLOCK.rstrip("\n") + "\n"), "无 oauth: 时依次追加 model-alias 与 providers")
+        self.assertIn('          replacement: ""\n', text)
+
+    def test_sync_config_never_overwrites_existing_routing_or_antigravity(self) -> None:
+        # 用户自有 routing:（即便内容不同）与 providers.antigravity:（即便内容不同）均原样保留
+        original = (
+            "routing:\n"
+            "  retry:\n"
+            "    request-retry: 3\n"
+            "oauth:\n"
+            '  auth-dir: "/x/auth"\n'
+            "  providers:\n"
+            "    antigravity:\n"
+            "      tos-pause-window: \"1h\"\n"
+            "  model-alias:\n"
+            "    antigravity:\n"
+            "      - name: \"a\"\n"
+        )
+        self.config.write_text(original, encoding="utf-8")
+        res = self.sync()
+        self.assertEqual(res.stdout.strip(), "")
+        self.assertEqual(self.config.read_text(encoding="utf-8"), original)
+        self.assertEqual(self.backups(), [])
+        # dry-run 同样报告无变更
+        self.assertEqual(self.sync("--dry-run").stdout.strip(), "")
+
+        # providers: 下已有其它渠道但无 antigravity：只在 providers 子块末尾追加，不碰 model-alias.antigravity
+        partial = (
+            "oauth:\n"
+            "  model-alias:\n"
+            "    antigravity:\n"
+            "      - name: \"a\"\n"
+            "  providers:\n"
+            "    codex:\n"
+            "      k: 1\n"
+        )
+        self.config.write_text(partial, encoding="utf-8")
+        self.sync()
+        text = self.config.read_text(encoding="utf-8")
+        self.assertIn("    codex:\n      k: 1\n    antigravity:\n      tos-pause-window: \"6h\"\n", text)
+        self.assertLess(text.index("model-alias:"), text.index("  providers:"), "不得打乱既有键顺序")
+
+        # 只有 model-alias.antigravity 而无 providers:：同名键不算 providers.antigravity，仍须在 oauth 块末尾补 providers:
+        alias_only = "oauth:\n  auth-dir: \"/x/auth\"\n  model-alias:\n    antigravity:\n      - name: \"a\"\n        alias: \"b\"\n"
+        self.config.write_text(alias_only, encoding="utf-8")
+        self.sync()
+        text = self.config.read_text(encoding="utf-8")
+        self.assertIn(alias_only, text, "oauth 块原有行原样保留在 providers: 之前")
+        self.assertIn('        alias: "b"\n  providers:\n    antigravity:\n      tos-pause-window: "6h"\n', text)
+        self.assertEqual(text.count("  providers:"), 1)
+        # 顶层无 oauth: 但有其它同名键，同样补齐 oauth.providers.antigravity
+        self.config.write_text("config-version: 8\nmodel-alias:\n  antigravity:\n    k: 1\n", encoding="utf-8")
+        self.sync()
+        text = self.config.read_text(encoding="utf-8")
+        self.assertIn("routing:\n  retry:\n    request-retry: 0\n", text)
+        self.assertIn("    k: 1\n\noauth:\n" + MODEL_ALIAS_ANTIGRAVITY_BLOCK + "  providers:\n    antigravity:\n", text)
+        self.assertEqual(self.sync().stdout.strip(), "")
+
+    def test_sync_config_fills_model_alias_antigravity_independently(self) -> None:
+        alias_tail = MODEL_ALIAS_ANTIGRAVITY_BLOCK.split("\n", 2)[2].rstrip("\n") + "\n"
+        # 1. 已有 routing 与 providers.antigravity，但无 model-alias：仅单独补齐 oauth 块末尾的 model-alias
+        base = "routing:\n  retry: {}\noauth:\n  auth-dir: \"/x/auth\"\n  providers:\n    antigravity:\n      x: 1\n"
+        self.config.write_text(base, encoding="utf-8")
+        res = self.sync()
+        self.assertIn("model-alias:", res.stdout)
+        text = self.config.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith(base), "既有行原样保留，model-alias 追加在 oauth 块末尾")
+        self.assertTrue(text.endswith("      x: 1\n" + MODEL_ALIAS_ANTIGRAVITY_BLOCK), text)
+        self.assertEqual(len(self.backups()), 1)
+        second = self.sync()
+        self.assertEqual(second.stdout.strip(), "")
+        self.assertEqual(len(self.backups()), 1, "二次执行严格 no-op，不产生多余备份")
+
+        # 2. 已有 model-alias（其它 provider 别名）但无 antigravity：在 model-alias 子块末尾插入
+        self.config.write_text('oauth:\n  model-alias:\n    gemini:\n      - name: "g"\n        alias: "x"\n  providers:\n    antigravity:\n      x: 1\n', encoding="utf-8")
+        self.sync()
+        text = self.config.read_text(encoding="utf-8")
+        self.assertIn('        alias: "x"\n    antigravity:\n      - name: "gemini-4-carbon-high"\n        alias: "gemini-4-carbon"\n        fork: true\n', text)
+        self.assertIn('        alias: "gemini-4-hydrogen"\n        fork: true\n  providers:\n    antigravity:\n      x: 1\n', text, "model-alias 子块之后仍是 providers，嵌套不乱")
+        self.assertEqual(text.count("  model-alias:"), 1)
+        self.assertEqual(self.sync().stdout.strip(), "")
+
+        # 3. 用户自定义 model-alias.antigravity：不覆盖
+        custom = "oauth:\n  model-alias:\n    antigravity:\n      - name: \"mine\"\n        alias: \"my-alias\"\n"
+        self.config.write_text(custom, encoding="utf-8")
+        res = self.sync()
+        self.assertNotIn("model-alias", res.stdout, "已有自定义 model-alias.antigravity 不覆盖")
+        self.assertIn(custom, self.config.read_text(encoding="utf-8"))
+        self.assertNotIn("gemini-4-carbon", self.config.read_text(encoding="utf-8"))
+
+        # 4. 只有 model-alias.antigravity、无 providers.antigravity / routing：后两项单独补齐
+        only_alias = "oauth:\n" + MODEL_ALIAS_ANTIGRAVITY_BLOCK
+        self.config.write_text(only_alias, encoding="utf-8")
+        res = self.sync()
+        self.assertIn("routing:", res.stdout)
+        self.assertIn("providers:", res.stdout)
+        self.assertNotIn("model-alias", res.stdout)
+        text = self.config.read_text(encoding="utf-8")
+        self.assertTrue(text.endswith('        fork: true\n  providers:\n' + ANTIGRAVITY_PROVIDER_BLOCK), text)
+        self.assertEqual(text.count("    antigravity:"), 2, "model-alias 与 providers 各一个 antigravity")
+        self.assertEqual(self.sync().stdout.strip(), "")
+
+    def test_sync_config_dry_run_makes_no_changes(self) -> None:
+        self.config.write_text(legacy_config(self.state / "auth"), encoding="utf-8")
+        before = self.config.read_bytes()
+        mode = self.config.stat().st_mode
+        res = self.sync("--dry-run")
+        self.assertIn("[dry-run]", res.stdout)
+        self.assertEqual(self.config.read_bytes(), before, "--dry-run 不得改写 config.yaml")
+        self.assertEqual(self.config.stat().st_mode, mode)
+        self.assertEqual(sorted(p.name for p in self.state.iterdir()), ["config.yaml"], "--dry-run 不得产生备份或其他文件")
+
+    def test_sync_config_noop_when_config_missing(self) -> None:
+        res = self.sync()
+        self.assertEqual(res.stdout.strip(), "")
+        self.assertEqual(list(self.state.iterdir()), [], "config.yaml 不存在时不得创建 lock/目录/文件")
+        self.assertFalse((self.state / "config.yaml").exists())
+        # 状态目录本身也不存在：同样静默 no-op
+        missing = self.root / "missing-state"
+        self.env["CLIPROXYAPI_STATE_DIR"] = str(missing)
+        self.assertEqual(self.sync().stdout.strip(), "")
+        self.assertFalse(missing.exists())
+        # --dry-run 组合同样 no-op
+        self.assertEqual(self.sync("--dry-run").stdout.strip(), "")
+
+    def test_sync_config_rejects_unknown_args(self) -> None:
+        res = run_manager(self.env, "sync-config", "--force")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("未知参数", res.stderr + res.stdout)
+
 
 def run_init_qwen(home_dir: Path, *extra_args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
     """在隔离 HOME 下运行 init-qwen.sh（所有目标路径均重定向到临时目录），绝不触碰真实 ~/.qwen。"""
@@ -386,16 +702,77 @@ class InitQwenMigrationTest(unittest.TestCase):
             self.assertTrue((new_state / "proxy.log").exists())
             config = (new_state / "config.yaml").read_text(encoding="utf-8")
             self.assertNotIn(str(old_state), config)
-            self.assertIn(f'auth-dir: "{new_state / "auth"}"', config)
+            self.assertIn('auth-dir: "' + str(new_state / "auth") + '"', config)
             self.assertIn('"server-id": "keep-me"', config)
             self.assertIn("port: 8317", config)
+            # 1c. 迁移后的旧 config.yaml 被增量补齐跨机安全基线，且用户手改项原样保留
+            self.assertIn("routing:\n  retry:\n    request-retry: 0\n    max-retry-interval: 0\n  cooldown:\n    save-cooldown-status: true\n", config)
+            self.assertIn("  providers:\n    antigravity:\n      tos-pause-window: \"6h\"\n", config)
+            self.assertIn('        "cliproxyapi": "local-gateway"', config)
+            self.assertEqual(config.count('auth-dir: "' + str(new_state / "auth") + '"'), 1)
+            backups = sorted(p.name for p in new_state.glob("config.yaml.bak-*"))
+            self.assertEqual(len(backups), 1, f"首次升级应恰好产生一个备份: {backups}")
+            self.assertEqual((new_state / backups[0]).stat().st_mode & 0o777, 0o600)
+            self.assertEqual((new_state / "config.yaml").stat().st_mode & 0o777, 0o600)
+            self.assertIn("已增量补齐", res.stdout)
 
-            # 幂等：再次运行无变化
+            # 幂等：再次运行无变化（含不再产生新的 config.yaml 备份）
             snapshot = sorted(str(p.relative_to(home_dir)) for p in home_dir.rglob("*"))
             second = run_init_qwen(home_dir)
             self.assertEqual(second.returncode, 0, msg=second.stderr)
             self.assertEqual(sorted(str(p.relative_to(home_dir)) for p in home_dir.rglob("*")), snapshot)
             self.assertFalse(second.stdout.count("状态目录已迁移"))
+            self.assertNotIn("已增量补齐", second.stdout)
+
+    def test_upgrades_existing_state_config_without_migration(self) -> None:
+        """新机器已是 cliproxyapi 目录但 config.yaml 为旧版：init-qwen.sh 仅增量补齐，不动状态目录。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            home_dir = Path(tmp) / "home"
+            home_dir.mkdir()
+            settings_path = home_dir / ".qwen" / "settings.json"
+            settings_path.parent.mkdir(parents=True)
+            settings_path.write_text(json.dumps({"env": {"KEEP_ME": "1"}}), encoding="utf-8")
+            state_dir = home_dir / ".qwen" / "cliproxyapi"
+            state_dir.mkdir()
+            config = state_dir / "config.yaml"
+            config.write_text(legacy_config(state_dir / "auth"), encoding="utf-8")
+            (state_dir / "proxy.log").write_text("log\n", encoding="utf-8")
+
+            res = run_init_qwen(home_dir)
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            text = config.read_text(encoding="utf-8")
+            self.assertIn("  server-id: keep-me-1234\n", text)
+            self.assertIn('  proxy-url: "http://127.0.0.1:7899"\n', text)
+            self.assertIn('  host: "127.0.0.1"  # 本机绑定\n', text)
+            self.assertIn("routing:\n  retry:\n    request-retry: 0\n", text)
+            self.assertIn("    antigravity:\n      tos-pause-window: \"6h\"\n", text)
+            self.assertTrue((state_dir / "proxy.log").exists())
+            self.assertEqual(len(list(state_dir.glob("config.yaml.bak-*"))), 1)
+            self.assertEqual(json.loads(settings_path.read_text(encoding="utf-8"))["env"]["KEEP_ME"], "1")
+
+            # 重跑：幂等，不再产生第二个备份
+            again = run_init_qwen(home_dir)
+            self.assertEqual(again.returncode, 0, msg=again.stderr)
+            self.assertEqual(len(list(state_dir.glob("config.yaml.bak-*"))), 1)
+            self.assertNotIn("已增量补齐", again.stdout)
+
+    def test_dry_run_previews_sync_without_touching_legacy_state_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home_dir = Path(tmp) / "home"
+            home_dir.mkdir()
+            state_dir = home_dir / ".qwen" / "cliproxyapi"
+            state_dir.mkdir(parents=True)
+            config = state_dir / "config.yaml"
+            config.write_text(legacy_config(state_dir / "auth"), encoding="utf-8")
+            before = config.read_bytes()
+
+            res = run_init_qwen(home_dir, "--dry-run")
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            self.assertIn("[dry-run]", res.stdout)
+            self.assertIn("将补齐", res.stdout, "旧 config.yaml 应预览补齐计划")
+            self.assertEqual(config.read_bytes(), before)
+            self.assertEqual(sorted(p.name for p in state_dir.iterdir()), ["config.yaml"])
+            self.assertFalse((home_dir / ".qwen" / "settings.json").exists())
 
     def test_dry_run_makes_no_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

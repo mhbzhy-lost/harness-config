@@ -22,6 +22,7 @@
 - ComfyUI 与 home-connect 保持同一个插件，共用连接层，但各自提供独立的 skill 和 MCP server 入口；不要把两组工具合并进同一个 `server.ts`。
 - 更新从 superpowers 改编的 skills 时，核对最新上游发布版，不以本机旧缓存为准。保留版本来源和许可证说明，移除对未随仓库分发的上游 skills 的依赖，保证改编版可以独立使用。
 - `cliproxyapi`（原名 `codex-proxy`，由 `init-qwen.sh` 幂等迁移旧 hooks、旧软链与 `~/.qwen/codex-proxy` 状态目录）为 Qwen Code 与 Pi 共享的懒加载代理：Qwen 侧 `SessionStart` hook 由 `init-qwen.sh` 按名称幂等管理（并清理旧的 `SessionEnd` 回收 hook），Pi 侧由 `pi/extensions/cliproxyapi` 扩展在加载与 `before_agent_start` 时按需拉起；两端共用 `qwen/extensions/cliproxyapi/scripts/manager.py` 与 `~/.qwen/cliproxyapi` 状态目录，代理只监听回环地址，**退出不自动回收**，需停止时手动 `manager.py stop`。未安装或未登录不应阻塞任何会话。
+- 升级 Qwen Code 或 Pi 版本时，必须先静态检查新版本的系统提示词（身份声明句、内置 `<docs>` 等分段）是否仍与 `qwen/extensions/cliproxyapi/scripts/manager.py`（及本机 `~/.qwen/cliproxyapi/config.yaml`）中 `oauth.providers.antigravity` 的 `sensitive-words-replace` / `sensitive-patterns-replace` 替换逻辑兼容（Pi 侧同时核对 `pi/extensions/cliproxyapi` 对 `supportsStrictMode: false` 的兜底行为）；若上游提示词文案或结构变化，先同步更新规则并确认匹配后再经 Antigravity 通道发起请求。
 
 ## Git 命令
 

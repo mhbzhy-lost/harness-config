@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # init-pi.sh — 将仓库中的 Pi 专属配置、全局指令、扩展、快捷键、shell 包装与跨运行时插件同步到本机：
 #   1. pi/settings.json 深度合并进 ~/.pi/agent/settings.json，按序注入仓内 pi/extensions/* 与 skills/（保留本机配置与其他扩展）
+#      并对共用状态目录 ~/.qwen/cliproxyapi/config.yaml 增量补齐 Antigravity 防风控基线（manager.py sync-config）
 #   2. pi/keybindings.json 软链接为 ~/.pi/agent/keybindings.json
 #   3. pi/GLOBAL.md 软链接为 ~/.pi/agent/AGENTS.md（全局指令，跨机同步）
 #   4. plugins/* 逐插件软链接进 ~/.agents/plugins/（复用 lib-plugins.sh）
@@ -47,6 +48,7 @@ usage() {
   PI_SHELL_RC         覆盖 shell 注册目标（默认 ~/.zshrc）
   PI_PACKAGE_DIR      指定本机 @earendil-works/pi-coding-agent 包目录（默认自动探测）
   PI_DOCS_SKILL_DIR   覆盖 pi-docs 文档软链落点（默认 <仓库根>/.agents/skills/pi-docs）
+  CLIPROXYAPI_STATE_DIR 覆盖 cliproxyapi 状态目录（默认 ~/.qwen/cliproxyapi；其 config.yaml 存在时增量补齐基线段）
 EOF
 }
 
@@ -284,6 +286,11 @@ if backup_path:
     print(f"已备份: {backup_path}")
 print(f"同步的顶层键: {', '.join(changed) or '（无变更）'}")
 PY
+
+# --- 1b. 增量补齐 cliproxyapi config.yaml 跨机安全基线（与 Qwen 共用状态目录；幂等，无 config.yaml 时静默 no-op） ---
+# 遵循 CLIPROXYAPI_STATE_DIR（默认 ~/.qwen/cliproxyapi），与 pi/extensions/cliproxyapi 扩展保持一致
+CLIPROXYAPI_STATE_DIR="${CLIPROXYAPI_STATE_DIR:-$HOME/.qwen/cliproxyapi}" python3 \
+  "$SCRIPT_DIR/qwen/extensions/cliproxyapi/scripts/manager.py" sync-config $([[ "$DRY_RUN" == 1 ]] && echo "--dry-run")
 
 # --- 2. 软链接 pi/keybindings.json ---
 if [[ -L "$KEYBINDINGS_TARGET" ]]; then

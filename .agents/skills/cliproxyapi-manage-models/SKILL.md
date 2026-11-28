@@ -100,11 +100,31 @@ curl -s http://127.0.0.1:8317/v1/models
           "contextWindowSize": 1000000,
           "samplingParams": { "max_tokens": 65536 }
         }
+      },
+      {
+        "id": "gemini-4-neon",
+        "name": "[Antigravity] Gemini 4 Neon",
+        "baseUrl": "http://127.0.0.1:8317",
+        "envKey": "CLIPROXYAPI_API_KEY",
+        "capabilities": {
+          "vision": true,
+          "reasoning": {
+            "thinking": true,
+            "efforts": ["low", "medium", "high", "xhigh"],
+            "defaultEffort": "high",
+            "canDisable": false
+          }
+        },
+        "generationConfig": {
+          "contextWindowSize": 1048576
+        }
       }
     ]
   }
 }
 ```
+
+> Antigravity 无后缀 ID（`gemini-4-carbon` / `gemini-4-neon` / `gemini-4-hydrogen`）来自 `manager.py` 内置的 `oauth.model-alias.antigravity`（`fork: true`）；配置 `capabilities.reasoning` 后，Qwen Code 可按 `model.reasoningEffort` 动态下发思考强度并由 CLIProxyAPI 路由到对应变体（`gemini-4-carbon` 的 `efforts` 为 `["low", "medium", "high"]`，`neon` / `hydrogen` 支持到 `"xhigh"`）。
 
 修改后需**重启 Qwen Code**，再通过 `/model` 切换。
 
@@ -120,6 +140,7 @@ curl -s http://127.0.0.1:8317/v1/models
 - **模型字段**：`id`（必填，发给 API 的真实 ID）、`name`、`reasoning`（布尔）、`input`（`["text"]` 或 `["text", "image"]`）、`contextWindow`、`maxTokens`、`cost`（订阅 OAuth 代理填全 `0` 即可，四项 `input`/`output`/`cacheRead`/`cacheWrite` 须齐全）。
   - **不要**添加非 schema 字段（如 `"type": "chat"`、`actualModelId`、`metadataUserId`）。
   - **不要**凭“这是代理”猜测开启 `compat` 开关；仅在实测请求报错确认差异后再按 Pi `models-configuration.md` 精确添加。
+  - **例外（Antigravity Gemini 必配）**：`google-generative-ai` 模型须显式写 `"compat": { "supportsStrictMode": false }`。根因：Pi 默认对 `gemini-3` 及更高版本模型 ID 开启 Gemini `VALIDATED` 严格工具模式（把工具 schema 改写为 `anyOf` 严格结构），Antigravity 上游不接受该 schema，直接返回 `429 RESOURCE_EXHAUSTED`。本仓 `pi/extensions/cliproxyapi` 扩展在运行时自动兜底：对 `baseUrl` 指向 `http://127.0.0.1:<port>` / `http://localhost:<port>`（忽略 `/v1beta` 后缀）的 `google-generative-ai` 模型、且未显式配置 `supportsStrictMode` 的，经 `pi.registerProvider` 补 `false`（不改磁盘 `models.json`）；显式写的 `true`/`false` 完全尊重。**远程代理、未装该扩展或非回环 `baseUrl` 时必须显式配置。**
 - **生效方式**：Pi 中打开 `/model` 即热重载 `~/.pi/agent/models.json`，无需重启。
 
 ### 参考配置片段（Pi）
@@ -175,7 +196,46 @@ curl -s http://127.0.0.1:8317/v1/models
           "input": ["text", "image"],
           "contextWindow": 1048576,
           "maxTokens": 65536,
-          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "compat": { "supportsStrictMode": false }
+        },
+        {
+          "id": "gemini-4-carbon",
+          "name": "[Antigravity] Gemini 4 Carbon",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": null,
+            "max": null
+          },
+          "input": ["text", "image"],
+          "contextWindow": 1048576,
+          "maxTokens": 65536,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "compat": { "supportsStrictMode": false }
+        },
+        {
+          "id": "gemini-4-neon",
+          "name": "[Antigravity] Gemini 4 Neon",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": null
+          },
+          "input": ["text", "image"],
+          "contextWindow": 1048576,
+          "maxTokens": 65536,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "compat": { "supportsStrictMode": false }
         }
       ]
     }
@@ -183,10 +243,13 @@ curl -s http://127.0.0.1:8317/v1/models
 }
 ```
 
+> `gemini-4-carbon` / `gemini-4-neon` / `gemini-4-hydrogen` 这类**无后缀 ID** 来自 CLIProxyAPI 的 `oauth.model-alias.antigravity`（`fork: true` 同时暴露别名与原后缀模型），由 `manager.py init-config` / `sync-config` 内置生成，无需手工维护。建议配齐 `thinkingLevelMap`：隐藏不支持的 `off`/`minimal`/`max` 档位，并为 `neon` / `hydrogen` 显式放开 opt-in 的 `"xhigh": "xhigh"`（未配置 `thinkingLevelMap` 时 Pi 默认提供 `off`/`minimal`/`low`/`medium`/`high` 且不开放 `xhigh`）。
+
 ### Pi 代理生命周期提醒
 `cliproxyapi` 为 **Qwen Code 与 Pi 双端统一懒加载、退出不自动回收**：
 - Qwen Code：`SessionStart` hook（由 `init-qwen.sh` 注入）调用 `manager.py start` 按需拉起。
 - Pi：仓内扩展 `pi/extensions/cliproxyapi`（由 `init-pi.sh` 注入）在加载与每次 `before_agent_start` 时自动懒加载——有凭据且端口未监听才调用同一个 `manager.py start`；并发合并、异常吞掉，不注册退出回收。
+- 跨机安全基线（`manager.py init-config` 首建、`sync-config` 对旧机器增量补齐，由 `init-qwen.sh` / `init-pi.sh` 自动调用且幂等）：`routing.retry` 关闭重试 + `cooldown.save-cooldown-status`；`oauth.providers.antigravity` 的 `tos-pause-window: "6h"` 与身份清洗（Pi 自述、`CLIProxyAPI`/`codex-proxy` 网关名、Qwen Code 署名、`<docs>` 段替换）；`oauth.model-alias.antigravity`（`fork: true` 暴露 `gemini-4-carbon` / `gemini-4-neon` / `gemini-4-hydrogen` 无后缀别名，保留原后缀模型）。`sync-config` 只补缺失段、不覆盖手改的 `server`/`port`/`proxy-url`/`auth-dir`/已有别名或注释，并先备份 `config.yaml.bak-<时间戳>`。
 - 两端共用 `~/.qwen/cliproxyapi` 与 `127.0.0.1:8317`；任一端退出都**不会**杀掉代理，需停止时手动 `python3 ~/.qwen/extensions/cliproxyapi/scripts/manager.py stop`（会同时影响正在使用它的 Pi/Qwen 会话）。
 - 仅在未使用本仓 Pi 扩展（如远端部署、独立机器）时才需自行启动代理（`manager.py start` 或独立常驻服务），否则会连接拒绝。
 
@@ -198,5 +261,7 @@ curl -s http://127.0.0.1:8317/v1/models
 | Pi 走 `google-generative-ai` 报 `404` | Pi 设 `baseUrl` 时清空 `apiVersion`，未写 `/v1beta` | Pi 用 `http://127.0.0.1:8317/v1beta`；Qwen `gemini` 仍用 `http://127.0.0.1:8317` |
 | Qwen 自定义 provider 名加载后被静默跳过 | 未在 `providerProtocol` 映射到内置 `AuthType` | 补齐 `providerProtocol["<id>"] = "anthropic" \| "gemini" \| "openai"` |
 | Qwen 中模型上下文字段不生效 | 照搬 Pi 的 `contextWindow` 顶层字段 | Qwen 须写在 `generationConfig.contextWindowSize` |
+| Pi 走 Antigravity Gemini 报 `429 RESOURCE_EXHAUSTED`（配额正常） | Pi 对 `gemini-3+` 默认开启 `VALIDATED` 严格工具模式并改写 `anyOf` schema，Antigravity 拒收 | 为该模型写 `"compat": { "supportsStrictMode": false }`；本仓 `pi/extensions/cliproxyapi` 仅对本地回环 `baseUrl` 自动兜底，远程代理仍须显式配置 |
+| 请求被 Antigravity 风控 / 频繁冷却 | 旧机器 `config.yaml` 缺 `oauth.providers.antigravity` 身份清洗与 `tos-pause-window`，或重试风暴 | 重跑 `init-qwen.sh` / `init-pi.sh`，或 `manager.py sync-config`（先 `--dry-run` 预览）增量补齐；不要手改覆盖已有 `port`/`proxy-url` |
 | Pi `/model` 里看不到刚加的 provider | 无 `apiKey` 且 `auth.json` 无条目，Pi 隐藏未认证模型 | 本地无鉴权回环设 `"apiKey": "local"`；有鉴权用 `"$ENV"` 或 `pi-manage-provider` `set-key` |
 | Pi 中调用报 `ECONNREFUSED 127.0.0.1:8317` | 未安装 `cliproxyapi` / `~/.qwen/cliproxyapi/auth` 无任何 `.json` 凭据（懒加载静默跳过），或未使用本仓 `pi/extensions/cliproxyapi` 扩展 | `manager.py status` 查 `credentials_present`，缺则走 `/cliproxyapi-login`；否则手动 `manager.py start` |

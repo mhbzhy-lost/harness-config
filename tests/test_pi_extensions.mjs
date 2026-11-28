@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 
 import { checkSensitivePath, checkShellPolicy, checkSynchronousBash } from "../pi/extensions/security-gates/shell-policy.ts";
 import { createNetworkRecoveryExtension } from "../pi/extensions/network-recovery/extension.ts";
-import { createCliproxyapiExtension, createLazyProxyController, hasCredentials, portListening, resolveCliproxyapiOptions } from "../pi/extensions/cliproxyapi/controller.ts";
+import { collectCliproxyapiStrictModeOverrides, createCliproxyapiExtension, createLazyProxyController, hasCredentials, portListening, resolveCliproxyapiOptions } from "../pi/extensions/cliproxyapi/controller.ts";
 import { createEndpointFallbackExtension, defaultProbe } from "../pi/extensions/endpoint-fallback/index.ts";
 import { agentDirFromArgv, classifyPiLaunch, defaultPiSessionDir, LaunchIntentError, resolveAgentDir, resolveLaunchTarget, resolveRecentSession } from "../pi/extensions/session-owner/contract.ts";
 import { createBashCwdToolDefinition, createCachedBashOptions, prepareBashCwdExecution } from "../pi/extensions/bash-cwd/extension.ts";
@@ -898,6 +898,8 @@ async function makeCliproxyapiFixture(overrides = {}) {
     managerPy,
     connectTimeoutMs: 200,
     startTimeoutMs: 12_000,
+    // models.json 也锚定在临时目录：绝不读取真实 ~/.pi/agent/models.json
+    modelsPath: join(root, "models.json"),
     ...overrides,
   });
   return { root, stateDir, port, log, opts, calls: () => (existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean) : []), cleanup: () => rmSync(root, { recursive: true, force: true }) };
@@ -1029,7 +1031,7 @@ test("cliproxyapi: 扩展加载即后台懒加载，before_agent_start 等待 in
     const controller = createCliproxyapiExtension(pi, f.opts);
     assert.ok(controller.inflight(), "扩展加载应立即在后台触发一次懒加载");
     assert.equal(typeof handlers.get("before_agent_start"), "function");
-    assert.deepEqual([...handlers.keys()].filter((e) => /shutdown|end|exit/.test(e)), [], "不得注册退出回收");
+    assert.deepEqual([...handlers.keys()].filter((e) => /shutdown|end|exit/.test(e)), [], "未注册任何 provider 时不注册退出回收");
 
     // 初始化触发的拉起仍在进行：before_agent_start 等待其完成而不再重复拉起
     await handlers.get("before_agent_start")({}, {});
@@ -1041,5 +1043,166 @@ test("cliproxyapi: 扩展加载即后台懒加载，before_agent_start 等待 in
     assert.deepEqual(f.calls(), ["start", "start"]);
   } finally {
     f.cleanup();
+  }
+});
+
+// ---- cliproxyapi: google-generative-ai 回环模型运行时兜底 supportsStrictMode: false ----
+
+function strictModeModelsDoc() {
+  return {
+    providers: {
+      "cliproxyapi-gemini": {
+        name: "CLIProxyAPI Gemini",
+        baseUrl: "http://127.0.0.1:8317/v1beta",
+        api: "google-generative-ai",
+        apiKey: "local",
+        models: [
+          { id: "gemini-4-carbon-high", reasoning: true, input: ["text"], contextWindow: 1048576, maxTokens: 65536, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+          { id: "explicit-true", compat: { supportsStrictMode: true } },
+          { id: "explicit-false", compat: { supportsStrictMode: false, other: 1 } },
+          { id: "other-api-model", api: "openai-completions" },
+        ],
+      },
+      "remote-gemini": {
+        baseUrl: "https://proxy.example.com/v1beta",
+        api: "google-generative-ai",
+        models: [{ id: "gemini-3-pro" }],
+      },
+      "cliproxyapi-codex": {
+        baseUrl: "http://localhost:8317/v1",
+        api: "openai-responses",
+        models: [{ id: "gpt-6.2" }],
+      },
+      "localhost-gemini-no-suffix": {
+        baseUrl: "http://localhost:8317",
+        api: "google-generative-ai",
+        models: [{ id: "gemini-3-pro-preview" }, { id: "wrong-port", baseUrl: "http://127.0.0.1:9999/v1beta" }],
+      },
+      "model-level-override": {
+        baseUrl: "https://elsewhere.example/v1beta",
+        models: [
+          { id: "via-provider", api: "google-generative-ai", baseUrl: "http://127.0.0.1:8317/v1beta" },
+          { id: "not-loopback", api: "google-generative-ai" },
+        ],
+      },
+      "no-models": { baseUrl: "http://127.0.0.1:8317/v1beta", api: "google-generative-ai" },
+    },
+  };
+}
+
+test("cliproxyapi: collectCliproxyapiStrictModeOverrides 仅对回环 CLIProxyAPI 的 google-generative-ai 模型补 supportsStrictMode: false", () => {
+  const doc = strictModeModelsDoc();
+  const frozen = JSON.stringify(doc);
+  const overrides = collectCliproxyapiStrictModeOverrides(doc, 8317);
+  assert.equal(JSON.stringify(doc), frozen, "纯函数：不得修改入参");
+  const byName = Object.fromEntries(overrides.map((o) => [o.name, o.config]));
+  assert.deepEqual(Object.keys(byName).sort(), ["cliproxyapi-gemini", "localhost-gemini-no-suffix", "model-level-override"]);
+
+  const gemini = byName["cliproxyapi-gemini"];
+  assert.equal(gemini.name, "CLIProxyAPI Gemini");
+  assert.equal(gemini.baseUrl, "http://127.0.0.1:8317/v1beta");
+  assert.equal(gemini.apiKey, "local");
+  const models = Object.fromEntries(gemini.models.map((m) => [m.id, m]));
+  assert.deepEqual(models["gemini-4-carbon-high"].compat, { supportsStrictMode: false }, "未显式配置的回环 gemini 模型被补齐");
+  assert.equal(models["gemini-4-carbon-high"].contextWindow, 1048576, "保留原 model 全部字段");
+  assert.deepEqual(models["explicit-true"].compat, { supportsStrictMode: true }, "显式 true 完全尊重");
+  assert.deepEqual(models["explicit-false"].compat, { supportsStrictMode: false, other: 1 }, "显式 false 完全尊重且不改其它 compat 字段");
+  assert.equal(models["other-api-model"].compat, undefined, "model 级覆盖为其它 api 的不受影响");
+
+  assert.equal(byName["remote-gemini"], undefined, "远程 URL 不受影响");
+  assert.equal(byName["cliproxyapi-codex"], undefined, "非 google-generative-ai provider 不受影响");
+  const noSuffix = Object.fromEntries(byName["localhost-gemini-no-suffix"].models.map((m) => [m.id, m]));
+  assert.deepEqual(noSuffix["gemini-3-pro-preview"].compat, { supportsStrictMode: false }, "localhost 无路径后缀也算回环");
+  assert.equal(noSuffix["wrong-port"].compat, undefined, "model 级 baseUrl 端口不同则跳过");
+  const modelLevel = Object.fromEntries(byName["model-level-override"].models.map((m) => [m.id, m]));
+  assert.deepEqual(modelLevel["via-provider"].compat, { supportsStrictMode: false }, "model 级 api/baseUrl 覆盖生效");
+  assert.equal(modelLevel["not-loopback"].compat, undefined);
+
+  assert.deepEqual(collectCliproxyapiStrictModeOverrides(doc, 9000), [], "端口不匹配时无覆盖");
+  for (const bad of [null, undefined, "x", 1, {}, { providers: null }, { providers: { a: null } }, { providers: { a: { models: "nope" } } }]) {
+    assert.deepEqual(collectCliproxyapiStrictModeOverrides(bad, 8317), []);
+  }
+});
+
+test("cliproxyapi: resolveCliproxyapiOptions 默认 modelsPath 跟随 PI_CODING_AGENT_DIR / ~/.pi/agent", () => {
+  const base = "file:///repo/pi/extensions/cliproxyapi/cliproxyapi.ts";
+  assert.equal(resolveCliproxyapiOptions({}, base).modelsPath, join(homedir(), ".pi", "agent", "models.json"));
+  assert.equal(resolveCliproxyapiOptions({ PI_CODING_AGENT_DIR: " /tmp/agent-dir " }, base).modelsPath, join("/tmp/agent-dir", "models.json"));
+});
+
+test("cliproxyapi: 扩展加载时为回环 gemini 模型 registerProvider 补 supportsStrictMode: false，session_shutdown 仅注销自己注册的 provider", async () => {
+  const f = await makeCliproxyapiFixture({ port: 8317 });
+  try {
+    const modelsFile = join(f.root, "models.json");
+    writeFileSync(modelsFile, JSON.stringify(strictModeModelsDoc()));
+    const before = readFileSync(modelsFile, "utf8");
+    const handlers = new Map();
+    const registered = [];
+    const unregistered = [];
+    const pi = {
+      on: (event, handler) => handlers.set(event, handler),
+      registerProvider(name, cfg) { registered.push([name, cfg]); },
+      unregisterProvider(name) { unregistered.push(name); },
+    };
+    createCliproxyapiExtension(pi, { ...f.opts, modelsPath: modelsFile });
+    assert.deepEqual(registered.map(([n]) => n).sort(), ["cliproxyapi-gemini", "localhost-gemini-no-suffix", "model-level-override"]);
+    const gemini = registered.find(([n]) => n === "cliproxyapi-gemini")[1];
+    assert.equal(gemini.models.find((m) => m.id === "gemini-4-carbon-high").compat.supportsStrictMode, false);
+    assert.equal(gemini.models.find((m) => m.id === "explicit-true").compat.supportsStrictMode, true, "显式 true 不被覆盖");
+    assert.equal(readFileSync(modelsFile, "utf8"), before, "绝不修改磁盘上的 models.json");
+
+    assert.equal(typeof handlers.get("session_shutdown"), "function");
+    assert.equal(typeof handlers.get("session_start"), "function");
+    // session_start 重读：已注册的 provider 不重复注册
+    handlers.get("session_start")({}, {});
+    assert.equal(registered.length, 3);
+    handlers.get("session_shutdown")({}, {});
+    assert.deepEqual(unregistered.sort(), ["cliproxyapi-gemini", "localhost-gemini-no-suffix", "model-level-override"], "只注销本扩展注册过的 provider");
+    // 等待后台懒加载结束，避免测试结束时仍有子进程
+    await handlers.get("before_agent_start")({}, {});
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("cliproxyapi: models.json 缺失/损坏/无回环 gemini 模型时静默忽略，仅 mock pi.on 亦可正常工作", async () => {
+  // 1. 文件不存在
+  const f1 = await makeCliproxyapiFixture();
+  try {
+    const handlers = new Map();
+    const calls = [];
+    createCliproxyapiExtension({ on: (e, h) => handlers.set(e, h), registerProvider: (n) => calls.push(n), unregisterProvider: (n) => calls.push("un:" + n) }, f1.opts);
+    assert.deepEqual(calls, []);
+    assert.equal(handlers.get("session_shutdown"), undefined);
+    await handlers.get("before_agent_start")({}, {});
+  } finally {
+    f1.cleanup();
+  }
+  // 2. 文件损坏
+  const f2 = await makeCliproxyapiFixture();
+  try {
+    writeFileSync(join(f2.root, "models.json"), "{ not json");
+    const handlers = new Map();
+    const calls = [];
+    const controller = createCliproxyapiExtension({ on: (e, h) => handlers.set(e, h), registerProvider: (n) => calls.push(n) }, f2.opts);
+    assert.deepEqual(calls, []);
+    await handlers.get("session_start")({}, {});
+    assert.deepEqual(calls, []);
+    await controller.ensure();
+  } finally {
+    f2.cleanup();
+  }
+  // 3. 只有显式配置 / 远程 provider：无需注册
+  const f3 = await makeCliproxyapiFixture({ port: 8317 });
+  try {
+    writeFileSync(join(f3.root, "models.json"), JSON.stringify({ providers: { "cliproxyapi-gemini": { baseUrl: "http://127.0.0.1:8317/v1beta", api: "google-generative-ai", models: [{ id: "g", compat: { supportsStrictMode: false } }] }, remote: { baseUrl: "https://x.example/v1beta", api: "google-generative-ai", models: [{ id: "r" }] } } }));
+    const handlers = new Map();
+    const calls = [];
+    createCliproxyapiExtension({ on: (e, h) => handlers.set(e, h), registerProvider: (n) => calls.push(n), unregisterProvider: (n) => calls.push("un:" + n) }, f3.opts);
+    assert.deepEqual(calls, []);
+    assert.equal(handlers.get("session_shutdown"), undefined, "未注册 provider 时不注册退出回收");
+    await handlers.get("before_agent_start")({}, {});
+  } finally {
+    f3.cleanup();
   }
 });

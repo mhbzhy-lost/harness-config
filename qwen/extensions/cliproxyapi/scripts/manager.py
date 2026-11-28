@@ -8,22 +8,29 @@ Qwen Code（SessionStart hook）与 Pi（pi/extensions/cliproxyapi）共用同�
 多进程安全：fcntl.flock 串行化启动；proxy.pid 记录带启动指纹的进程身份，stop 只杀指纹匹配的进程。
 未安装 cliproxyapi 或未完成任何渠道登录时静默 no-op，绝不阻塞任何会话。
 
-状态目录为 ~/.qwen/cliproxyapi（由旧名 codex-proxy 迁移而来，迁移见 init-qwen.sh）。
+状态目录为 ~/.qwen/cliproxyapi（由旧名 codex-proxy 迁移而来，迁移见 init-qwen.sh；
+可用环境变量 CLIPROXYAPI_STATE_DIR 覆盖，与 Pi 扩展 pi/extensions/cliproxyapi 一致）。
 
-子命令: start | stop | status | init-config
+子命令: start | stop | status | init-config | sync-config [--dry-run]
         register（= start 的向后兼容别名）| unregister（静默 no-op，兼容旧机器未重跑 init-qwen.sh 时的旧 hook）
+
+init-config 仅在 config.yaml 不存在时生成跨机安全基线（Antigravity 别名、身份清洗与冷却/重试保护）；
+sync-config 对已有旧 config.yaml 做**非破坏性增量补齐**（只补缺失的 routing: / oauth.model-alias.antigravity: / oauth.providers.antigravity: 段，
+绝不覆盖用户手改的 server/port/server-id/proxy-url/auth-dir/已有别名/注释），由 init-qwen.sh / init-pi.sh 调用。
 """
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 
-STATE = os.path.expanduser("~/.qwen/cliproxyapi")
+STATE = os.path.expanduser(os.environ.get("CLIPROXYAPI_STATE_DIR") or "~/.qwen/cliproxyapi")
 REGISTRY = os.path.join(STATE, "sessions.json")  # 旧版会话注册表，仅在 stop 时清理遗留
 LOCK = os.path.join(STATE, "lock")
 PROXY_PID = os.path.join(STATE, "proxy.pid")
@@ -185,7 +192,52 @@ def has_credentials():
         return False
 
 
+# 跨机安全基线（纯字符串拼接，本机无 PyYAML）：
+# - routing.retry 关闭重试、cooldown 持久化冷却状态；
+# - oauth.providers.antigravity 的 tos-pause-window 与敏感词/正则替换，用于 Antigravity 防风控身份清洗
+#   （Pi 系统提示自述、CLIProxyAPI/codex-proxy 网关名、Qwen Code 署名与 <docs> 段）。
+ROUTING_BASELINE = (
+    "routing:\n"
+    "  retry:\n"
+    "    request-retry: 0\n"
+    "    max-retry-interval: 0\n"
+    "  cooldown:\n"
+    "    save-cooldown-status: true\n"
+)
+MODEL_ALIAS_ANTIGRAVITY_BLOCK = (
+    "  model-alias:\n"
+    "    antigravity:\n"
+    '      - name: "gemini-4-carbon-high"\n'
+    '        alias: "gemini-4-carbon"\n'
+    "        fork: true\n"
+    '      - name: "gemini-4-neon-xhigh"\n'
+    '        alias: "gemini-4-neon"\n'
+    "        fork: true\n"
+    '      - name: "gemini-4-hydrogen-xhigh"\n'
+    '        alias: "gemini-4-hydrogen"\n'
+    "        fork: true\n"
+)
+ANTIGRAVITY_PROVIDER_BLOCK = (
+    "    antigravity:\n"
+    '      tos-pause-window: "6h"\n'
+    "      sensitive-words-replace:\n"
+    '        "You are a coding assistant running inside pi, a coding agent harness.": '
+    '"You are a helpful coding assistant."\n'
+    '        "cliproxyapi": "local-gateway"\n'
+    '        "CLIProxyAPI": "local-gateway"\n'
+    '        "codex-proxy": "local-gateway"\n'
+    "      sensitive-patterns-replace:\n"
+    "        - pattern: 'You are Qwen Code,[^\\n.]*developed by Alibaba Group[^\\n.]*\\.'\n"
+    '          replacement: "You are a helpful coding assistant."\n'
+    "        - pattern: 'You are Qwen Code,[^\\n.]*\\.'\n"
+    '          replacement: "You are a helpful coding assistant."\n'
+    "        - pattern: '(?s)<docs>.*?</docs>\\n?'\n"
+    '          replacement: ""\n'
+)
+
+
 def gen_config():
+    """首次生成 config.yaml（幂等：已存在则原样返回，绝不覆盖）。"""
     os.makedirs(AUTH_DIR, exist_ok=True)
     if os.path.exists(CONFIG):
         return
@@ -195,11 +247,175 @@ def gen_config():
         "server:\n"
         '  host: "127.0.0.1"\n'
         f"  port: {API_PORT}\n"
-        "requests:\n"
+        + ROUTING_BASELINE
+        + "requests:\n"
         f'  proxy-url: "{UPSTREAM_PROXY}"\n'
         "oauth:\n"
-        f'  auth-dir: "{AUTH_DIR}"\n',
+        f'  auth-dir: "{AUTH_DIR}"\n'
+        + MODEL_ALIAS_ANTIGRAVITY_BLOCK
+        + "  providers:\n"
+        + ANTIGRAVITY_PROVIDER_BLOCK,
     )
+    os.chmod(CONFIG, 0o600)
+
+_TOP_KEY = re.compile(r"^([A-Za-z0-9_-]+):")
+_ANTIGRAVITY = re.compile(r"^\s*antigravity\s*:")
+
+
+def _read_config_lines():
+    try:
+        with open(CONFIG, encoding="utf-8") as f:
+            return f.read().split("\n")
+    except OSError:
+        return None
+
+
+def _top_level_ranges(lines):
+    """返回 [(key, start, end)]：每个顶层键的行号区间 [start, end)，end 为下一个顶层键行或文件末尾。"""
+    ranges = []
+    starts = []
+    for i, line in enumerate(lines):
+        m = _TOP_KEY.match(line)
+        if m:
+            starts.append((m.group(1), i))
+    for idx, (key, start) in enumerate(starts):
+        end = starts[idx + 1][1] if idx + 1 < len(starts) else len(lines)
+        ranges.append((key, start, end))
+    return ranges
+
+
+def _trim_trailing_empty(lines, start, end):
+    """块内最后一个非空行之后（不含文件末尾的空行）的位置，用于在块末尾插入内容。"""
+    pos = end
+    while pos > start and not lines[pos - 1].strip():
+        pos -= 1
+    return pos
+
+
+def _sub_block_end(lines, start, end):
+    """子块结束行：下一条缩进 <= 2 空格的非空行（start 为子块首行下标）。"""
+    pos = start
+    while pos < end:
+        line = lines[pos]
+        if line.strip() and not line.startswith("   "):
+            break
+        pos += 1
+    return pos
+
+
+def _plan_oauth_child(lines, oauth_start, oauth_end, sub_key, child_block, tail_additions, plan_inserts):
+    """独立判断 oauth.<sub_key>.antigravity 是否缺失，缺失则补齐（不改写任何既有行）。
+
+    - oauth 块内无 `  <sub_key>:`：把 `  <sub_key>:\n` + child_block 记入 tail_additions（追加到 oauth 块末尾）；
+    - 有 `  <sub_key>:` 但其子块内无 `    antigravity:`：在子块末尾插入 child_block；
+    - 已有 antigravity:：不动（尊重用户自定义）。
+    """
+    oauth_lines = lines[oauth_start:oauth_end]
+    sub_idx = next((i for i, l in enumerate(oauth_lines) if re.match(rf"^  {re.escape(sub_key)}:\s*(#.*)?$", l)), None)
+    if sub_idx is None:
+        tail_additions.append(["  " + sub_key + ":"] + child_block)
+        return
+    child_start = oauth_start + sub_idx + 1
+    child_end = _sub_block_end(lines, child_start, oauth_end)
+    if any(_ANTIGRAVITY.match(l) for l in lines[child_start:child_end]):
+        return
+    plan_inserts.append((_trim_trailing_empty(lines, child_start, child_end), child_block))
+
+
+def _plan_sync(lines):
+    """计算增量补齐计划，返回 [(插入位置, 待插入行列表)]；空列表表示无需变更。
+
+    以行为单位做轻量结构识别（仅依赖“顶层键顶格、oauth 子键 2 空格缩进”这两条缩进约定），
+    不解析也不改写任何既有行，因此用户的手改内容与注释全部原样保留。
+    routing / oauth.model-alias.antigravity / oauth.providers.antigravity 三项独立判断，各自缺失才补。
+    只认对应子块内的 antigravity:（其它位置的同名键不算）。
+    """
+    plan = []
+    eof_blocks = []  # 需要追加到文件末尾的段（合并为一次插入，共享一个空行分隔）
+    ranges = _top_level_ranges(lines)
+    keys = [k for k, _, _ in ranges]
+
+    # 1. 顶层 routing: 段缺失 → 补齐（插在 server: 段之后；无 server: 则插在首个其他顶层键之前或文件末尾）
+    if "routing" not in keys:
+        block = ROUTING_BASELINE.rstrip("\n").split("\n")
+        insert_at = None
+        for key, start, _ in ranges:
+            if key in ("config-version", "server"):
+                continue
+            insert_at = start
+            break
+        if insert_at is None:
+            eof_blocks.append(block)
+        else:
+            plan.append((insert_at, block))
+
+    # 2./3. oauth.model-alias.antigravity 与 oauth.providers.antigravity 独立补齐
+    oauth_range = next(((s, e) for k, s, e in ranges if k == "oauth"), None)
+    if oauth_range is None:
+        eof_blocks.append(
+            (["oauth:"] + MODEL_ALIAS_ANTIGRAVITY_BLOCK.rstrip("\n").split("\n")
+             + ["  providers:"] + ANTIGRAVITY_PROVIDER_BLOCK.rstrip("\n").split("\n"))
+        )
+    else:
+        oauth_start, oauth_end = oauth_range
+        tail_additions = []  # 追加到 oauth 块末尾的子块（按 model-alias → providers 顺序）
+        plan_inserts = []  # 本轮对 oauth 的插入计划（位置都在 oauth 块内）
+        _plan_oauth_child(lines, oauth_start, oauth_end, "model-alias",
+                          MODEL_ALIAS_ANTIGRAVITY_BLOCK.rstrip("\n").split("\n")[1:], tail_additions, plan_inserts)
+        _plan_oauth_child(lines, oauth_start, oauth_end, "providers",
+                          ANTIGRAVITY_PROVIDER_BLOCK.rstrip("\n").split("\n"), tail_additions, plan_inserts)
+        plan.extend(plan_inserts)
+        if tail_additions:
+            block = [line for chunk in tail_additions for line in chunk]
+            plan.append((_trim_trailing_empty(lines, oauth_start + 1, oauth_end), block))
+
+    if eof_blocks:
+        block = [line for chunk in eof_blocks for line in chunk]
+        if lines and lines[-1].strip():
+            block = [""] + block  # 原文件末行无换行时先补一个行结束
+        plan.append((len(lines), block))
+    return plan
+
+
+def sync_config(dry_run=False):
+    """对已有 config.yaml 非破坏性增量补齐跨机安全基线；返回是否需要变更。
+
+    - config.yaml 不存在：静默 no-op（不建目录、不建文件；首建请用 init-config）。
+    - 只补缺失的顶层 routing: 段与 oauth.model-alias.antigravity: / oauth.providers.antigravity: 段，绝不改写既有行。
+    - 无缺失项：严格 no-op（不写文件、不备份），连续执行幂等。
+    - 有变更：先备份 config.yaml.bak-<YYYYMMDDHHMMSS>（0600），再原子写回（0600）；dry_run 仅预览。
+    """
+    lines = _read_config_lines()
+    if lines is None:
+        return False
+    plan = _plan_sync(lines)
+    if not plan:
+        return False
+    summary = []
+    for pos, block in plan:
+        # 以插入段内缩进为 0/2 空格的键名概括该段（如 "routing:"、"model-alias:+providers:"）
+        keys = [l.strip() for l in block if re.match(r"^(?:  )?\S.*:\s*$", l)]
+        key = "+".join(dict.fromkeys(keys)) or "段"
+        summary.append(f"{key}（第 {pos + 1} 行前插入 {len(block)} 行）")
+    desc = "；".join(summary)
+    if dry_run:
+        print(f"[dry-run] cliproxyapi: {CONFIG} 将补齐: {desc}")
+        return True
+    # 自下而上应用插入，保证前面的位置不失效；同一位置的多个插入按计划倒序应用，
+    # 使“子块末尾插入”（先计划）最终落在“oauth 块末尾追加”（后计划）之前，保持嵌套正确
+    for _, (pos, block) in sorted(enumerate(plan), key=lambda t: (t[1][0], t[0]), reverse=True):
+        lines[pos:pos] = block
+    content = "\n".join(lines)
+    if not content.endswith("\n"):
+        content += "\n"
+    backup = f"{CONFIG}.bak-{datetime.now():%Y%m%d%H%M%S}"
+    with open(CONFIG, "rb") as src, open(backup, "wb") as dst:
+        dst.write(src.read())
+    os.chmod(backup, 0o600)
+    _atomic_write_text(CONFIG, content)
+    os.chmod(CONFIG, 0o600)
+    print(f"cliproxyapi: {CONFIG} 已增量补齐: {desc}；备份: {backup}")
+    return True
 
 
 def rotate_log_if_needed():
@@ -297,7 +513,7 @@ def status():
 
 def main():
     if len(sys.argv) < 2:
-        sys.exit("用法: manager.py start|stop|status|init-config")
+        sys.exit("用法: manager.py start|stop|status|init-config|sync-config [--dry-run]")
     cmd = sys.argv[1]
     try:
         if cmd in ("start", "register"):
@@ -313,6 +529,12 @@ def main():
         elif cmd == "init-config":
             # 首次登录前幂等生成 config.yaml 与 auth/ 目录（供 /cliproxyapi-login 调用）
             locked(gen_config)
+        elif cmd == "sync-config":
+            # 旧机器增量补齐 config.yaml 缺失段（不建目录/文件；不加锁以免在无状态目录时产生 lock 文件）
+            args = sys.argv[2:]
+            if any(a not in ("--dry-run",) for a in args):
+                sys.exit(f"未知参数: {' '.join(args)}")
+            sync_config(dry_run="--dry-run" in args)
         else:
             sys.exit(f"未知子命令: {cmd}")
     except Exception as e:
