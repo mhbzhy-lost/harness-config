@@ -249,6 +249,31 @@ html, body, #root {
   margin: 0 0 6px 0;
 }
 
+/* 卡片标题行：标题与右侧工具按钮同行，窄侧面板下不换行、不遮挡 */
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: nowrap;
+  gap: 8px;
+  margin: 0 0 6px 0;
+}
+
+.section-head > .section-title {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.btn-collapse {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .callout-question {
   border-color: var(--color-border-warning, rgba(191, 135, 0, 0.45));
   background: var(--color-background-warning, rgba(191, 135, 0, 0.08));

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { createRequire } from "node:module";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseGitStatusFileUri } from "../plugins/pi-worker/ui-src/git-uri.ts";
 import { createCoalescingRunner } from "../plugins/pi-worker/ui-src/poller.ts";
 import {
@@ -35,9 +36,21 @@ import {
   reduceTimelineItems,
   summarizeDetailPreview,
 } from "../plugins/pi-worker/ui-src/timeline.ts";
+import {
+  EXPANDABLE_SELECTOR,
+  OPEN_EXPANDABLE_SELECTOR,
+  clearExpandedKeys,
+  collapseAll,
+  collapseExpandables,
+  hasExpandedItem,
+  pruneExpandedKeys,
+  setExpandedKey,
+} from "../plugins/pi-worker/ui-src/collapse.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MONITOR_HTML = join(ROOT, "plugins", "pi-worker", "ui", "monitor.html");
+const UI_SRC = join(ROOT, "plugins", "pi-worker", "ui-src");
+const UI_NODE_MODULES = join(UI_SRC, "node_modules");
 const SERVER_PATH = join(ROOT, "plugins", "pi-worker", "src", "server.ts");
 
 test("test_git_status_uri_parser_handles_renames_spaces_and_unicode", () => {
@@ -506,4 +519,260 @@ test("test_app_tsx_and_monitor_html_enforce_ui_event_window_and_memo", () => {
   assert.match(appSource, /isConversationSurface\(app\?\.getHostCapabilities\(\)\)/);
   const html = readFileSync(MONITOR_HTML, "utf8");
   assert.ok(html.includes("当前侧面板尚未绑定会话"), "monitor.html missing unbound-session hint");
+});
+
+// ───────────────────────── 「全部折叠」按钮回归 ─────────────────────────
+
+/** 时间线事件样本：覆盖全部可折叠块（thinking / 含正文 tool 卡 / 多行 detail 事件）与若干静态块 */
+const COLLAPSE_T = "2026-11-25T10:00:00.000Z";
+const COLLAPSE_EVENTS_BASE = [
+  { seq: 1, round: 1, blockId: 1, kind: "thinking", title: "思考中", detail: "先读源码再改", thinkingChars: 6, timestamp: COLLAPSE_T },
+  { seq: 2, round: 1, kind: "tool_start", toolName: "bash", toolCallId: "tc-1", title: "bash", detail: "npm test", preview: "npm test", timestamp: COLLAPSE_T },
+  { seq: 3, round: 1, kind: "tool_end", toolName: "bash", toolCallId: "tc-1", title: "bash", detail: "ALL PASS\nok", isError: false, durationMs: 100, timestamp: COLLAPSE_T },
+  { seq: 4, round: 1, kind: "tool_start", toolName: "glob", toolCallId: "tc-2", title: "glob", preview: "src/**", timestamp: COLLAPSE_T },
+  { seq: 5, round: 1, kind: "tool_end", toolName: "glob", toolCallId: "tc-2", title: "glob", isError: false, durationMs: 5, timestamp: COLLAPSE_T },
+  { seq: 6, round: 1, kind: "steer", title: "Steer 插话（主代理）", detail: "改用方案 B\n并补测试", timestamp: COLLAPSE_T },
+  { seq: 7, round: 1, kind: "steer", title: "Steer 插话（面板）", detail: "继续", timestamp: COLLAPSE_T },
+  { seq: 8, round: 1, blockId: 2, kind: "text_delta", title: "助手输出", detail: "## 进度\n- 已完成", timestamp: COLLAPSE_T },
+  { seq: 9, round: 1, blockId: 2, kind: "assistant", title: "助手输出", detail: "## 进度\n- 已完成全部测试", timestamp: COLLAPSE_T },
+];
+const COLLAPSE_EVENTS_INCREMENT = [
+  { seq: 10, round: 1, blockId: 3, kind: "thinking", title: "思考中", detail: "第二轮分析", thinkingChars: 5, timestamp: COLLAPSE_T },
+  { seq: 11, round: 1, kind: "tool_start", toolName: "read", toolCallId: "tc-3", title: "read", detail: "src/index.ts", preview: "src/index.ts", timestamp: COLLAPSE_T },
+  { seq: 12, round: 1, kind: "tool_end", toolName: "read", toolCallId: "tc-3", title: "read", detail: "line1\nline2", isError: true, durationMs: 20, timestamp: COLLAPSE_T },
+  { seq: 13, round: 1, kind: "status", title: "状态更新", detail: "x".repeat(150), isError: false, timestamp: COLLAPSE_T },
+];
+
+/** 按类型/特征从 reduce 结果中定位 key，避免硬编码 key 格式 */
+function itemKey(items, pred) {
+  const found = items.find(pred);
+  assert.ok(found, `timeline item not found: ${pred}`);
+  return found.key;
+}
+
+/** 最小 DOM 桩：只实现 querySelectorAll 对 EXPANDABLE/OPEN 选择器的匹配 */
+function makeFakeTimelineRoot(nodes) {
+  const matches = (node, selector) => {
+    if (!node.details || !node.expandable) return false;
+    return selector === EXPANDABLE_SELECTOR || (selector === OPEN_EXPANDABLE_SELECTOR && node.open);
+  };
+  return {
+    nodes,
+    querySelectorAll(selector) {
+      return nodes.filter((node) => matches(node, selector));
+    },
+  };
+}
+const fakeDetails = (open, expandable = true) => ({ details: true, expandable, open });
+
+test("test_collapse_state_helpers_track_expand_clear_prune_and_dom_collapse", () => {
+  const items = reduceTimelineItems(COLLAPSE_EVENTS_BASE, true);
+  // thinking + 含正文 tool 卡(tc-1) 为 <details>；无正文 tool 卡(tc-2)、单行 steer、assistant 为静态块
+  assert.deepEqual(items.map((it) => it.type), ["thinking", "tool", "tool", "event", "event", "assistant"]);
+  assert.equal(items[2].status, "done");
+  assert.equal(items[2].input ?? items[2].output, undefined, "无正文工具卡不渲染为可折叠块");
+  assert.equal(isExpandableDetail(items[4].detail), false);
+  const thinking = items[0];
+  const toolWithBody = items[1];
+  const steerMulti = items[3];
+
+  // 1. 初始无展开块：集合为空 → 无已展开项
+  let expanded = clearExpandedKeys();
+  assert.equal(expanded.size, 0);
+  assert.equal(hasExpandedItem(expanded, items), false);
+
+  // 2. 用户点击展开多种可折叠块
+  expanded = setExpandedKey(expanded, thinking.key, true);
+  expanded = setExpandedKey(expanded, toolWithBody.key, true);
+  expanded = setExpandedKey(expanded, steerMulti.key, true);
+  assert.equal(expanded.size, 3);
+  assert.equal(hasExpandedItem(expanded, items), true);
+  // 幂等：重复 set 同值返回同一引用
+  assert.equal(setExpandedKey(expanded, thinking.key, true), expanded);
+  // 单个折叠同步启用态
+  const oneCollapsed = setExpandedKey(expanded, thinking.key, false);
+  assert.equal(oneCollapsed.size, 2);
+  assert.equal(hasExpandedItem(oneCollapsed, items), true);
+
+  // 3. 全部折叠：DOM 同步关闭 + 内部集合清空
+  const root = makeFakeTimelineRoot([
+    fakeDetails(true),                        // thinking
+    fakeDetails(true),                        // tool 卡
+    fakeDetails(false),                       // 已折叠块不计
+    fakeDetails(true, false),                 // 非 ev-expandable 的 <details>（如 Markdown 内）不受影响
+    fakeDetails(true),                        // 多行 steer
+  ]);
+  const result = collapseAll(expanded, root);
+  assert.equal(result.closedCount, 3);
+  assert.equal(result.expanded.size, 0);
+  assert.deepEqual(root.nodes.map((n) => n.open), [false, false, false, true, false]);
+  assert.equal(hasExpandedItem(result.expanded, items), false);
+  // 空容器 / 无容器安全
+  assert.equal(collapseExpandables(null), 0);
+  assert.equal(collapseExpandables(makeFakeTimelineRoot([])), 0);
+
+  // 4. 增量重渲染：残留 key 剔除、折叠状态不反弹
+  const allEvents = [...COLLAPSE_EVENTS_BASE, ...COLLAPSE_EVENTS_INCREMENT];
+  const nextItems = reduceTimelineItems(allEvents, true);
+  // 模拟仅残留一个已滚出窗口 key 的集合：按新时间线剔除后不再点亮按钮
+  const stale = new Set(["gone:key"]);
+  assert.equal(hasExpandedItem(stale, nextItems), false);
+  assert.equal(pruneExpandedKeys(stale, nextItems).size, 0);
+  // 折叠后的空集合在增量重渲染后保持为空（不反弹）
+  const afterIncrement = pruneExpandedKeys(result.expanded, nextItems);
+  assert.equal(afterIncrement.size, 0);
+  assert.equal(hasExpandedItem(afterIncrement, nextItems), false);
+  // 新增的可折叠块（read 报错卡、超长 status 事件）默认折叠，不影响既有折叠块
+  const readKey = itemKey(nextItems, (it) => it.type === "tool" && it.toolName === "read");
+  const statusKey = itemKey(nextItems, (it) => it.type === "event" && it.title === "状态更新");
+  assert.equal(afterIncrement.has(readKey), false);
+  assert.equal(afterIncrement.has(statusKey), false);
+  // 无残留时 prune 返回原引用，避免无谓重渲染
+  const live = setExpandedKey(afterIncrement, steerMulti.key, true);
+  assert.equal(pruneExpandedKeys(live, nextItems), live);
+  assert.equal(hasExpandedItem(pruneExpandedKeys(live, nextItems), nextItems), true);
+});
+
+/** 经 esbuild（UI 构建同链路）打包真实 TimelineCard，校验 <details open> 受控渲染与按钮禁用态 */
+async function loadBundledTimelineCard() {
+  let esbuild;
+  try {
+    const req = createRequire(join(UI_SRC, "package.json"));
+    esbuild = req("esbuild");
+  } catch {
+    return null;
+  }
+  const dir = mkdtempSync(join(tmpdir(), "pi-worker-ui-collapse-"));
+  const entry = join(dir, "entry.mjs");
+  const outfile = join(dir, "bundle.mjs");
+  writeFileSync(entry, `
+import { renderToStaticMarkup } from "react-dom/server";
+import { TimelineCard } from ${JSON.stringify(join(UI_SRC, "app.tsx"))};
+export { renderToStaticMarkup, TimelineCard };
+`);
+  try {
+    await esbuild.build({
+      entryPoints: [entry],
+      outfile,
+      bundle: true,
+      format: "esm",
+      platform: "node",
+      target: ["es2022"],
+      jsx: "automatic",
+      nodePaths: [UI_NODE_MODULES],
+      define: { "process.env.NODE_ENV": '"production"' },
+      // react-dom/server 等 CJS 依赖在 ESM 产物中经 createRequire 兜底
+      banner: { js: 'import { createRequire as __cr } from "node:module"; const require = __cr(import.meta.url);' },
+      logLevel: "silent",
+    });
+    const mod = await import(pathToFileURL(outfile).href);
+    rmSync(dir, { recursive: true, force: true });
+    return mod;
+  } catch (err) {
+    rmSync(dir, { recursive: true, force: true });
+    throw err;
+  }
+}
+
+function countOpenDetails(html) {
+  return (html.match(/<details[^>]*\sopen=""[^>]*>/g) ?? []).length;
+}
+
+test("test_collapse_all_button_renders_disabled_and_blocks_stay_collapsed_after_rerender", async (t) => {
+  let mod;
+  try {
+    mod = await loadBundledTimelineCard();
+  } catch (err) {
+    if (String(err?.message ?? err).includes("Cannot find module")) {
+      t.skip("ui-src/node_modules 未安装，跳过真实 React 渲染校验（npm install 后可运行）");
+      return;
+    }
+    throw err;
+  }
+  if (!mod) {
+    t.skip("ui-src/node_modules 未安装，跳过真实 React 渲染校验（npm install 后可运行）");
+    return;
+  }
+  const { renderToStaticMarkup, TimelineCard } = mod;
+  const items = reduceTimelineItems(COLLAPSE_EVENTS_BASE, true);
+  const onToggle = () => () => {};
+  const render = (list, expanded, hasExpanded, root = null) => renderToStaticMarkup(TimelineCard({
+    items: list,
+    expand: { expanded, onToggle },
+    hasExpanded,
+    onCollapseAll: () => {},
+    onOpenLink: () => {},
+    timelineRef: { current: root },
+  }));
+
+  // 1. 初始：按钮禁用，所有 details 均折叠；静态块（无正文工具卡 / 单行 steer / assistant）不渲染 <details>
+  let expanded = clearExpandedKeys();
+  let html = render(items, expanded, hasExpandedItem(expanded, items));
+  assert.match(html, /<button[^>]*id="btn-collapse-all"[^>]*disabled=""[^>]*>全部折叠<\/button>/);
+  assert.equal(countOpenDetails(html), 0);
+  // thinking / 含正文 tool 卡 / 多行 steer 共 3 个 <details>；无正文 tool 卡、单行 steer、assistant 不渲染 <details>
+  assert.equal((html.match(/<details /g) ?? []).length, 3);
+  assert.equal((html.match(/ev-expandable/g) ?? []).length, 3);
+  assert.doesNotMatch(html, /<details[^>]*ev-tool_start ev-expandable"[^>]*>[^<]*<summary[^>]*>[^<]*<div class="ev-head">[^<]*<span class="ev-title">[^<]*<span>[^<]*glob/, "无正文工具卡不应渲染为 details");
+
+  // 2. 展开多种可折叠块：按钮可用，三个块带 open
+  expanded = setExpandedKey(expanded, items[0].key, true);
+  expanded = setExpandedKey(expanded, items[1].key, true);
+  expanded = setExpandedKey(expanded, items[3].key, true);
+  html = render(items, expanded, hasExpandedItem(expanded, items));
+  assert.match(html, /<button[^>]*id="btn-collapse-all"(?![^>]*disabled)[^>]*>全部折叠<\/button>/);
+  assert.equal(countOpenDetails(html), 3);
+  assert.match(html, /<details class="ev ev-thinking ev-expandable" open=""/);
+  assert.match(html, /<details class="ev ev-tool_end ev-expandable" open=""/);
+  assert.match(html, /<details class="ev ev-steer ev-expandable" open=""/);
+  // 三类可折叠块（thinking / tool / steer）均受控展开
+  assert.equal((html.match(/<details /g) ?? []).length, 3);
+
+  // 3. 点击「全部折叠」：DOM 同步关闭 + 集合清空 → 重渲染全部折叠、按钮恢复禁用
+  const root = makeFakeTimelineRoot([fakeDetails(true), fakeDetails(true), fakeDetails(false), fakeDetails(true)]);
+  const { expanded: cleared, closedCount } = collapseAll(expanded, root);
+  assert.equal(closedCount, 3);
+  expanded = cleared;
+  html = render(items, expanded, hasExpandedItem(expanded, items));
+  assert.equal(countOpenDetails(html), 0);
+  assert.match(html, /<button[^>]*id="btn-collapse-all"[^>]*disabled=""[^>]*>全部折叠<\/button>/);
+
+  // 4. 再触发一轮增量重渲染：原展开块保持折叠不反弹，新增块默认折叠，按钮仍禁用
+  const nextItems = reduceTimelineItems([...COLLAPSE_EVENTS_BASE, ...COLLAPSE_EVENTS_INCREMENT], true);
+  expanded = pruneExpandedKeys(expanded, nextItems);
+  html = render(nextItems, expanded, hasExpandedItem(expanded, nextItems));
+  assert.equal(countOpenDetails(html), 0);
+  // 新增第二轮 thinking、read 报错卡与超长 status 事件同样渲染为 <details>（共 6 个）且默认折叠
+  assert.equal((html.match(/<details /g) ?? []).length, 6);
+  assert.equal((html.match(/ev-expandable/g) ?? []).length, 6);
+  assert.match(html, /<button[^>]*id="btn-collapse-all"[^>]*disabled=""[^>]*>全部折叠<\/button>/);
+  assert.ok(html.includes(`实时进度流 (${nextItems.length})`));
+  // 反向校验：受控 open 为 true 时确实渲染 open 属性，证明渲染契约为受控展开而非仅靠 DOM
+  const oneOpen = setExpandedKey(
+    expanded,
+    itemKey(nextItems, (it) => it.type === "tool" && it.toolName === "read"),
+    true,
+  );
+  html = render(nextItems, oneOpen, hasExpandedItem(oneOpen, nextItems));
+  assert.equal(countOpenDetails(html), 1);
+  assert.match(html, /<button[^>]*id="btn-collapse-all"(?![^>]*disabled)[^>]*>全部折叠<\/button>/);
+});
+
+test("test_app_tsx_wires_controlled_details_and_collapse_all_button", () => {
+  const appSource = readFileSync(join(UI_SRC, "app.tsx"), "utf8");
+  // 三类可折叠块（thinking / tool / 多行 detail 事件）均以 expandedKeys 受控 open 并挂接 onToggle
+  assert.equal((appSource.match(/open=\{expand\.expanded\.has\(item\.key\)\}/g) ?? []).length, 3);
+  assert.equal((appSource.match(/onToggle=\{expand\.onToggle\(item\.key\)\}/g) ?? []).length, 3);
+  // 全部折叠：同步关闭 DOM + 清空状态；按钮启用态由当前视图中已展开块决定
+  assert.match(appSource, /collapseExpandables\(timelineRef\.current\);\s*setExpandedKeys\(clearExpandedKeys\(\)\)/);
+  assert.match(appSource, /disabled=\{!hasExpanded\}/);
+  assert.match(appSource, /hasExpandedItem\(expandedKeys,\s*timelineItems\)/);
+  assert.match(appSource, /pruneExpandedKeys\(prev,\s*timelineItems\)/);
+  assert.match(appSource, /className="timeline" ref=\{timelineRef\}/);
+  const html = readFileSync(MONITOR_HTML, "utf8");
+  // 构建产物与源码一致：按钮文案 / id / 样式类均已进入 monitor.html
+  assert.ok(html.includes("全部折叠"), "monitor.html missing 全部折叠 button text");
+  assert.ok(html.includes("btn-collapse-all"), "monitor.html missing btn-collapse-all id");
+  assert.ok(html.includes("btn-collapse"), "monitor.html missing btn-collapse class");
+  assert.ok(html.includes("section-head"), "monitor.html missing section-head class");
 });

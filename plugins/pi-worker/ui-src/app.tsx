@@ -35,6 +35,19 @@ import {
   summarizeDetailPreview,
 } from "./timeline.ts";
 import type { TimelineEventLike, TimelineItem } from "./timeline.ts";
+import {
+  clearExpandedKeys,
+  collapseExpandables,
+  hasExpandedItem,
+  pruneExpandedKeys,
+  setExpandedKey,
+} from "./collapse.ts";
+import type { ExpandedKeySet } from "./collapse.ts";
+
+type ExpandControl = {
+  expanded: ExpandedKeySet;
+  onToggle: (key: string) => (e: React.SyntheticEvent<HTMLDetailsElement>) => void;
+};
 
 interface TaskSummary extends ScopeTaskLike {}
 
@@ -172,14 +185,18 @@ function MarkdownView({
   );
 }
 
-function ThinkingBlock({ item }: { item: Extract<TimelineItem, { type: "thinking" }> }) {
+function ThinkingBlock({ item, expand }: { item: Extract<TimelineItem, { type: "thinking" }>; expand: ExpandControl }) {
   const preview = item.text ? summarizeDetailPreview(item.text, 100) : "";
   const label = item.isStreaming
     ? `思考中 (${item.thinkingChars} chars)`
     : `思考过程 (${item.thinkingChars} chars)`;
 
   return (
-    <details className="ev ev-thinking ev-expandable">
+    <details
+      className="ev ev-thinking ev-expandable"
+      open={expand.expanded.has(item.key)}
+      onToggle={expand.onToggle(item.key)}
+    >
       <summary className="ev-summary">
         <div className="ev-head">
           <span className="ev-title">
@@ -202,7 +219,7 @@ function ThinkingBlock({ item }: { item: Extract<TimelineItem, { type: "thinking
   );
 }
 
-function ToolCard({ item }: { item: Extract<TimelineItem, { type: "tool" }> }) {
+function ToolCard({ item, expand }: { item: Extract<TimelineItem, { type: "tool" }>; expand: ExpandControl }) {
   const isError = item.status === "error";
   const isRunning = item.status === "running";
   const dur = fmtDuration(item.durationMs);
@@ -234,7 +251,11 @@ function ToolCard({ item }: { item: Extract<TimelineItem, { type: "tool" }> }) {
   }
 
   return (
-    <details className={cardClass}>
+    <details
+      className={cardClass}
+      open={expand.expanded.has(item.key)}
+      onToggle={expand.onToggle(item.key)}
+    >
       <summary className="ev-summary">
         <div className="ev-head">
           <span className="ev-title">
@@ -301,9 +322,11 @@ function AssistantCard({
 function GenericEventRow({
   item,
   onOpenLink,
+  expand,
 }: {
   item: Extract<TimelineItem, { type: "event" }>;
   onOpenLink: (url: string) => void;
+  expand: ExpandControl;
 }) {
   if (item.kind === "turn_end") {
     return (
@@ -328,7 +351,11 @@ function GenericEventRow({
 
   if (item.detail && isExpandableDetail(item.detail)) {
     return (
-      <details className={`${cls} ev-expandable`}>
+      <details
+        className={`${cls} ev-expandable`}
+        open={expand.expanded.has(item.key)}
+        onToggle={expand.onToggle(item.key)}
+      >
         <summary className="ev-summary">
           <div className="ev-head">
             <span className="ev-title">
@@ -355,6 +382,71 @@ function GenericEventRow({
   );
 }
 
+/**
+ * 实时进度流卡片：标题行内置「全部折叠」按钮（存在已展开块时可用），正文为时间线列表。
+ * 导出供单测经 esbuild 打包后做渲染契约校验。
+ */
+export function TimelineCard({
+  items,
+  expand,
+  hasExpanded,
+  onCollapseAll,
+  onOpenLink,
+  timelineRef,
+}: {
+  items: TimelineItem[];
+  expand: ExpandControl;
+  hasExpanded: boolean;
+  onCollapseAll: () => void;
+  onOpenLink: (url: string) => void;
+  timelineRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  return (
+    <div className="card">
+      <div className="section-head">
+        <div className="section-title">实时进度流 ({items.length})</div>
+        <button
+          id="btn-collapse-all"
+          className="btn btn-collapse"
+          type="button"
+          disabled={!hasExpanded}
+          onClick={onCollapseAll}
+          title="折叠所有已展开的思考、工具与事件块"
+        >
+          全部折叠
+        </button>
+      </div>
+      {items.length === 0 ? (
+        <div className="muted">等待流式事件...</div>
+      ) : (
+        <div className="timeline" ref={timelineRef}>
+          {items.map((item) => {
+            if (item.type === "round") {
+              return (
+                <div key={item.key} className="round-divider">
+                  <span>Round {item.round} · {fmtTime(item.timestamp)}</span>
+                </div>
+              );
+            }
+            if (item.type === "thinking") {
+              return <ThinkingBlock key={item.key} item={item} expand={expand} />;
+            }
+            if (item.type === "tool") {
+              return <ToolCard key={item.key} item={item} expand={expand} />;
+            }
+            if (item.type === "assistant") {
+              return <AssistantCard key={item.key} item={item} onOpenLink={onOpenLink} />;
+            }
+            return (
+              <GenericEventRow key={item.key} item={item} onOpenLink={onOpenLink} expand={expand} />
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MonitorApp() {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [groups, setGroups] = useState<TaskSessionGroup[]>([]);
@@ -364,6 +456,8 @@ function MonitorApp() {
   const [currentTask, setCurrentTask] = useState<TaskRecord | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [events, setEvents] = useState<TimelineEventLike[]>([]);
+  // 用户点击展开的可折叠块 key 集合；<details> 以该集合受控 open，「全部折叠」时清空
+  const [expandedKeys, setExpandedKeys] = useState<ExpandedKeySet>(() => new Set());
   const [loadingInitial, setLoadingInitial] = useState(true);
   const [cancelling, setCancelling] = useState(false);
   const [steerText, setSteerText] = useState("");
@@ -384,6 +478,7 @@ function MonitorApp() {
   const receivedToolEventRef = useRef(false);
   const fallbackTimerRef = useRef<number | null>(null);
   const inConversationSurfaceRef = useRef(true);
+  const timelineRef = useRef<HTMLDivElement | null>(null);
 
   const syncConversationSurface = useCallback(() => {
     const next = isConversationSurface(appRef.current?.getHostCapabilities());
@@ -785,6 +880,34 @@ function MonitorApp() {
     !cancelling && (currentTask?.status === "running" || currentTask?.status === "needs_input"),
   );
 
+  // 切换任务时清空展开集合，避免不同任务复用同序号 key（如 thinking:1）时意外沿用展开态
+  useEffect(() => {
+    setExpandedKeys(clearExpandedKeys());
+  }, [selectedTaskId]);
+
+  // 增量/快照重渲染后剔除已滚出窗口的 key；折叠状态本身保留，不会反弹
+  useEffect(() => {
+    setExpandedKeys((prev) => pruneExpandedKeys(prev, timelineItems));
+  }, [timelineItems]);
+
+  const hasExpanded = hasExpandedItem(expandedKeys, timelineItems);
+
+  const handleExpandToggle = useCallback((key: string) => (e: React.SyntheticEvent<HTMLDetailsElement>) => {
+    const open = e.currentTarget.open;
+    setExpandedKeys((prev) => setExpandedKey(prev, key, open));
+  }, []);
+
+  const handleCollapseAll = useCallback(() => {
+    // 先同步关闭 DOM（覆盖 toggle 事件尚未派发、未入集合的竞态块），再清空内部状态
+    collapseExpandables(timelineRef.current);
+    setExpandedKeys(clearExpandedKeys());
+  }, []);
+
+  const expandControl = useMemo<ExpandControl>(
+    () => ({ expanded: expandedKeys, onToggle: handleExpandToggle }),
+    [expandedKeys, handleExpandToggle],
+  );
+
   const modelLabel = currentTask
     ? [currentTask.provider, currentTask.model].filter(Boolean).join("/") || "默认模型"
     : "";
@@ -1018,34 +1141,14 @@ function MonitorApp() {
                   </div>
                 )}
 
-                <div className="card">
-                  <div className="section-title">实时进度流 ({timelineItems.length})</div>
-                  {timelineItems.length === 0 ? (
-                    <div className="muted">等待流式事件...</div>
-                  ) : (
-                    <div className="timeline">
-                      {timelineItems.map((item) => {
-                        if (item.type === "round") {
-                          return (
-                            <div key={item.key} className="round-divider">
-                              <span>Round {item.round} · {fmtTime(item.timestamp)}</span>
-                            </div>
-                          );
-                        }
-                        if (item.type === "thinking") {
-                          return <ThinkingBlock key={item.key} item={item} />;
-                        }
-                        if (item.type === "tool") {
-                          return <ToolCard key={item.key} item={item} />;
-                        }
-                        if (item.type === "assistant") {
-                          return <AssistantCard key={item.key} item={item} onOpenLink={handleOpenLink} />;
-                        }
-                        return <GenericEventRow key={item.key} item={item} onOpenLink={handleOpenLink} />;
-                      })}
-                    </div>
-                  )}
-                </div>
+                <TimelineCard
+                  items={timelineItems}
+                  expand={expandControl}
+                  hasExpanded={hasExpanded}
+                  onCollapseAll={handleCollapseAll}
+                  onOpenLink={handleOpenLink}
+                  timelineRef={timelineRef}
+                />
               </>
             )}
           </div>
@@ -1094,7 +1197,8 @@ function MonitorApp() {
   );
 }
 
-const rootEl = document.getElementById("root");
+// 仅供浏览器入口挂载；被单测/SSR 打包导入时无 document 则跳过
+const rootEl = typeof document !== "undefined" ? document.getElementById("root") : null;
 if (rootEl) {
   createRoot(rootEl).render(<MonitorApp />);
 }
