@@ -1,6 +1,8 @@
 import json
 import os
 import pty
+import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -16,7 +18,7 @@ class PiSyncTest(unittest.TestCase):
         ext_root = ROOT / "pi/extensions"
         self.assertTrue(ext_root.is_dir())
         dirs = sorted(p for p in ext_root.iterdir() if p.is_dir())
-        self.assertGreaterEqual(len(dirs), 13)
+        self.assertGreaterEqual(len(dirs), 14)
         for ext_dir in dirs:
             entry = ext_dir / f"{ext_dir.name}.ts"
             self.assertTrue(
@@ -48,6 +50,7 @@ class PiSyncTest(unittest.TestCase):
                 pkg.startswith(("npm:", "git:")),
                 msg=f"模板 packages 只应包含跨机 npm:/git: 声明: {pkg}",
             )
+        self.assertNotIn("pi-subagents", settings_path.read_text(encoding="utf-8"), msg="pi-subagents 只能经 launcher 注入交互式会话，不得写入全局模板（pi-worker 会加载）")
         for forbidden in (
             "model",
             "defaultProvider",
@@ -97,6 +100,55 @@ class PiSyncTest(unittest.TestCase):
             self.assertFalse(agent_dir.exists())
             self.assertFalse(plugins_dir.exists())
             self.assertFalse(shell_rc.exists())
+
+    def test_init_pi_retires_openai_proxy_and_injects_cliproxyapi(self) -> None:
+        """openai-proxy 已退役：重跑 init-pi.sh 须从本机 settings 剔除其遗留路径（含旧仓库路径），并注入 cliproxyapi 懒加载扩展。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            agent_dir = Path(tmp) / "pi-agent"
+            agent_dir.mkdir(parents=True)
+            plugins_dir = Path(tmp) / "plugins"
+            shell_rc = Path(tmp) / ".zshrc"
+            shell_rc.write_text("# existing zshrc\n", encoding="utf-8")
+            settings_path = agent_dir / "settings.json"
+            settings_path.write_text(json.dumps({
+                "extensions": [
+                    "/custom/keep-me/index.mjs",
+                    "/old/harness-config/pi/extensions/openai-proxy/openai-proxy.ts",
+                    "/custom/plugins/openai-proxy/openai-proxy.ts",
+                    "/custom/keep-openai-proxy-helper.ts",
+                ],
+            }), encoding="utf-8")
+            env = os.environ.copy()
+            env["PI_AGENT_DIR"] = str(agent_dir)
+            env["PI_PLUGINS_DIR"] = str(plugins_dir)
+            env["PI_SHELL_RC"] = str(shell_rc)
+            env["PI_DOCS_SKILL_DIR"] = str(Path(tmp) / "pi-docs")
+            env["PI_PACKAGE_DIR"] = str(Path(tmp) / "missing-pkg")
+
+            res = subprocess.run(
+                ["bash", str(ROOT / "init-pi.sh")],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(res.returncode, 0, msg=f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}")
+
+            exts = json.loads(settings_path.read_text(encoding="utf-8"))["extensions"]
+            self.assertFalse(
+                [e for e in exts if e.endswith("/pi/extensions/openai-proxy/openai-proxy.ts")],
+                msg="退役的 openai-proxy 扩展路径未被清理",
+            )
+            self.assertIn("/custom/plugins/openai-proxy/openai-proxy.ts", exts, msg="仅剔除 /pi/extensions/<retired>/<retired>.ts 后缀，用户自建同名扩展不得被误删")
+            self.assertIn("/custom/keep-me/index.mjs", exts)
+            self.assertIn("/custom/keep-openai-proxy-helper.ts", exts, msg="仅剔除与 <retired>/<retired>.ts 后缀完全匹配的条目")
+            cliproxyapi = str(ROOT / "pi/extensions/cliproxyapi/cliproxyapi.ts")
+            self.assertIn(cliproxyapi, exts)
+            self.assertLess(exts.index(str(ROOT / "pi/extensions/agent-plugins/agent-plugins.ts")), exts.index(cliproxyapi))
+            self.assertLess(exts.index(cliproxyapi), exts.index(str(ROOT / "pi/extensions/ask-user-question/ask-user-question.ts")))
+            self.assertFalse((ROOT / "pi/extensions/openai-proxy").exists(), msg="openai-proxy 目录应已从仓内移除")
+            self.assertFalse((ROOT / "pi/openai-proxy.example.json").exists())
 
     def test_init_pi_sync_preserves_existing_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -163,11 +215,14 @@ class PiSyncTest(unittest.TestCase):
             self.assertNotIn("/old/harness-config/pi/extensions/tui-lite/tui-lite.ts", exts)
             ask_idx = exts.index(str(ROOT / "pi/extensions/ask-user-question/ask-user-question.ts"))
             dcp_idx = exts.index(str(ROOT / "pi/extensions/dcp/dcp.ts"))
+            subagents_idx = exts.index(str(ROOT / "pi/extensions/subagents/subagents.ts"))
             compact_idx = exts.index(str(ROOT / "pi/extensions/compact-tools/compact-tools.ts"))
             self.assertLess(ask_idx, compact_idx)
             self.assertLess(dcp_idx, compact_idx)
+            self.assertLess(dcp_idx, subagents_idx)
+            self.assertLess(subagents_idx, compact_idx)
             self.assertIn(str(ROOT / "pi/extensions/agent-plugins/agent-plugins.ts"), exts)
-            self.assertEqual(len(exts), 1 + 13)
+            self.assertEqual(len(exts), 1 + 14)
             self.assertIn("/custom/local-skills", merged["skills"])
             self.assertIn(str(ROOT / "skills"), merged["skills"])
             self.assertEqual(stat.S_IMODE(settings_path.stat().st_mode), 0o600)
@@ -267,6 +322,132 @@ class PiSyncTest(unittest.TestCase):
             self.assertEqual(ver.returncode, 0, msg=f"stderr:\n{ver.stderr}")
             self.assertIn("FAKE_PI:--version", ver.stdout)
             self.assertFalse(registry.exists())
+
+    def test_interactive_packages_manifest_is_pinned_and_isolated_from_settings(self) -> None:
+        manifest = ROOT / "pi/interactive-packages.json"
+        self.assertTrue(manifest.is_file(), msg=f"缺少 {manifest}")
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertIsInstance(data, dict)
+        pkgs = data.get("packages")
+        self.assertIsInstance(pkgs, list)
+        self.assertIn("npm:pi-subagents@0.90.0", pkgs)
+        self.assertEqual(set(data), {"packages"}, msg="清单只应包含 packages 字段")
+        exact = re.compile(r"^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)*$")
+        commit = re.compile(r"^[0-9a-f]{7,40}$")
+        for pkg in pkgs:
+            self.assertIsInstance(pkg, str)
+            self.assertTrue(pkg.startswith(("npm:", "git:")), msg=f"仅支持 npm:/git: 条目: {pkg}")
+            name, sep, version = pkg.rpartition("@")
+            self.assertTrue(sep and name and version, msg=f"条目必须锁定精确版本/tag/commit: {pkg}")
+            self.assertFalse(version.startswith(("^", "~", ">", "<", "=", "*", "x", " ")), msg=f"禁止 semver 范围: {pkg}")
+            self.assertNotIn(version, ("latest", "next", "main", "master", "dev"), msg=f"禁止浮动 tag/分支: {pkg}")
+            self.assertNotIn(" ", version)
+            if pkg.startswith("npm:"):
+                self.assertRegex(version, exact, msg=f"npm 条目必须锁定精确版本: {pkg}")
+            else:
+                self.assertTrue(exact.match(version) or commit.match(version), msg=f"git 条目必须锁定 tag 或 commit: {pkg}")
+        self.assertNotIn("pi-subagents", (ROOT / "pi/settings.json").read_text(encoding="utf-8"))
+
+    def _run_launcher_with_argv_capture(self, launcher: Path, argv: list[str]) -> tuple[int, str, dict]:
+        """在 pty 下启动 launcher（假 pi 记录 argv），返回 (退出码, stderr, 假 pi 记录)。"""
+        tmp_path = launcher.parent
+        fake_pi = tmp_path / "fake-pi"
+        fake_pi.write_text(
+            "#!/usr/bin/env node\n"
+            "const { writeFileSync } = require('node:fs');\n"
+            "writeFileSync(process.env.FAKE_PI_OUT, JSON.stringify({ argv: process.argv.slice(2), nodeOptions: process.env.NODE_OPTIONS || '' }));\n",
+            encoding="utf-8",
+        )
+        fake_pi.chmod(0o755)
+        out_file = tmp_path / "fake-pi-output.json"
+        env = os.environ.copy()
+        for leaked in ("NODE_OPTIONS", "PI_SUBAGENT_CHILD", "PI_SUBAGENT_FANOUT_CHILD", "PI_SESSION_OWNER_ID", "PI_SESSION_OWNER_REGISTRY", "PI_SESSION_FILE"):
+            env.pop(leaked, None)
+        env["PI_REAL_BIN"] = str(fake_pi)
+        env["PI_SESSION_OWNER_REGISTRY"] = str(tmp_path / "registry")
+        env["PI_HEAP_DIAGNOSTIC_DIR"] = str(tmp_path / "heap")
+        env["FAKE_PI_OUT"] = str(out_file)
+        master_fd, slave_fd = pty.openpty()
+        try:
+            res = subprocess.run(
+                ["zsh", str(launcher), *argv],
+                cwd=tmp_path,
+                env=env,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+        finally:
+            os.close(slave_fd)
+            os.close(master_fd)
+        info = json.loads(out_file.read_text(encoding="utf-8")) if out_file.is_file() else {}
+        return res.returncode, res.stderr, info
+
+    def test_launcher_injects_interactive_packages_only_in_interactive_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp).resolve()
+            session_owner_arg = str(tmp_path / "extensions/session-owner/session-owner.ts")
+            # 假 pi 所在目录即 pi_root：把 launcher 放在临时目录，scripts/ 软链到仓内
+            launcher = tmp_path / "launcher.zsh"
+            launcher.write_text((ROOT / "pi/launcher.zsh").read_text(encoding="utf-8"), encoding="utf-8")
+            (tmp_path / "scripts").symlink_to(ROOT / "pi/scripts")
+            (tmp_path / "extensions").symlink_to(ROOT / "pi/extensions")
+            (tmp_path / "interactive-packages.json").write_text((ROOT / "pi/interactive-packages.json").read_text(encoding="utf-8"), encoding="utf-8")
+
+            # 1. 交互模式（无参数，pty）：session-owner 与锁版包一同以 -e 传入，且置于用户参数之前
+            code, stderr, info = self._run_launcher_with_argv_capture(launcher, [])
+            self.assertEqual(code, 0, msg=f"stderr:\n{stderr}")
+            argv = info.get("argv") or []
+            self.assertIn(session_owner_arg, argv, msg=f"stderr:\n{stderr}\nargv: {argv}")
+            self.assertEqual(argv.count("-e"), 2, msg=f"应恰好注入两个 -e: {argv}")
+            self.assertEqual(argv[0], "-e")
+            self.assertEqual(argv[2], "-e")
+            self.assertEqual(argv[3], "npm:pi-subagents@0.90.0")
+            self.assertEqual(argv[-2:], ["-e", "npm:pi-subagents@0.90.0"])
+            self.assertEqual(info.get("nodeOptions"), "")
+
+            shutil.rmtree(tmp_path / "registry")
+            # 2. 非交互 bypass（--version）：不加载 pi-subagents，参数原样透传
+            code, stderr, info = self._run_launcher_with_argv_capture(launcher, ["--version"])
+            self.assertEqual(code, 0, msg=f"stderr:\n{stderr}")
+            argv = info.get("argv") or []
+            self.assertEqual(argv, ["--version"])
+            self.assertFalse((tmp_path / "registry").exists())
+
+            # 3. 含空格的包名经 NUL 分隔读入后仍是单个参数
+            (tmp_path / "interactive-packages.json").write_text(
+                json.dumps({"packages": ["npm:a b@1.0.0", "npm:c@2.0.0"]}), encoding="utf-8"
+            )
+            code, stderr, info = self._run_launcher_with_argv_capture(launcher, [])
+            self.assertEqual(code, 0, msg=f"stderr:\n{stderr}")
+            argv = info.get("argv") or []
+            self.assertEqual(argv[-4:], ["-e", "npm:a b@1.0.0", "-e", "npm:c@2.0.0"])
+
+            # 4. 清单缺失时静默跳过，只注入 session-owner
+            (tmp_path / "interactive-packages.json").unlink()
+            code, stderr, info = self._run_launcher_with_argv_capture(launcher, [])
+            self.assertEqual(code, 0, msg=f"stderr:\n{stderr}")
+            self.assertEqual(info.get("argv"), ["-e", session_owner_arg])
+
+            # 5. 清单非法 JSON / packages 非字符串数组：中文报错且非零退出，不拉起 pi
+            for bad in ("{bad", '{"packages": "npm:x@1.0.0"}', '{"packages": [1]}', '{"packages": [""]} ', '{"other": []}'):
+                (tmp_path / "interactive-packages.json").write_text(bad, encoding="utf-8")
+                out_file = tmp_path / "fake-pi-output.json"
+                out_file.unlink(missing_ok=True)
+                code, stderr, info = self._run_launcher_with_argv_capture(launcher, [])
+                self.assertNotEqual(code, 0, msg=f"清单 {bad!r} 应失败")
+                self.assertIn("错误:", stderr)
+                self.assertIn("interactive-packages.json", stderr)
+                self.assertNotIn("parameter not set", stderr)
+                self.assertFalse(out_file.exists(), msg=f"清单 {bad!r} 非法时不得拉起 pi")
+
+            # 6. bypass 模式忽略非法清单（非交互不读取清单）
+            (tmp_path / "interactive-packages.json").write_text("{bad", encoding="utf-8")
+            code, stderr, info = self._run_launcher_with_argv_capture(launcher, ["--version"])
+            self.assertEqual(code, 0, msg=f"stderr:\n{stderr}")
+            self.assertEqual(info.get("argv"), ["--version"])
 
     def test_launcher_node_script_receives_heap_flags_with_spaces_without_leaking_node_options(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

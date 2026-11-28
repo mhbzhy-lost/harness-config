@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, realpathSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { checkSensitivePath, checkShellPolicy, checkSynchronousBash } from "../pi/extensions/security-gates/shell-policy.ts";
 import { createNetworkRecoveryExtension } from "../pi/extensions/network-recovery/extension.ts";
-import { ensureScopedProxyFetch, installScopedProxyFetch, loadOpenAIProxyConfig } from "../pi/extensions/openai-proxy/index.ts";
+import { createCliproxyapiExtension, createLazyProxyController, hasCredentials, portListening, resolveCliproxyapiOptions } from "../pi/extensions/cliproxyapi/controller.ts";
 import { createEndpointFallbackExtension, defaultProbe } from "../pi/extensions/endpoint-fallback/index.ts";
 import { classifyPiLaunch, defaultPiSessionDir, resolveRecentSession } from "../pi/extensions/session-owner/contract.ts";
 import { createBashCwdToolDefinition, createCachedBashOptions, prepareBashCwdExecution } from "../pi/extensions/bash-cwd/extension.ts";
@@ -14,6 +15,7 @@ import { createBashAsyncController } from "../pi/extensions/bash-async/controlle
 import { createToolTimingExtension } from "../pi/extensions/tool-timing/index.ts";
 import { discoverPlugins } from "../pi/extensions/agent-plugins/manifest.ts";
 import { clearAllStatusAnimations, syncStatusAnimation } from "../pi/extensions/compact-tools/status.ts";
+import { createSubagentsRenderer, formatResultsText, SUBAGENT_TOOL_NAMES } from "../pi/extensions/subagents/renderer.ts";
 
 // ---- 1. security-gates ----
 
@@ -116,27 +118,6 @@ test("network-recovery: attempting 态看门狗到期且会话空闲时可正常
 
   assert.ok(probeCalls >= 2, `期望看门狗至少触发 2 次探活，实际 ${probeCalls}`);
   assert.ok(sent.length >= 2, `期望看门狗在 attempting 态也能再次唤醒，实际 ${sent.length}`);
-});
-
-// ---- 3. openai-proxy ----
-
-test("openai-proxy: ENOENT 静默跳过，installScopedProxyFetch 同步恢复包装", () => {
-  const errors = [];
-  const missing = loadOpenAIProxyConfig("/nonexistent/path/openai-proxy.json", { onError: (m) => errors.push(m) });
-  assert.equal(missing, undefined);
-  assert.equal(errors.length, 0);
-
-  const calls = [];
-  const fakeTarget = { fetch: (url) => { calls.push(["direct", url]); return "direct"; } };
-  const fakeProxy = (url) => { calls.push(["proxy", url]); return "proxy"; };
-  installScopedProxyFetch(fakeProxy, { target: fakeTarget });
-  assert.equal(fakeTarget.fetch("https://auth.openai.com/token"), "proxy");
-  assert.equal(fakeTarget.fetch("https://example.com/api"), "direct");
-
-  // 模拟宿主重置全局 fetch，同步重装必须立即生效
-  fakeTarget.fetch = (url) => { calls.push(["direct2", url]); return "direct2"; };
-  installScopedProxyFetch(fakeProxy, { target: fakeTarget });
-  assert.equal(fakeTarget.fetch("https://chatgpt.com/backend-api/codex"), "proxy");
 });
 
 // ---- 4. endpoint-fallback ----
@@ -424,6 +405,249 @@ test("compact-tools: orphaned loading timer stops on maxLifetime expiry and clea
   assert.match(entrySource, /clearAllStatusAnimations/);
 });
 
+// ---- 10. subagents 渲染器 ----
+
+// spinner 帧随时间变化，比对前统一归一化为 ⠋
+const SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+const norm = (value) => (Array.isArray(value) ? value.map(norm) : String(value).replace(/<dim>[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]<\/dim>/g, "<dim>⠋</dim>"));
+
+test("subagents: 仅接管 pi-subagents 工具并覆盖自带渲染器，其余透传 next()", () => {
+  const { resolver, theme, context } = createSubagentsHarness();
+  assert.deepEqual([...SUBAGENT_TOOL_NAMES], ["subagent", "subagent_launch", "bg_wait", "contact_supervisor", "subagent_supervisor", "watchdog_diff"]);
+
+  const other = { renderCall() {}, renderResult() {} };
+  assert.equal(resolver("bash", () => other), other, "非 subagents 工具应原样透传 next()");
+  assert.equal(resolver("read", () => undefined), undefined);
+
+  // 带有自带 renderCall/renderResult 的 base（pi-subagents 原生渲染器）必须被接管
+  const native = { renderCall: () => "native-call", renderResult: () => "native-result", renderShell: "native" };
+  const taken = resolver("subagent", () => native);
+  assert.equal(taken.renderShell, "self");
+  assert.notEqual(taken.renderCall, native.renderCall);
+  assert.notEqual(taken.renderResult, native.renderResult);
+  const call = taken.renderCall({ agent: "reviewer", task: "检查 代码" }, theme, context());
+  assert.equal(norm(call.render(80)[0]), "<dim>⠋</dim> <toolTitle><bold>subagent</bold></toolTitle> <accent>reviewer</accent> <dim>检查 代码</dim>");
+
+  // base 缺失时仍可用
+  const noBase = resolver("bg_wait", () => undefined);
+  assert.equal(norm(noBase.renderCall({ id: "job-1" }, theme, context()).render(80)[0]), "<dim>⠋</dim> <toolTitle><bold>bg_wait</bold></toolTitle> <accent>job-1</accent>");
+});
+
+test("subagents: 标题行格式、空白折叠与单行截断", () => {
+  const { renderCall } = createSubagentsHarness();
+  const line = (name, args, width = 200) => norm(renderCall(name, args, width)).join("\n");
+  const T = (name) => `<dim>⠋</dim> <toolTitle><bold>${name}</bold></toolTitle>`;
+
+  // subagent: agent 形态（label 优先于 task，model 带 @ 前缀，async 标记）
+  assert.equal(
+    line("subagent", { agent: "reviewer", label: "代码审查", task: "ignored", model: "gpt-5", async: true }),
+    `${T("subagent")} <accent>reviewer</accent> <dim>代码审查</dim> <dim>@gpt-5</dim> <warning>[async]</warning>`,
+  );
+  // subagent: workflow 形态（workflow 为 true 或字符串均显示 workflow）
+  assert.equal(
+    line("subagent", { workflow: true, task: "多行\n  任务  描述", async: true }),
+    `${T("subagent")} <accent>workflow</accent> <dim>多行 任务 描述</dim> <warning>[async]</warning>`,
+  );
+  assert.equal(line("subagent", { workflow: "parallel" }), `${T("subagent")} <accent>workflow</accent>`);
+  // subagent: action 形态
+  assert.equal(
+    line("subagent", { action: "status", id: "run-42", message: "please\ncontinue" }),
+    `${T("subagent")} <accent>status</accent> <dim>#run-42</dim> <dim>please continue</dim>`,
+  );
+  assert.equal(line("subagent", { action: "list" }), `${T("subagent")} <accent>list</accent>`);
+  // subagent: 回退首个非空字符串参数
+  assert.equal(line("subagent", { task: "  free   form  " }), `${T("subagent")} <accent>free form</accent>`);
+  assert.equal(line("subagent", { agent: "   " }), `${T("subagent")}`);
+
+  // subagent_launch
+  assert.equal(
+    line("subagent_launch", { agent: "worker", task: "写 测试", async: true }),
+    `${T("subagent_launch")} <accent>worker</accent> <dim>写 测试</dim> <warning>[async]</warning>`,
+  );
+  assert.equal(line("subagent_launch", { key: "k1", workflowRunId: "w1" }), `${T("subagent_launch")} <accent>k1</accent>`);
+  assert.equal(line("subagent_launch", { workflowRunId: "w1" }), `${T("subagent_launch")} <accent>w1</accent>`);
+
+  // bg_wait
+  assert.equal(line("bg_wait", { all: true }), `${T("bg_wait")} <accent>all</accent>`);
+  assert.equal(line("bg_wait", { any: true }), `${T("bg_wait")} <accent>any</accent>`);
+  assert.equal(
+    line("bg_wait", { id: "job-7", nonBlocking: true }),
+    `${T("bg_wait")} <accent>job-7</accent> <dim>non-blocking</dim>`,
+  );
+
+  // contact_supervisor / subagent_supervisor / watchdog_diff：首个非空字符串参数
+  for (const name of ["contact_supervisor", "subagent_supervisor", "watchdog_diff"]) {
+    assert.equal(line(name, { message: "hello\n world" }), `${T(name)} <accent>hello world</accent>`);
+    assert.equal(line(name, {}), `${T(name)}`);
+  }
+
+  // 单行截断：按可见宽度裁剪并以 … 结尾，不换行
+  const narrow = renderCall("subagent", { agent: "a-very-long-agent-name", task: "x".repeat(120) }, 40);
+  const rendered = narrow[0];
+  assert.equal(narrow.length, 1);
+  assert.ok(stripAnsi(rendered).endsWith("…"), rendered);
+  assert.ok(!rendered.includes("\n"), "标题应保持单行");
+  assert.equal(stripAnsi(rendered).length, 40);
+});
+
+test("subagents: loading 态保持 spinner 并显示步骤进度摘要，返回空结果", () => {
+  const { resolver, theme } = createSubagentsHarness();
+  let invalidations = 0;
+  const context = { state: {}, expanded: false, invalidate() { invalidations += 1; } };
+  const r = resolver("subagent", () => undefined);
+
+  const step = r.renderResult(
+    { content: [{ type: "text", text: "partial" }], details: { mode: "single", currentStepIndex: 1, totalSteps: 4 } },
+    { isPartial: true },
+    theme,
+    context,
+  );
+  assert.equal(step.render(80), "");
+  assert.equal(context.state.subagentsStatus, "loading");
+  assert.equal(context.state.subagentsSummary, "step 2/4");
+  assert.equal(norm(r.renderCall({ workflow: true }, theme, context).render(80)[0]), "<dim>⠋</dim> <toolTitle><bold>subagent</bold></toolTitle> <accent>workflow</accent><dim> · step 2/4</dim>");
+
+  // 无步骤信息时回退 progress 数组：running 已完成/总数
+  r.renderResult(
+    { content: [], details: { progress: [{ status: "done" }, { status: "running" }, { status: "failed" }] } },
+    { isPartial: true },
+    theme,
+    context,
+  );
+  assert.equal(context.state.subagentsSummary, "running 2/3");
+  // 两者皆无时仅显示 spinner
+  r.renderResult({ content: [], details: {} }, { isPartial: true }, theme, context);
+  assert.equal(context.state.subagentsSummary, undefined);
+
+  clearAllStatusAnimations();
+});
+
+test("subagents: success 折叠态返回空结果并以 · summary 收尾", () => {
+  const { resolver, theme } = createSubagentsHarness();
+  const r = resolver("subagent", () => undefined);
+  const run = (result) => {
+    const context = { state: {}, expanded: false };
+    const out = r.renderResult(result, {}, theme, context);
+    assert.equal(out.render(80), "", "折叠态成功结果应为空");
+    assert.equal(context.state.subagentsStatus, "success");
+    return norm(r.renderCall({ agent: "reviewer" }, theme, context).render(80)[0]);
+  };
+  const title = "<success>✓</success> <toolTitle><bold>subagent</bold></toolTitle> <accent>reviewer</accent>";
+
+  // 异步启动态
+  assert.equal(run({ content: [{ type: "text", text: "launched" }], details: { mode: "async", id: "abc" } }), `${title}<dim> · launched #abc</dim>`);
+  assert.equal(run({ content: [{ type: "text", text: "queued" }], details: { async: true } }), `${title}<dim> · launched</dim>`);
+  // 多结果：未失败项/总数
+  assert.equal(
+    run({ content: [{ type: "text", text: "a\nb\nc" }], details: { results: [{ status: "done" }, { status: "failed" }, { status: "done" }] } }),
+    `${title}<dim> · 2/3 done</dim>`,
+  );
+  // 单结果/无结果：非空文本行数，0 行时 done
+  assert.equal(run({ content: [{ type: "text", text: "a\n\n  \nb" }] }), `${title}<dim> · 2 lines</dim>`);
+  assert.equal(run({ content: [] }), `${title}<dim> · done</dim>`);
+});
+
+test("subagents: expanded 展开态隐藏摘要并以 createExpandedToolText 输出全文", () => {
+  const { resolver, theme, Text } = createSubagentsHarness();
+  const r = resolver("subagent", () => ({ renderResult: () => "native" }));
+  const context = { state: {}, expanded: true };
+  const result = {
+    content: [
+      { type: "text", text: "line 1\nline 2" },
+      { type: "image", data: "abc" },
+      { type: "text", text: "tail", extra: 1 },
+    ],
+  };
+  const out = r.renderResult(result, { expanded: true }, theme, context);
+  assert.ok(out instanceof Text, "展开态应返回 Text 组件");
+  assert.equal(context.state.subagentsStatus, "success");
+  assert.equal(context.state.subagentsSummary, undefined);
+  assert.equal(out.render(80), "  <toolOutput>line 1\n  line 2\n  {\n    \"type\": \"image\",\n    \"data\": \"abc\"\n  }\n  tail\n  contentBlock:\n  {\n    \"type\": \"text\",\n    \"text\": \"tail\",\n    \"extra\": 1\n  }</toolOutput>");
+  assert.equal(r.renderCall({ agent: "reviewer" }, theme, context).render(80)[0], "<success>✓</success> <toolTitle><bold>subagent</bold></toolTitle> <accent>reviewer</accent>");
+
+  // 正文为空但 details.results 非空：格式化简明结果文本
+  const text = formatResultsText([{ agent: "a", status: "done", text: "ok\nnext" }, { agent: "b", status: "failed", error: "boom" }]);
+  assert.equal(text, "[1] a (done)\n    ok\n    next\n[2] b (failed)\n    boom");
+  const fromDetails = r.renderResult({ content: [], details: { results: [{ agent: "a", status: "done" }] } }, { expanded: true }, theme, { state: {}, expanded: true });
+  assert.equal(stripAnsi(fromDetails.render(80)), "  [1] a (done)");
+  // 完全无正文：done 占位
+  assert.equal(stripAnsi(r.renderResult({ content: [] }, { expanded: true }, theme, { state: {}, expanded: true }).render(80)), "   └ done");
+});
+
+test("subagents: failure 折叠态显示 ✗ 与红色错误行，展开态输出红色全文", () => {
+  const { resolver, theme } = createSubagentsHarness();
+  const r = resolver("subagent", () => undefined);
+
+  const collapsed = { state: { subagentsSummary: "stale" }, expanded: false };
+  const failed = r.renderResult({ content: [{ type: "text", text: "Error: boom\nmore" }], isError: true }, {}, theme, collapsed);
+  assert.equal(collapsed.state.subagentsStatus, "failure");
+  assert.equal(collapsed.state.subagentsSummary, undefined);
+  assert.deepEqual(failed.render(80), ["<error>Error: boom</error>"]);
+  assert.deepEqual(failed.render(10).map(stripAnsi), ["Error: bo…"]);
+  assert.equal(r.renderCall({ agent: "reviewer" }, theme, collapsed).render(80)[0], "<error>✗</error> <toolTitle><bold>subagent</bold></toolTitle> <accent>reviewer</accent>");
+
+  const expanded = { state: {}, expanded: true };
+  const out = r.renderResult({ content: [{ type: "text", text: "Error: boom\nmore" }], isError: true }, { expanded: true }, theme, expanded);
+  assert.equal(expanded.state.subagentsStatus, "failure");
+  assert.equal(out.render(80), "  <error>Error: boom\n  more</error>");
+  // 失败且无正文
+  const empty = r.renderResult({ content: [], isError: true }, { expanded: true }, theme, { state: {}, expanded: true });
+  assert.equal(stripAnsi(empty.render(80)), "   └ 失败");
+  // context.isError 同样视为失败
+  assert.deepEqual(r.renderResult({ content: [] }, {}, theme, { state: {}, isError: true }).render(80), ["<error>工具执行失败（未提供错误信息）</error>"]);
+});
+
+function createSubagentsHarness() {
+  class Text {
+    constructor(content, paddingX = 0, _paddingY = 0) {
+      this.content = content;
+      this.paddingX = paddingX;
+    }
+    render(width) {
+      return String(this.content).split("\n").map((line) => `${" ".repeat(this.paddingX)}${truncate(line, width)}`).join("\n");
+    }
+  }
+  const truncate = (text, width) => {
+    const visible = stripAnsi(text);
+    return visible.length > width ? `${text.slice(0, Math.max(0, width - 1))}…` : text;
+  }
+  // 简化的宽度裁剪：标签零宽，按可见字符数截断并补齐未闭合标签
+  const truncateToWidth = (text, width, ellipsis = "…") => {
+    const visible = stripAnsi(text);
+    if (visible.length <= width) return text;
+    if (width <= 0) return "";
+    const keep = width - stripAnsi(ellipsis).length;
+    let out = "";
+    let count = 0;
+    const open = [];
+    for (const token of String(text).match(/<\/?[a-zA-Z]+>|[\s\S]+?(?=<|$)/g) ?? []) {
+      const tag = /^<(\/?)([a-zA-Z]+)>$/.exec(token);
+      if (tag) {
+        if (tag[1]) open.pop(); else open.push(tag[2]);
+        out += token;
+        continue;
+      }
+      for (const ch of token) {
+        if (count >= keep) break;
+        out += ch;
+        count += 1;
+      }
+    }
+    return `${out}${ellipsis}${open.reverse().map((t) => `</${t}>`).join("")}`;
+  };
+  const theme = {
+    fg: (color, text) => `<${color}>${text}</${color}>`,
+    bold: (text) => `<bold>${text}</bold>`,
+  };
+  const resolver = createSubagentsRenderer({ Text, visibleWidth: (text) => stripAnsi(text).length, truncateToWidth });
+  const renderCall = (name, args, width) => resolver(name, () => undefined).renderCall(args, theme, { state: {} }).render(width);
+  return { resolver, theme, Text, renderCall, context: () => ({ state: {}, expanded: false }) };
+}
+
+function stripAnsi(text) {
+  return String(text).replace(/<\/?[a-zA-Z]+>/g, "");
+}
+
 test("security-gates: nested sh -c exceeding depth limit is blocked and non-string sensitive path fails closed", () => {
   const cwd = process.cwd();
   let nested = "echo ok";
@@ -459,33 +683,6 @@ test("endpoint-fallback: defaultProbe cancels response body after checking statu
   } finally {
     globalThis.fetch = originalFetch;
   }
-});
-
-test("openai-proxy: re-applying proxy config updates delegate target and closes previous ProxyAgent", async () => {
-  const target = { fetch: () => "direct" };
-  const closed = [];
-  const routed = [];
-  const createProxyFetch = async (proxyUrl) => {
-    const fn = (url) => {
-      routed.push([proxyUrl, url]);
-      return `via:${proxyUrl}`;
-    };
-    fn.close = async () => { closed.push(proxyUrl); };
-    return fn;
-  };
-
-  await ensureScopedProxyFetch("http://127.0.0.1:8001", { createProxyFetch, target });
-  assert.equal(target.fetch("https://auth.openai.com/token"), "via:http://127.0.0.1:8001");
-  assert.deepEqual(closed, []);
-
-  await ensureScopedProxyFetch("http://127.0.0.1:8002", { createProxyFetch, target });
-  assert.deepEqual(closed, ["http://127.0.0.1:8001"], "切换代理时应关闭旧 ProxyAgent");
-  assert.equal(target.fetch("https://chatgpt.com/backend-api/codex"), "via:http://127.0.0.1:8002");
-  assert.equal(target.fetch("https://example.com/other"), "direct");
-  assert.deepEqual(routed, [
-    ["http://127.0.0.1:8001", "https://auth.openai.com/token"],
-    ["http://127.0.0.1:8002", "https://chatgpt.com/backend-api/codex"],
-  ]);
 });
 
 test("bash-cwd: createCachedBashOptions caches lookup per (cwd, projectTrusted)", async () => {
@@ -527,4 +724,186 @@ test("bash-cwd: createCachedBashOptions caches lookup per (cwd, projectTrusted)"
   await tool.execute("1", { command: "pwd" }, undefined, undefined, ctxA);
   await tool.execute("2", { command: "ls" }, undefined, undefined, ctxA);
   assert.equal(toolCalls, 1, "bash-cwd 工具连续执行应复用缓存配置");
+});
+
+// ---- cliproxyapi（懒加载；完全隔离在临时目录 + 空闲端口，绝不触碰真实 ~/.qwen 或 8317） ----
+
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.once("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+function writeFakeManager(root) {
+  // 假 manager.py：只记录被调用的参数；FAKE_EXIT 非零时以该码退出模拟启动失败
+  const manager = join(root, "fake-manager.py");
+  writeFileSync(manager, [
+    "import os, sys",
+    'with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as f: f.write(" ".join(sys.argv[1:]) + "\\n")',
+    'sys.exit(int(os.environ.get("FAKE_EXIT", "0")))',
+    "",
+  ].join("\n"));
+  return manager;
+}
+
+async function makeCliproxyapiFixture(overrides = {}) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "cliproxyapi-test-")));
+  const stateDir = join(root, "state");
+  mkdirSync(stateDir);
+  const port = await freePort();
+  const log = join(root, "manager.log");
+  const managerPy = writeFakeManager(root);
+  const opts = resolveCliproxyapiOptions({ HOME: root, FAKE_LOG: log, CLIPROXYAPI_STATE_DIR: stateDir, CLIPROXYAPI_API_PORT: String(port) }, import.meta.url, {
+    managerPy,
+    connectTimeoutMs: 200,
+    startTimeoutMs: 12_000,
+    ...overrides,
+  });
+  return { root, stateDir, port, log, opts, calls: () => (existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean) : []), cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+function listenOnce(port) {
+  return new Promise((resolve) => {
+    const srv = createServer();
+    srv.listen(port, "127.0.0.1", () => resolve(() => new Promise((r) => srv.close(() => r()))));
+  });
+}
+
+test("cliproxyapi: resolveCliproxyapiOptions 读取 CLIPROXYAPI_STATE_DIR / 端口优先级与 manager.py 相对路径", () => {
+  const env = { CLIPROXYAPI_STATE_DIR: "/tmp/x", CODEX_PROXY_API_PORT: "9000" };
+  const o = resolveCliproxyapiOptions(env, "file:///repo/pi/extensions/cliproxyapi/cliproxyapi.ts");
+  assert.equal(o.stateDir, "/tmp/x");
+  assert.equal(o.port, 9000, "旧名 CODEX_PROXY_API_PORT 仍兼容");
+  assert.equal(o.managerPy, "/repo/qwen/extensions/cliproxyapi/scripts/manager.py");
+  assert.equal(resolveCliproxyapiOptions({ CLIPROXYAPI_API_PORT: "9001", CODEX_PROXY_API_PORT: "9002" }, "file:///x/y.ts").port, 9001, "新名优先");
+  assert.equal(resolveCliproxyapiOptions({}, "file:///x/y.ts").port, 8317, "默认 8317");
+  assert.equal(resolveCliproxyapiOptions({ CLIPROXYAPI_API_PORT: "abc" }, "file:///x/y.ts").port, 8317, "非法端口回退默认");
+});
+
+test("cliproxyapi: hasCredentials 仅看 auth/*.json 文件名，目录缺失或无 json 均为 false", () => {
+  const root = mkdtempSync(join(tmpdir(), "cliproxyapi-cred-"));
+  try {
+    assert.equal(hasCredentials(join(root, "missing")), false);
+    mkdirSync(join(root, "auth"));
+    assert.equal(hasCredentials(root), false);
+    writeFileSync(join(root, "auth", "kv.db"), "");
+    writeFileSync(join(root, "auth", "note.txt"), "{}");
+    assert.equal(hasCredentials(root), false, "非 .json 运行态文件不算凭据");
+    writeFileSync(join(root, "auth", "codex.json"), "");
+    assert.equal(hasCredentials(root), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cliproxyapi: portListening 对空闲端口短超时返回 false，对监听端口返回 true", async () => {
+  const port = await freePort();
+  const t0 = Date.now();
+  assert.equal(await portListening(port, 200), false);
+  assert.ok(Date.now() - t0 < 2000, "空闲端口探测应快速返回");
+  const close = await listenOnce(port);
+  try {
+    assert.equal(await portListening(port, 200), true);
+  } finally {
+    await close();
+  }
+});
+
+test("cliproxyapi: 无凭据时静默跳过，不探测端口也不调用 manager", async () => {
+  const f = await makeCliproxyapiFixture();
+  try {
+    assert.equal(hasCredentials(f.stateDir), false);
+    await createLazyProxyController(f.opts).ensure();
+    assert.deepEqual(f.calls(), []);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("cliproxyapi: 端口已监听时零 Python 开销直接返回", async () => {
+  const f = await makeCliproxyapiFixture();
+  try {
+    mkdirSync(join(f.stateDir, "auth"));
+    writeFileSync(join(f.stateDir, "auth", "cred.json"), "{}");
+    const close = await listenOnce(f.port);
+    try {
+      await createLazyProxyController(f.opts).ensure();
+      assert.deepEqual(f.calls(), [], "端口已监听不得调用 manager.py");
+    } finally {
+      await close();
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("cliproxyapi: 端口未监听触发 manager start，并发 ensure 合并为单次 in-flight", async () => {
+  const f = await makeCliproxyapiFixture();
+  try {
+    mkdirSync(join(f.stateDir, "auth"));
+    writeFileSync(join(f.stateDir, "auth", "cred.json"), "{}");
+    const controller = createLazyProxyController(f.opts);
+    const first = controller.ensure();
+    assert.equal(controller.inflight(), first, "进行中的拉起应暴露为 in-flight");
+    const results = await Promise.all([first, controller.ensure(), controller.ensure(), controller.ensure()]);
+    assert.deepEqual(results, [undefined, undefined, undefined, undefined]);
+    assert.equal(controller.inflight(), undefined, "结束后 in-flight 应清空");
+    assert.deepEqual(f.calls(), ["start"], "并发调用只应拉起一次");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("cliproxyapi: manager 失败（非零退出 / 无法启动 python）不抛异常", async () => {
+  const f = await makeCliproxyapiFixture();
+  try {
+    mkdirSync(join(f.stateDir, "auth"));
+    writeFileSync(join(f.stateDir, "auth", "cred.json"), "{}");
+    f.opts.env.FAKE_EXIT = "3";
+    await createLazyProxyController(f.opts).ensure();
+    assert.deepEqual(f.calls(), ["start"], "失败的一次调用仍被记录，且 ensure 正常 resolve");
+  } finally {
+    f.cleanup();
+  }
+  const broken = await makeCliproxyapiFixture();
+  try {
+    mkdirSync(join(broken.stateDir, "auth"));
+    writeFileSync(join(broken.stateDir, "auth", "cred.json"), "{}");
+    broken.opts.python = join(broken.root, "definitely-missing-python");
+    await createLazyProxyController(broken.opts).ensure();
+    assert.deepEqual(broken.calls(), [], "python 不存在时 spawn 失败应被吞掉");
+  } finally {
+    broken.cleanup();
+  }
+});
+
+test("cliproxyapi: 扩展加载即后台懒加载，before_agent_start 等待 in-flight 且停止后可按需重拉，不注册退出回收", async () => {
+  const f = await makeCliproxyapiFixture();
+  try {
+    mkdirSync(join(f.stateDir, "auth"));
+    writeFileSync(join(f.stateDir, "auth", "cred.json"), "{}");
+
+    const handlers = new Map();
+    const pi = { on: (event, handler) => handlers.set(event, handler) };
+    const controller = createCliproxyapiExtension(pi, f.opts);
+    assert.ok(controller.inflight(), "扩展加载应立即在后台触发一次懒加载");
+    assert.equal(typeof handlers.get("before_agent_start"), "function");
+    assert.deepEqual([...handlers.keys()].filter((e) => /shutdown|end|exit/.test(e)), [], "不得注册退出回收");
+
+    // 初始化触发的拉起仍在进行：before_agent_start 等待其完成而不再重复拉起
+    await handlers.get("before_agent_start")({}, {});
+    assert.equal(controller.inflight(), undefined);
+    assert.deepEqual(f.calls(), ["start"]);
+
+    // 模拟代理被手动停止（端口未监听）：下一次 agent 启动按需重拉
+    await handlers.get("before_agent_start")({}, {});
+    assert.deepEqual(f.calls(), ["start", "start"]);
+  } finally {
+    f.cleanup();
+  }
 });

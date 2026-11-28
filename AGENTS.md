@@ -2,7 +2,7 @@
 
 ## 目录与指令归属
 
-- Qwen Code 专属配置放在 `qwen/`，包括设置模板、shell 包装、agent 定义和原生扩展；AGY 专属配置放在 `agy/`（设置模板 `agy/settings.json`、shell 包装 `agy/shell.zsh`、全局规则 `agy/rules/`、subagent 定义 `agy/agents/` 与生命周期 hook `agy/hooks/`；设置模板同样只放跨机通用偏好，不写入本机状态或凭据，自定义 subagent 通过 frontmatter 绑定抽象档位，受管 hooks 通过 `hooks.json` 按名幂等注入）；Pi 专属配置放在 `pi/`（设置模板 `pi/settings.json`、快捷键 `pi/keybindings.json`、shell 包装 `pi/shell.zsh` + `pi/launcher.zsh`、子进程工具 `pi/bin/`、预检脚本 `pi/scripts/` 与扩展 `pi/extensions/`）。跨运行时的插件、跨项目独立技能和通用远程终端分别放在根目录的 `plugins/`、`skills/` 和 `remote-terminal/`（由 `init-remote.sh` 独立初始化，运行时状态与凭据保存在本机 `~/.harness-remote/`，不入库）；仅在本仓维护配置时使用的项目级技能放在 `.agents/skills/`（如 `pi-manage-provider`、`pi-docs`；其中 `pi-docs` 指向本机 Pi 包的文档软链由 `init-pi.sh` 按本机路径自动创建并纳入 `.gitignore`，不入库）。
+- Qwen Code 专属配置放在 `qwen/`，包括设置模板、shell 包装、agent 定义和原生扩展；AGY 专属配置放在 `agy/`（设置模板 `agy/settings.json`、shell 包装 `agy/shell.zsh`、全局规则 `agy/rules/`、subagent 定义 `agy/agents/` 与生命周期 hook `agy/hooks/`；设置模板同样只放跨机通用偏好，不写入本机状态或凭据，自定义 subagent 通过 frontmatter 绑定抽象档位，受管 hooks 通过 `hooks.json` 按名幂等注入）；Pi 专属配置放在 `pi/`（设置模板 `pi/settings.json`、快捷键 `pi/keybindings.json`、shell 包装 `pi/shell.zsh` + `pi/launcher.zsh`、仅交互式 Pi 经 `launcher.zsh` 以 `-e` 注入的锁版包清单 `pi/interactive-packages.json`（如 `pi-subagents`；不写入 `settings.json`，`pi-worker` 与非交互 `bypass` 模式不加载；`pi-worker` 子进程以 `--no-extensions` 严格白名单仅注入内置 `mcp`/`codemode`/`tool-search`、锁版 `pi-dcp` 与仓内非交互扩展，并以 `--no-context-files` 排除 `pi/GLOBAL.md`、仅注入目标项目自身的 `AGENTS.md`/`CLAUDE.md`）、子进程工具 `pi/bin/`、预检脚本 `pi/scripts/` 与扩展 `pi/extensions/`）。跨运行时的插件、跨项目独立技能和通用远程终端分别放在根目录的 `plugins/`、`skills/` 和 `remote-terminal/`（由 `init-remote.sh` 独立初始化，运行时状态与凭据保存在本机 `~/.harness-remote/`，不入库）；仅在本仓维护配置时使用的项目级技能放在 `.agents/skills/`（如 `pi-manage-provider`、`pi-docs`、`cliproxyapi-manage-models`；其中 `pi-docs` 指向本机 Pi 包的文档软链由 `init-pi.sh` 按本机路径自动创建并纳入 `.gitignore`，不入库）。
 - Pi 扩展遵循严格命名约定：每个扩展位于 `pi/extensions/<name>/`，入口文件必须与扩展名一致，命名为 `pi/extensions/<name>/<name>.ts`；扩展的私有辅助模块放在同一扩展目录内，不在 `pi/extensions/` 下放置无同名入口的独立目录。`pi/settings.json` 同样只放跨机通用偏好与锁版的社区 `npm:` / `git:` 包，不写入本机模型、认证、本地路径 packages、代理或运行时状态；`init-pi.sh` 合并模板（对 `packages` 与 `defaultTools` 增量合并、同包名/同仓库按模板版本原地更新）并按序注入仓内扩展与 `skills/` 绝对路径，保留本机已有非受管扩展、本地 packages、skills 与配置。
 - 本仓规则写在根目录 `AGENTS.md`；跨项目的个人偏好按运行时分别维护在 `qwen/QWEN.md`（由 `init-qwen.sh` 软链接到 `~/.qwen/QWEN.md`）、`agy/rules/harness-config.md`（由 `init-agy.sh` 逐文件软链接到 `~/.gemini/config/rules/`）和 `pi/GLOBAL.md`（由 `init-pi.sh` 软链接到 `~/.pi/agent/AGENTS.md`）；AGY 与 Pi 侧仓内源文件均不命名为 `AGENTS.md` 以免被目录扫描误加载，不用复制文件或通过 `context.includeDirectories` 扩大加载范围。
 - 支撑跨机器偏好的 shell 逻辑应留在仓内（例如 `qwen/shell.zsh`）；用户的 shell 配置只由初始化脚本幂等注册加载入口，不内联实现。
@@ -21,7 +21,7 @@
 - 插件凭据放在仓内对应插件约定的位置，并纳入 `.gitignore`；只提交不含真实凭据的示例，不把凭据放到 `~/.pi` 再做兼容链接。这与模型通道凭据留在本机 Qwen Code 配置是两回事。
 - ComfyUI 与 home-connect 保持同一个插件，共用连接层，但各自提供独立的 skill 和 MCP server 入口；不要把两组工具合并进同一个 `server.ts`。
 - 更新从 superpowers 改编的 skills 时，核对最新上游发布版，不以本机旧缓存为准。保留版本来源和许可证说明，移除对未随仓库分发的上游 skills 的依赖，保证改编版可以独立使用。
-- `codex-proxy` 保持为本机 Qwen 扩展：会话 hooks 由 `init-qwen.sh` 按名称幂等管理，不影响其他 hooks。代理只监听回环地址；多个 Qwen 会话可共用，最后一个会话退出后才停止。未安装或未登录不应阻塞 Qwen 会话。
+- `cliproxyapi`（原名 `codex-proxy`，由 `init-qwen.sh` 幂等迁移旧 hooks、旧软链与 `~/.qwen/codex-proxy` 状态目录）为 Qwen Code 与 Pi 共享的懒加载代理：Qwen 侧 `SessionStart` hook 由 `init-qwen.sh` 按名称幂等管理（并清理旧的 `SessionEnd` 回收 hook），Pi 侧由 `pi/extensions/cliproxyapi` 扩展在加载与 `before_agent_start` 时按需拉起；两端共用 `qwen/extensions/cliproxyapi/scripts/manager.py` 与 `~/.qwen/cliproxyapi` 状态目录，代理只监听回环地址，**退出不自动回收**，需停止时手动 `manager.py stop`。未安装或未登录不应阻塞任何会话。
 
 ## Git 命令
 

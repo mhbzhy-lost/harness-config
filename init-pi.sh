@@ -7,7 +7,7 @@
 #   5. pi/shell.zsh 注册 source 进 ~/.zshrc（标记块，幂等；接入 session-owner launcher）
 #   6. 探测本机 @earendil-works/pi-coding-agent 包路径，软链接 docs/examples/schemas/README.md 到 .agents/skills/pi-docs/
 #   7. 复制 pi/bin/apply_patch 到 ~/.pi/agent/bin/apply_patch（fd/rg 由 Pi 原生管理）
-# 模型/提供商/认证/密钥与 openai-proxy.json 均为 per-machine 配置，不在同步范围。
+# 模型/提供商/认证/密钥均为 per-machine 配置，不在同步范围。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -76,21 +76,27 @@ from datetime import datetime
 template_path, target_path, extensions_dir, skills_dir = sys.argv[1:5]
 dry_run = os.environ.get("PI_SYNC_DRY_RUN") == "1"
 
-# 受管扩展加载顺序：ask-user-question / dcp 位于 compact-tools 之前，确保自定义渲染器优先于通用兜底。
+# 受管扩展加载顺序：ask-user-question / dcp / subagents 位于 compact-tools 之前，确保自定义渲染器优先于通用兜底。
 MANAGED_EXTENSIONS = [
     "agent-plugins",
+    "cliproxyapi",
     "ask-user-question",
     "dcp",
+    "subagents",
     "compact-tools",
     "bash-cwd",
     "bash-async",
     "endpoint-fallback",
     "network-recovery",
-    "openai-proxy",
     "security-gates",
     "session-owner",
     "tool-timing",
     "tui-lite",
+]
+
+# 已退役的受管扩展：仓内不再提供，重跑脚本时按路径后缀从本机 settings 中剔除，保留其余非受管条目
+RETIRED_EXTENSIONS = [
+    "openai-proxy",
 ]
 
 managed_entries = []
@@ -101,6 +107,7 @@ for name in MANAGED_EXTENSIONS:
         sys.exit(f"错误: 缺少受管扩展入口文件（须与扩展名一致）: {entry}")
     managed_entries.append(entry)
     managed_suffixes.append(f"/pi/extensions/{name}/{name}.ts")
+retired_suffixes = [f"/pi/extensions/{name}/{name}.ts" for name in RETIRED_EXTENSIONS]
 
 with open(template_path, encoding="utf-8") as f:
     template = json.load(f)
@@ -223,7 +230,9 @@ def is_managed_ext(item):
     if not isinstance(item, str):
         return False
     normalized = item.replace("\\", "/")
-    return normalized in managed_entries or any(normalized.endswith(s) for s in managed_suffixes)
+    return (normalized in managed_entries
+            or any(normalized.endswith(s) for s in managed_suffixes)
+            or any(normalized.endswith(s) for s in retired_suffixes))
 
 preserved = [item for item in existing_exts if not is_managed_ext(item)]
 merged["extensions"] = preserved + managed_entries
@@ -493,11 +502,6 @@ else
   chmod 0755 "$tmp_bin"
   mv -f "$tmp_bin" "$APPLY_PATCH_TARGET"
   echo "Pi 工具 apply_patch：已复制到 $APPLY_PATCH_TARGET"
-fi
-
-# --- 8. 本机可选配置提示 ---
-if [[ "$DRY_RUN" != 1 && ! -f "$AGENT_DIR/openai-proxy.json" ]]; then
-  echo "提示: 如需仅对 OpenAI/Codex 走局部代理，可复制 pi/openai-proxy.example.json 到 $AGENT_DIR/openai-proxy.json 并修改代理地址"
 fi
 
 if [[ "$DRY_RUN" == 1 ]]; then

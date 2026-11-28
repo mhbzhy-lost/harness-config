@@ -25,6 +25,34 @@ real_bin=${real_bin:A}
 node_heap_mb=""
 heap_diagnostic_dir=""
 
+# 交互式会话专属的锁版包清单（如 pi-subagents）：不写入 settings.json，因此 pi-worker 与 bypass 模式不会加载
+interactive_manifest="$pi_root/interactive-packages.json"
+interactive_manifest_check='const fs = require("node:fs");
+const file = process.env.PI_INTERACTIVE_MANIFEST;
+let data;
+try { data = JSON.parse(fs.readFileSync(file, "utf8")); }
+catch (error) { process.stderr.write(`错误: ${file} 不是合法 JSON: ${error.message}\n`); process.exit(1); }
+if (data === null || typeof data !== "object" || Array.isArray(data) || !Array.isArray(data.packages)
+    || !data.packages.every((pkg) => typeof pkg === "string" && pkg.trim().length > 0)) {
+  process.stderr.write(`错误: ${file} 的 packages 必须是非空字符串组成的数组\n`);
+  process.exit(1);
+}
+process.stdout.write(data.packages.join("\0"));'
+
+# 读取 interactive-packages.json 的 packages 字符串数组到 interactive_pkgs（以 NUL 分隔，防止含空格的参数被错误切分）；文件不存在时静默跳过
+_load_interactive_packages() {
+  interactive_pkgs=()
+  [[ -f "$interactive_manifest" ]] || return 0
+  local stream=""
+  if ! stream=$(PI_INTERACTIVE_MANIFEST="$interactive_manifest" "$node_bin" -e "$interactive_manifest_check"); then
+    print -u2 -- "错误: 无法加载 $interactive_manifest"
+    return 1
+  fi
+  [[ -n "$stream" ]] || return 0
+  interactive_pkgs=("${(@0)stream}")
+  (( ${#interactive_pkgs} > 0 )) || return 1
+}
+
 _exec_pi() {
   local -a heap_flags=()
   if [[ -n "${node_heap_mb:-}" && -n "${heap_diagnostic_dir:-}" ]]; then
@@ -140,5 +168,11 @@ else
   node_heap_mb=""
 fi
 
+_load_interactive_packages
+interactive_flags=()
+for pkg in "${interactive_pkgs[@]}"; do
+  interactive_flags+=(-e "$pkg")
+done
+
 cleanup; trap - EXIT HUP INT TERM
-_exec_pi -e "$pi_root/extensions/session-owner/session-owner.ts" "${args[@]}"
+_exec_pi -e "$pi_root/extensions/session-owner/session-owner.ts" "${interactive_flags[@]}" "${args[@]}"

@@ -6,14 +6,15 @@ Qwen Code / Pi / Antigravity（AGY）个人配置与插件的多机同步仓库�
 
 | 路径 | 说明 |
 |---|---|
-| `init-qwen.sh` | Qwen 同步脚本：合并设置 + 注入 HARNESS_CONFIG_ROOT + 链接插件 + 注册 shell 片段 + 链接全局 QWEN.md + 链接 agent 定义 + 注入 codex-proxy 生命周期 hooks、清理 comfyui-draw 旧版 classic hooks（已迁 Mods） |
+| `init-qwen.sh` | Qwen 同步脚本：合并设置 + 注入 HARNESS_CONFIG_ROOT + 链接插件 + 注册 shell 片段 + 链接全局 QWEN.md + 链接 agent 定义 + 注入 cliproxyapi 懒加载 SessionStart hook（清理旧版 SessionEnd 回收 hook）、清理 comfyui-draw 旧版 classic hooks（已迁 Mods）与旧版 codex-proxy hooks、迁移旧 codex-proxy 状态目录 |
 | `init-pi.sh` | 同步到 Pi：合并 `pi/settings.json` 并按序注入 `pi/extensions/*` 与 `skills/` 到 `~/.pi/agent/settings.json` + 链接 `pi/keybindings.json` + 链接 `pi/GLOBAL.md` 到 `~/.pi/agent/AGENTS.md` + 复制 `pi/bin/apply_patch` 到 `~/.pi/agent/bin/` + 链接跨运行时插件到 `~/.agents/plugins` + 注册 `pi/shell.zsh` 到 `~/.zshrc` + 自动软链本机 Pi 包文档到 `.agents/skills/pi-docs/` |
 | `pi/settings.json` | Pi 跨机通用设置模板（`hideThinkingBlock`、`cacheWarming`、`defaultTools` 与锁版社区包 `npm:@arhen/pi-core-ask@1.1.0` / `git:github.com/mhbzhy-lost/pi-dcp@v1.0.1`），深度合并进 `~/.pi/agent/settings.json`（保留本机模型、本地 packages 与非受管扩展） |
 | `pi/GLOBAL.md` | Pi 全局指令（Commit 规范、Pi bin 工具与 `bash_async` 约定），软链接为 `~/.pi/agent/AGENTS.md`（仓内不命名为 `AGENTS.md` 避免目录扫描误加载） |
 | `pi/keybindings.json` | Pi 快捷键配置（`alt+p` / `shift+alt+p` 切换模型），软链接为 `~/.pi/agent/keybindings.json` |
 | `pi/bin/` | Pi 辅助工具 `apply_patch`（由 `init-pi.sh` 复制到 `~/.pi/agent/bin/apply_patch`，与 Pi 原生管理的 `fd` / `rg` 一同自动进入 Pi bash 子进程 `PATH`） |
-| `pi/extensions/` | Pi 专属扩展（每个扩展 `<name>/<name>.ts`）：`agent-plugins`（Agent Plugins 1.0.0 加载 `~/.agents/plugins/`）、`ask-user-question`、`dcp`、`compact-tools`、`bash-cwd`、`bash-async`、`endpoint-fallback`、`network-recovery`、`openai-proxy`、`security-gates`、`session-owner`、`tool-timing`、`tui-lite` |
+| `pi/extensions/` | Pi 专属扩展（每个扩展 `<name>/<name>.ts`）：`agent-plugins`（Agent Plugins 1.0.0 加载 `~/.agents/plugins/`）、`ask-user-question`、`dcp`、`subagents`（pi-subagents 工具渲染器）、`compact-tools`、`bash-cwd`、`bash-async`、`endpoint-fallback`、`network-recovery`、`cliproxyapi`（懒加载 CLIProxyAPI 代理，与 Qwen 共用）、`security-gates`、`session-owner`、`tool-timing`、`tui-lite` |
 | `pi/shell.zsh` + `pi/launcher.zsh` | Pi shell 包装与 `session-owner` 启动预检器（`pi/scripts/pi-session-owner.ts`），防止多窗口 `pi -c` 写坏同一会话 |
+| `pi/interactive-packages.json` | 仅交互式 Pi 的锁版包清单（如 `npm:pi-subagents@0.90.0`），由 `launcher.zsh` 在 `pass`/`pin-session` 分支以 `-e <pkg>` 注入；不写入 `pi/settings.json`，因此 `pi-worker` 子代理与非交互 `bypass` 模式不加载 |
 | `init-agy.sh` | 同步到 Antigravity（AGY）：合并 `agy/settings.json` + 链接插件到 `~/.gemini/config/plugins` + 注册 `skills/` 到 `skills.json` + 链接 `agy/rules/*.md` 到全局 rules + 链接 `agy/agents/*.md` 到全局 agents + 注入 `agy/hooks/` 到 `hooks.json` |
 | `init-remote.sh` | 初始化通用远程终端 `remote-terminal/`（按需安装 `node-pty`/`xterm`/`ws`、检查 `tmux`、注册 `rt`/`rtctl` 包装进 `~/.zshrc`） |
 | `remote-terminal/` | 通用 tmux Web 终端与公网中继客户端（兼容 ECS `pi-relay-server` v2 协议，支持承载 `pi`/`qwen`/`agy`/普通 shell 等任意会话；状态保存在 `~/.harness-remote/`） |
@@ -26,17 +27,17 @@ Qwen Code / Pi / Antigravity（AGY）个人配置与插件的多机同步仓库�
 | `qwen/shell.zsh` | qwen shell 包装：主题随系统明暗（macOS light→Xcode / dark→Qwen Dark） |
 | `qwen/QWEN.md` | 全局指令与子代理路由表，软链接为 `~/.qwen/QWEN.md`（对所有项目生效） |
 | `qwen/agents/` | subagent 定义（test-runner 只读验证与失败日志压缩，frontmatter 声明 `model: fast`；review-agent 重模型覆盖；antigravity 外部执行器委托 `agy acp`），逐文件软链接进 `~/.qwen/agents/` |
-| `qwen/extensions/` | 原生 Qwen extension（codex-proxy：/codex-login、/codex-status + 生命周期脚本；comfyui-draw：`/draw` 生图命令，基于 Mods `hooks/register.js` 实现，需开启 `experimental.mods`），软链接进 `~/.qwen/extensions/` |
+| `qwen/extensions/` | 原生 Qwen extension（cliproxyapi：/cliproxyapi-login、/cliproxyapi-status + 生命周期脚本，CLIProxyAPI 多渠道 OAuth 桥接；comfyui-draw：`/draw` 生图命令，基于 Mods `hooks/register.js` 实现，需开启 `experimental.mods`），软链接进 `~/.qwen/extensions/` |
 | `skills/` | 跨项目独立 skill（superpowers 改写版：`writing-skills` / `writing-plans`），分别注入 Qwen `skills.directories`、AGY `skills.json` 与 Pi `skills` 加载 |
-| `.agents/skills/` | 仅在本仓加载的项目级 skill：`pi-manage-provider`（安全管理 `~/.pi/agent/models.json` 与 `/dev/tty` 凭据录入）、`pi-docs`（Pi 官方文档索引，本机 `docs`/`examples`/`schemas`/`README.md` 软链由 `init-pi.sh` 自动生成且 gitignore） |
+| `.agents/skills/` | 仅在本仓加载的项目级 skill：`pi-manage-provider`（安全管理 `~/.pi/agent/models.json` 与 `/dev/tty` 凭据录入）、`pi-docs`（Pi 官方文档索引，本机 `docs`/`examples`/`schemas`/`README.md` 软链由 `init-pi.sh` 自动生成且 gitignore）、`cliproxyapi-manage-models`（为走 CLIProxyAPI 的服务编写 Qwen Code 与 Pi 模型定义） |
 | `plugins/` | Agent Plugins v1 插件：deepseek-search / home-connect / pi-worker / playwright |
 
 ## 同步范围
 
 本仓按运行时分为四块，各自由对应 init 脚本幂等同步；凭据与 per-machine 状态一律不入库：
 
-- **Qwen Code（`./init-qwen.sh`）**：模板中定义的设置键；`plugins/*` → `~/.qwen/extensions/<name>` 软链接；`qwen/shell.zsh` 的 source 注册进 `~/.zshrc`；`qwen/QWEN.md` → `~/.qwen/QWEN.md` 软链接（全局指令）；`skills/` 经注入的 `skills.directories` 加载（user 级 skill）；`qwen/agents/*.md` → `~/.qwen/agents/<name>.md` 逐文件软链接（subagent 定义）；`qwen/extensions/*` → `~/.qwen/extensions/<name>` 软链接 + codex-proxy 生命周期 hooks 注入 settings（同时清理 comfyui-draw 旧版 classic hooks）。
-- **Pi（`./init-pi.sh`）**：`pi/settings.json` 深度合并进 `~/.pi/agent/settings.json` 并按序注入 `pi/extensions/*` 与 `skills/`（保留本机模型、本地 packages 与非受管扩展）；`pi/keybindings.json`、`pi/GLOBAL.md`（→ `AGENTS.md`）软链接；`plugins/*` 逐插件软链到 `~/.agents/plugins/`（Pi 经 `agent-plugins` 扩展加载）；注册 `pi/shell.zsh`；软链本机 Pi 包文档到 `.agents/skills/pi-docs/`。
+- **Qwen Code（`./init-qwen.sh`）**：模板中定义的设置键；`plugins/*` → `~/.qwen/extensions/<name>` 软链接；`qwen/shell.zsh` 的 source 注册进 `~/.zshrc`；`qwen/QWEN.md` → `~/.qwen/QWEN.md` 软链接（全局指令）；`skills/` 经注入的 `skills.directories` 加载（user 级 skill）；`qwen/agents/*.md` → `~/.qwen/agents/<name>.md` 逐文件软链接（subagent 定义）；`qwen/extensions/*` → `~/.qwen/extensions/<name>` 软链接 + cliproxyapi 懒加载 `SessionStart` hook 注入 settings（同时清理旧版 `SessionEnd` 回收 hook、comfyui-draw 旧版 classic hooks 与旧版 codex-proxy hooks、旧 `codex-proxy` 软链，并迁移 `~/.qwen/codex-proxy` → `~/.qwen/cliproxyapi`）。
+- **Pi（`./init-pi.sh`）**：`pi/settings.json` 深度合并进 `~/.pi/agent/settings.json` 并按序注入 `pi/extensions/*` 与 `skills/`（保留本机模型、本地 packages 与非受管扩展；自动剔除已退役受管扩展的遗留路径）；`pi/keybindings.json`、`pi/GLOBAL.md`（→ `AGENTS.md`）软链接；`plugins/*` 逐插件软链到 `~/.agents/plugins/`（Pi 经 `agent-plugins` 扩展加载）；注册 `pi/shell.zsh`；软链本机 Pi 包文档到 `.agents/skills/pi-docs/`。
 - **AGY（`./init-agy.sh`）**：`agy/settings.json` 深度合并进 `~/.gemini/antigravity-cli/settings.json`；`plugins/*` 软链到 `~/.gemini/config/plugins`；`skills/` 目录注册进 `skills.json`；`agy/rules/*.md`、`agy/agents/*.md` 逐文件软链；`agy/hooks/` 按名注入 `hooks.json`；注册 `agy/shell.zsh`。
 - **remote-terminal（`./init-remote.sh`，可选）**：检查 Node >= 22.19 与 tmux、按需 `npm install`、注册 `rt` / `rtctl` 包装进 `~/.zshrc`；运行时状态与配置保存在 `~/.harness-remote/`，不入库。
 - **不同步（per-machine）**：Qwen 的 `model`、`fastModel`、`agents.modelGrades`、`modelProviders`、`security.auth`、`env` 中的密钥、`providerMetadata`、`$version`、`ui.autoModeAcknowledged`，Pi 的模型选择、`models.json`、`auth.json`、`enabledModels`，AGY 的本机登录态与模型选择，以及各插件的 `.env` / `.ssh/` / `config/*.env` 凭据等机器本地状态。具体模型、轻量档位映射、提供商和认证在各机器自行配置；模板只写 `fast` / `inherit` 等抽象角色档位。
@@ -62,16 +63,16 @@ Qwen Code / Pi / Antigravity（AGY）个人配置与插件的多机同步仓库�
 - 未注册包装的机器上 `QWEN_THEME` 未定义，插值保留字面量→主题查找失败→回退默认深色。
 - **勿用 `/theme` 对话框选主题**：会把固定值写回 `ui.theme`，覆盖插值；误操作后改回 `"${QWEN_THEME}"`。
 
-## Codex 订阅桥接（codex-proxy）
+## 多渠道 OAuth 桥接（cliproxyapi）
 
-CLIProxyAPI（`brew install cliproxyapi`）把 ChatGPT 订阅配额暴露为本地 OpenAI 端点（仅绑 `127.0.0.1:8317`），生命周期由 Qwen hooks 自动管理，无需单独守护。
+CLIProxyAPI（`brew install cliproxyapi`）把 Codex（ChatGPT 订阅）、Claude、Antigravity、Copilot 等 OAuth 渠道暴露为本地 OpenAI 兼容端点（仅绑 `127.0.0.1:8317`），Qwen Code 与 Pi **双端统一懒加载**：任一端发现代理未运行即按需拉起，**退出不自动回收**（防止 Qwen 退出杀掉 Pi 正在使用的代理），需停止时手动 `python3 ~/.qwen/extensions/cliproxyapi/scripts/manager.py stop`。扩展原名 `codex-proxy`，`init-qwen.sh` 会幂等迁移旧 hooks、旧软链与旧状态目录。
 
-- **架构**：`qwen/extensions/codex-proxy/` 提供 `/codex-login`、`/codex-status` 命令与 `scripts/manager.py`。标准 extension 不加载 hooks（实测），故 SessionStart/SessionEnd hooks 由 `init-qwen.sh` 注入用户 settings（按 name 幂等管理自有条目，保留其他 hooks；命令路径为 per-machine 绝对路径）。
-- **多进程安全**：hook 命令是 qwen 进程直接子进程（`$PPID` 即 qwen PID，实测）。PID 注册表 + `fcntl.flock`；SessionStart 注册，SessionEnd（非 clear 原因）注销；watchdog 每 5s 清理死亡 PID，最后一个会话消失即停 proxy。`kill -9` 崩溃由 watchdog 兜底（已测）。
-- **上游代理**：OpenAI 流量必须走代理——config `requests.proxy-url` 默认 `http://127.0.0.1:7897`（`CODEX_UPSTREAM_PROXY` 可覆盖），登录用 `-login-proxy` 同值。只作用于 cliproxyapi 进程，Qwen 自身流量不受影响。
-- **一次性接入**：`brew install cliproxyapi` → 确保 7897 代理客户端在跑 → `/codex-login`（浏览器 ChatGPT OAuth，命令引导后续模型条目写入）。模型条目属 per-machine 配置，不入模板。
-- **状态目录** `~/.qwen/codex-proxy/`：config.yaml、auth/（OAuth 凭据，per-machine 秘密，不在仓内）、proxy.log、注册表。未安装/未登录时 hooks 静默 no-op，不阻塞任何会话。
-- **风险**：个人自用属 OpenAI 当前默许的灰区；共享/转售触发风控。
+- **架构**：`qwen/extensions/cliproxyapi/` 提供 `/cliproxyapi-login`、`/cliproxyapi-status` 命令与 `scripts/manager.py`（子命令 `start` | `stop` | `status` | `init-config`；环境变量 `CLIPROXYAPI_API_PORT` / `CLIPROXYAPI_UPSTREAM_PROXY`，旧 `CODEX_*` 名仍兼容）。Qwen 侧：标准 extension 不加载 hooks（实测），故 `SessionStart` hook（`hook.sh start`）由 `init-qwen.sh` 注入用户 settings（按 name 幂等管理，保留其他 hooks，同时清理旧的 `SessionEnd` `cliproxyapi-end`）。Pi 侧：`pi/extensions/cliproxyapi/` 扩展在加载时与 `before_agent_start` 时懒加载——先查 `<stateDir>/auth/*.json` 是否存在凭据（只读文件名）、再向 `127.0.0.1:<port>` 做短超时 TCP 探测，两级短路后仍未监听才调用 `manager.py start`（并发合并为单次 in-flight，异常全部吞掉，不注册退出回收）。
+- **多进程安全**：`manager.py start` 持 `fcntl.flock` 串行化，已在运行或端口已监听直接返回；进程秒退立即清理 `proxy.pid` 不空等。`stop` 只终止 `proxy.pid` 中启动指纹匹配的进程（SIGTERM → SIGKILL 升级），不会误杀无关进程。
+- **上游代理**：OpenAI 流量必须走代理——config `requests.proxy-url` 默认 `http://127.0.0.1:7897`（`CLIPROXYAPI_UPSTREAM_PROXY` 可覆盖），登录用 `-login-proxy` 同值。只作用于 cliproxyapi 进程，Qwen 自身流量不受影响。
+- **一次性接入**：`brew install cliproxyapi` → 确保 7897 代理客户端在跑 → `/cliproxyapi-login`（先 `manager.py init-config` 生成 config.yaml，再按渠道执行 `-codex-login` / `-claude-login` / `-antigravity-login` / `-copilot-login` 等浏览器 OAuth，命令引导后续模型条目写入）。模型条目属 per-machine 配置，不入模板。
+- **状态目录** `~/.qwen/cliproxyapi/`：config.yaml、auth/（OAuth 凭据，per-machine 秘密，不在仓内；Pi 扩展可用 `CLIPROXYAPI_STATE_DIR` 覆盖以便测试）、proxy.log（>5MB 轮转为 `proxy.log.1`）、proxy.pid。未安装/未登录时 hook 与 Pi 扩展均静默 no-op，不阻塞任何会话。
+- **风险**：个人自用属各渠道当前默许的灰区；共享/转售触发风控。
 
 ## 新机器用法
 

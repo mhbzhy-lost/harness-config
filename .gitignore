@@ -16,9 +16,6 @@ plugins/home-connect/config/*
 plugins/home-connect/host.json
 plugins/home-connect/tls/
 
-# Pi 本机代理覆盖（实际配置位于 ~/.pi/agent/openai-proxy.json，仓内仅保留 example）
-pi/openai-proxy.json
-
 # remote-terminal 本机配置（实际位于 ~/.harness-remote/config.json，仓内仅保留 example）
 remote-terminal/config.json
 

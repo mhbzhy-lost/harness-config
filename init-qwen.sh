@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # init-qwen.sh — 将仓库中的 Qwen Code 配置与插件同步到本机：
 #   1. qwen/settings.json 深度合并进 ~/.qwen/settings.json，注入 env.HARNESS_CONFIG_ROOT=仓库根，
-#      确保 skills.directories 含 <仓库根>/skills，注入 codex-proxy 生命周期 hooks，
-#      清理 comfyui-draw 旧版 classic hooks（已迁 Mods）（均为 per-machine 绝对路径）
+#      确保 skills.directories 含 <仓库根>/skills，注入 cliproxyapi 懒加载 SessionStart hook，
+#      清理 comfyui-draw 旧版 classic hooks（已迁 Mods）与旧版 codex-proxy / cliproxyapi SessionEnd hooks，
+#      迁移旧状态目录 ~/.qwen/codex-proxy → ~/.qwen/cliproxyapi（均为 per-machine 绝对路径）
 #   2. plugins/* 软链接进 ~/.qwen/extensions/
 #   3. qwen/shell.zsh 注册 source 进 ~/.zshrc（标记块，幂等；qwen 主题随系统明暗）
 #   4. qwen/QWEN.md 软链接为 ~/.qwen/QWEN.md（全局指令，跨机同步）
 #   5. qwen/agents/*.md 软链接进 ~/.qwen/agents/（subagent 定义，含 review-agent 重模型覆盖）
-#   6. qwen/extensions/* 软链接进 ~/.qwen/extensions/（原生 extension：codex-proxy 命令等）
+#   6. qwen/extensions/* 软链接进 ~/.qwen/extensions/（原生 extension：cliproxyapi 命令等；清理旧版 codex-proxy 断链）
 # 模型/提供商/认证/密钥均为 per-machine 配置，不在同步范围。
 set -euo pipefail
 
@@ -41,8 +42,11 @@ usage() {
 
 脚本会向目标设置的 env 注入 HARNESS_CONFIG_ROOT（本仓库绝对路径），
 确保 skills.directories 含本仓 skills/ 目录（保留其他已有条目），
-注入 codex-proxy 生命周期 hooks（按 name 幂等管理，保留其他 hooks），
-清理 comfyui-draw 旧版 classic hooks（/draw 已迁 Mods，由扩展自带 hooks/register.js 实现），
+注入 cliproxyapi 懒加载 SessionStart hook（按 name 幂等管理，保留其他 hooks；代理由 Qwen Code 与 Pi 共用，
+退出不自动回收，手动 manager.py stop 停止），
+清理 comfyui-draw 旧版 classic hooks（/draw 已迁 Mods，由扩展自带 hooks/register.js 实现）
+与旧版 codex-proxy-start/codex-proxy-end、cliproxyapi-end hooks（SessionEnd 回收已退役），
+迁移旧状态目录 ~/.qwen/codex-proxy → ~/.qwen/cliproxyapi（存在时），
 把 qwen/shell.zsh 的 source 行注册进 ~/.zshrc（标记块，幂等），
 把 qwen/QWEN.md 软链接为全局 QWEN.md（真实文件则警告跳过，不破坏），
 把 qwen/agents/*.md 逐文件软链接进 ~/.qwen/agents/（同语义），
@@ -116,29 +120,30 @@ if not isinstance(dirs, list):
 if skills_dir not in dirs:
     dirs.append(skills_dir)
 
-# codex-proxy 生命周期 hooks：按 name 管理自有条目，保留其他 hooks
+# cliproxyapi 懒加载 hook：按 name 管理自有条目，保留其他 hooks。
 hooks = merged.setdefault("hooks", {})
 if not isinstance(hooks, dict):
-    sys.exit("错误: 现有配置的 hooks 字段不是对象，无法注入 codex-proxy hooks")
-hook_script = os.path.join(repo_root, "qwen", "extensions", "codex-proxy", "scripts", "hook.sh")
+    sys.exit("错误: 现有配置的 hooks 字段不是对象，无法注入 cliproxyapi hooks")
+hook_script = os.path.join(repo_root, "qwen", "extensions", "cliproxyapi", "scripts", "hook.sh")
 
-def set_named_hook(event, name, command, matcher=None):
+def drop_named_hook(event, *names):
     groups = hooks.setdefault(event, [])
     if not isinstance(groups, list):
         sys.exit(f"错误: 现有配置的 hooks.{event} 不是数组")
     for g in groups:
         if isinstance(g, dict) and isinstance(g.get("hooks"), list):
-            g["hooks"] = [h for h in g["hooks"] if not (isinstance(h, dict) and h.get("name") == name)]
+            g["hooks"] = [h for h in g["hooks"] if not (isinstance(h, dict) and h.get("name") in names)]
     groups[:] = [g for g in groups if isinstance(g, dict) and g.get("hooks")]
-    entry = {"hooks": [{"type": "command", "name": name, "command": command}]}
-    if matcher:
-        entry["matcher"] = matcher
-    groups.append(entry)
+
+# 代理改为懒加载、Qwen/Pi 共用且退出不自动回收：只保留 SessionStart 拉起；
+# 按名清理旧版 codex-proxy-* hooks 与旧的 SessionEnd cliproxyapi-end（防止 Qwen 退出杀掉 Pi 正在使用的代理）
+for event in ("SessionStart", "SessionEnd"):
+    drop_named_hook(event, "codex-proxy-start", "codex-proxy-end", "cliproxyapi-end")
 
 hook_cmd = f'bash "{hook_script}"'
-set_named_hook("SessionStart", "codex-proxy-start", hook_cmd + " register")
-set_named_hook("SessionEnd", "codex-proxy-end", hook_cmd + " unregister",
-               "logout|prompt_input_exit|bypass_permissions_disabled|other")
+drop_named_hook("SessionStart", "cliproxyapi-start")
+groups = hooks.setdefault("SessionStart", [])
+groups.append({"hooks": [{"type": "command", "name": "cliproxyapi-start", "command": hook_cmd + " start"}]})
 
 # comfyui-draw /draw 已迁 Mods（扩展自带 hooks/register.js，需 experimental.mods）：
 # 这里只清理旧版按名注入的 classic hooks（comfyui-draw-*），不再注入新条目
@@ -157,7 +162,7 @@ if dry_run:
     print(f"[dry-run] 将变更的顶层键: {', '.join(changed) or '（无变更）'}")
     print(f"[dry-run] 将注入 env.HARNESS_CONFIG_ROOT = {repo_root}")
     print(f"[dry-run] 将确保 skills.directories 含 {skills_dir}")
-    print(f"[dry-run] 将注入 codex-proxy 生命周期 hooks（SessionStart/SessionEnd）")
+    print(f"[dry-run] 将注入 cliproxyapi 懒加载 SessionStart hook（退出不回收），清理旧版 codex-proxy / cliproxyapi-end hooks")
     print(f"[dry-run] 将清理 comfyui-draw 旧版 classic hooks（已迁 Mods）")
     sys.exit(0)
 
@@ -190,6 +195,58 @@ print(f"设置已写入: {target_path}（权限 600）")
 if backup_path:
     print(f"已备份: {backup_path}")
 print(f"同步的顶层键: {', '.join(changed) or '（无变更）'}")
+PY
+
+# --- 1b. 迁移旧状态目录 codex-proxy → cliproxyapi（扩展改名；幂等，仅在旧目录存在且新目录不存在时执行） ---
+QWEN_SYNC_DRY_RUN="$DRY_RUN" python3 - "$NATIVE_EXT_SRC" "$(dirname "$TARGET")" <<'PY'
+import importlib.util, os, sys
+
+ext_src, state_base = sys.argv[1:3]
+dry_run = os.environ.get("QWEN_SYNC_DRY_RUN") == "1"
+old_dir = os.path.join(state_base, "codex-proxy")
+new_dir = os.path.join(state_base, "cliproxyapi")
+
+# 旧目录必须是真实目录（不跟随软链，不碰用户自建链接）
+if not os.path.isdir(old_dir) or os.path.islink(old_dir):
+    sys.exit(0)
+if os.path.lexists(new_dir):
+    print(f"跳过状态目录迁移：{new_dir} 已存在（旧目录 {old_dir} 保留，请手动处理）")
+    sys.exit(0)
+
+if dry_run:
+    print(f"[dry-run] 状态目录：{old_dir} → {new_dir}（含停止运行中的旧 proxy、改写 config.yaml 的 auth-dir）")
+    sys.exit(0)
+
+# 复用 manager.py 的进程指纹验证 / SIGKILL 升级逻辑，温和停止旧目录下运行中的 proxy
+spec = importlib.util.spec_from_file_location(
+    "cliproxyapi_manager", os.path.join(ext_src, "cliproxyapi", "scripts", "manager.py"))
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.STATE = old_dir
+m.LOCK = os.path.join(old_dir, "lock")
+m.PROXY_PID = os.path.join(old_dir, "proxy.pid")
+m.WATCHDOG_PID = os.path.join(old_dir, "watchdog.pid")
+try:
+    m.locked(m.stop_proxy)
+except Exception as e:
+    print(f"警告: 停止旧 proxy 失败（继续迁移）: {e}", file=sys.stderr)
+
+os.rename(old_dir, new_dir)
+print(f"状态目录已迁移: {old_dir} → {new_dir}")
+
+# config.yaml 中的 oauth.auth-dir 若仍指向旧路径，原子替换为新路径（其余配置如 server-id 保持不变）
+config = os.path.join(new_dir, "config.yaml")
+try:
+    with open(config, encoding="utf-8") as f:
+        text = f.read()
+except OSError:
+    text = None
+if text is not None:
+    old_auth = os.path.join(old_dir, "auth")
+    new_auth = os.path.join(new_dir, "auth")
+    if old_auth in text:
+        m._atomic_write_text(config, text.replace(old_auth, new_auth))
+        print(f"config.yaml 的 auth-dir 已改写: {old_auth} → {new_auth}")
 PY
 
 # --- 2. 插件软链接 ---
@@ -335,6 +392,19 @@ if [[ -d "$NATIVE_EXT_SRC" ]]; then
   done
 else
   echo "（无 qwen/extensions/ 目录，跳过原生 extension 链接）"
+fi
+
+# --- 7. 清理旧版 codex-proxy extension 软链 ---
+# 扩展已改名为 cliproxyapi；仅移除指向仓内旧路径的软链（含断链），真实目录或指向他处的链接不动
+legacy_link="$EXT_DIR/codex-proxy"
+legacy_target="$NATIVE_EXT_SRC/codex-proxy"
+if [[ -L "$legacy_link" && "$(readlink "$legacy_link")" == "$legacy_target" ]]; then
+  if [[ "$DRY_RUN" == 1 ]]; then
+    echo "[dry-run] extension codex-proxy：清理旧软链 ${legacy_link}（已改名 cliproxyapi）"
+  else
+    rm "$legacy_link"
+    echo "extension codex-proxy：已清理旧软链（已改名 cliproxyapi）"
+  fi
 fi
 
 if [[ "$DRY_RUN" == 1 ]]; then

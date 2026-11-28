@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""codex-proxy 生命周期管理：CLIProxyAPI 随 Qwen Code 会话起停。
+"""cliproxyapi 生命周期管理：CLIProxyAPI 多渠道 OAuth 代理的懒加载启动与手动停止。
 
-多进程安全：PID 注册表 + fcntl.flock；watchdog 每 5s 清理死亡 PID，
-最后一个会话消失即停 proxy。崩溃（kill -9）由 watchdog 兜底。
-未安装 cliproxyapi 或未完成 codex 登录时静默 no-op，绝不阻塞 Qwen 启动。
+Qwen Code（SessionStart hook）与 Pi（pi/extensions/cliproxyapi）共用同一份状态目录与端口：
+任何一端发现代理未运行即按需拉起，退出时**不**自动回收（避免一方退出杀掉另一方正在使用的代理），
+需要停止时手动执行 `manager.py stop`。
 
-子命令: register <pid> | unregister <pid> | watchdog | start | stop | status
+多进程安全：fcntl.flock 串行化启动；proxy.pid 记录带启动指纹的进程身份，stop 只杀指纹匹配的进程。
+未安装 cliproxyapi 或未完成任何渠道登录时静默 no-op，绝不阻塞任何会话。
+
+状态目录为 ~/.qwen/cliproxyapi（由旧名 codex-proxy 迁移而来，迁移见 init-qwen.sh）。
+
+子命令: start | stop | status | init-config
+        register（= start 的向后兼容别名）| unregister（静默 no-op，兼容旧机器未重跑 init-qwen.sh 时的旧 hook）
 """
 import fcntl
 import json
@@ -17,8 +23,8 @@ import sys
 import tempfile
 import time
 
-STATE = os.path.expanduser("~/.qwen/codex-proxy")
-REGISTRY = os.path.join(STATE, "sessions.json")
+STATE = os.path.expanduser("~/.qwen/cliproxyapi")
+REGISTRY = os.path.join(STATE, "sessions.json")  # 旧版会话注册表，仅在 stop 时清理遗留
 LOCK = os.path.join(STATE, "lock")
 PROXY_PID = os.path.join(STATE, "proxy.pid")
 WATCHDOG_PID = os.path.join(STATE, "watchdog.pid")
@@ -26,9 +32,11 @@ LOG = os.path.join(STATE, "proxy.log")
 LOG_MAX_BYTES = 5 * 1024 * 1024
 CONFIG = os.path.join(STATE, "config.yaml")
 AUTH_DIR = os.path.join(STATE, "auth")
-API_PORT = int(os.environ.get("CODEX_PROXY_API_PORT", "8317"))
-UPSTREAM_PROXY = os.environ.get("CODEX_UPSTREAM_PROXY", "http://127.0.0.1:7897")
-WATCHDOG_INTERVAL = 5
+# 环境变量优先读 CLIPROXYAPI_*，回退兼容旧名 CODEX_*
+API_PORT = int(os.environ.get("CLIPROXYAPI_API_PORT") or os.environ.get("CODEX_PROXY_API_PORT") or "8317")
+UPSTREAM_PROXY = (os.environ.get("CLIPROXYAPI_UPSTREAM_PROXY")
+                  or os.environ.get("CODEX_UPSTREAM_PROXY")
+                  or "http://127.0.0.1:7897")
 
 
 def find_bin():
@@ -79,14 +87,6 @@ def is_zombie(pid):
     return bool(stat and "Z" in stat.split()[0])
 
 
-def read_pids():
-    try:
-        with open(REGISTRY, encoding="utf-8") as f:
-            return [int(p) for p in json.load(f)]
-    except (OSError, ValueError):
-        return []
-
-
 def _atomic_write_text(path, content):
     parent = os.path.dirname(path) or "."
     os.makedirs(parent, exist_ok=True)
@@ -101,10 +101,6 @@ def _atomic_write_text(path, content):
         except OSError:
             pass
         raise
-
-
-def write_pids(pids):
-    _atomic_write_text(REGISTRY, json.dumps(sorted(set(pids))))
 
 
 def read_pidfile_entry(path):
@@ -222,20 +218,34 @@ def port_ready():
 
 
 def stop_proxy():
+    """手动停止代理：仅终止 proxy.pid 中指纹匹配的进程，SIGTERM 无效则升级 SIGKILL。
+
+    顺带清理旧版“随会话起停”方案遗留的 watchdog.pid 与 sessions.json（若存在）。
+    """
     entries = []
-    for path, hint in ((WATCHDOG_PID, "manager.py"), (PROXY_PID, "cliproxyapi")):
+    for path, hint in ((PROXY_PID, "cliproxyapi"), (WATCHDOG_PID, "manager.py")):
         pid, sig = read_pidfile_entry(path)
-        entries.append((pid, sig, hint))
+        if pid:
+            entries.append((pid, sig, hint))
         try:
             os.unlink(path)
         except OSError:
             pass
+    try:
+        os.unlink(REGISTRY)
+    except OSError:
+        pass
     for pid, sig, hint in entries:
         terminate_verified_process(pid, sig, hint)
 
 
 def ensure_running():
-    if proxy_running():
+    """懒加载：已在运行或端口已被监听则直接返回；否则拉起 cliproxyapi 并等待端口就绪。
+
+    必须在 locked() 内调用（外层持 flock），避免 Qwen 与 Pi 并发重复启动。
+    找不到二进制或未登录任何渠道时静默 no-op；进程秒退则立即清理 proxy.pid 返回，不空等。
+    """
+    if proxy_running() or port_ready():
         return
     bin_path = find_bin()
     if not os.path.isfile(bin_path) or not has_credentials():
@@ -251,12 +261,6 @@ def ensure_running():
     write_pidfile(PROXY_PID, proc.pid)
     for _ in range(50):
         if port_ready():
-            wd = subprocess.Popen(
-                [sys.executable, os.path.abspath(__file__), "watchdog"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            write_pidfile(WATCHDOG_PID, wd.pid)
             return
         if proc.poll() is not None:
             proc.wait()
@@ -266,12 +270,6 @@ def ensure_running():
                 pass
             return
         time.sleep(0.2)
-    wd = subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "watchdog"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    write_pidfile(WATCHDOG_PID, wd.pid)
 
 
 def locked(fn):
@@ -284,46 +282,6 @@ def locked(fn):
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
-def register(pid):
-    def op():
-        pids = [p for p in read_pids() if alive(p)]
-        if alive(pid) and pid not in pids:
-            pids.append(pid)
-        write_pids(pids)
-        ensure_running()
-    locked(op)
-
-
-def unregister(pid):
-    def op():
-        pids = [p for p in read_pids() if alive(p) and p != pid]
-        write_pids(pids)
-        if not pids:
-            stop_proxy()
-    locked(op)
-
-
-def watchdog():
-    while True:
-        time.sleep(WATCHDOG_INTERVAL)
-        def op():
-            pids = [p for p in read_pids() if alive(p)]
-            write_pids(pids)
-            if not pids:
-                # 先清 pidfile 再杀 proxy；watchdog 自然退出，不杀自己
-                proxy_pid, proxy_sig = read_pidfile_entry(PROXY_PID)
-                for path in (PROXY_PID, WATCHDOG_PID):
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
-                terminate_verified_process(proxy_pid, proxy_sig, "cliproxyapi")
-                return True
-            return False
-        if locked(op):
-            return
-
-
 def status():
     pid = proxy_running()
     print(json.dumps({
@@ -331,33 +289,35 @@ def status():
         "proxy_pid": pid,
         "api_port": API_PORT,
         "upstream_proxy": UPSTREAM_PROXY,
-        "sessions": read_pids(),
         "credentials_present": has_credentials(),
         "binary": find_bin(),
+        "lifecycle": "lazy",
     }, ensure_ascii=False, indent=2))
 
 
 def main():
     if len(sys.argv) < 2:
-        sys.exit("用法: manager.py register|unregister|watchdog|start|stop|status [pid]")
+        sys.exit("用法: manager.py start|stop|status|init-config")
     cmd = sys.argv[1]
     try:
-        if cmd in ("register", "unregister"):
-            pid = int(sys.argv[2]) if len(sys.argv) > 2 else os.getppid()
-            (register if cmd == "register" else unregister)(pid)
-        elif cmd == "watchdog":
-            watchdog()
-        elif cmd == "start":
+        if cmd in ("start", "register"):
+            # register 是旧 hook 的子命令，语义已退化为“确保运行”
             locked(ensure_running)
+        elif cmd == "unregister":
+            # 旧 SessionEnd hook 入口：退出不再回收代理，静默 no-op
+            pass
         elif cmd == "stop":
             locked(stop_proxy)
         elif cmd == "status":
             status()
+        elif cmd == "init-config":
+            # 首次登录前幂等生成 config.yaml 与 auth/ 目录（供 /cliproxyapi-login 调用）
+            locked(gen_config)
         else:
             sys.exit(f"未知子命令: {cmd}")
     except Exception as e:
-        # 生命周期钩子绝不阻塞 Qwen：失败只报 stderr
-        print(f"codex-proxy: {e}", file=sys.stderr)
+        # 生命周期钩子绝不阻塞 Qwen/Pi：失败只报 stderr
+        print(f"cliproxyapi: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

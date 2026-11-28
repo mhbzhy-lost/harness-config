@@ -1,0 +1,5 @@
+{
+  "name": "cliproxyapi",
+  "version": "1.2.0",
+  "description": "CLIProxyAPI 多渠道 OAuth 代理（Codex、Claude、Antigravity、Copilot 等）懒加载启动（SessionStart hook 由 init-qwen.sh 注入 settings），Qwen Code 与 Pi 共用，退出不自动回收（手动 manager.py stop 停止）；提供 /cliproxyapi-login 与 /cliproxyapi-status"
+}
